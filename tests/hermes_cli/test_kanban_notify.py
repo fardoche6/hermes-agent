@@ -657,3 +657,164 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     # Only the real file was uploaded.
     assert len(documents_uploaded) == 1
     assert "real.pdf" in documents_uploaded[0]
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: create → auto-subscribe → event → Telegram notification
+#
+# These tests verify the full subscription lifecycle:
+#   1. kanban_create called with a Telegram gateway session env → subscription
+#      row auto-written by _maybe_auto_subscribe (no manual add_notify_sub)
+#   2. Task event (block or complete) appended
+#   3. Notifier watcher delivers message to the subscribed Telegram chat_id
+#   4. Repeated add_notify_sub for same (task, platform, chat_id) = 1 row only
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_then_block_notifies_telegram(kanban_home, monkeypatch):
+    """End-to-end: kanban_create with Telegram session auto-subscribes;
+    a subsequent block event delivers a 'blocked' notification to the chat."""
+    import json as _json
+    from tools import kanban_tools as kt
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "tg-e2e-block")
+    monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
+    # Leave HERMES_PROFILE unset so notifier_profile stays None on the
+    # subscription row; the watcher skips the profile filter for unowned rows.
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+
+    out = kt._handle_create({"title": "e2e block flow", "assignee": "alice"})
+    d = _json.loads(out)
+    assert d["ok"] is True, d
+    assert d["subscribed"] is True, d
+    tid = d["task_id"]
+
+    conn = kb.connect()
+    try:
+        kb.block_task(conn, tid, reason="waiting for external data")
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+
+    delivered: list = []
+
+    async def _capture(chat_id, msg, metadata=None):
+        delivered.append((chat_id, msg))
+        runner._running = False
+
+    fake_adapter = MagicMock()
+    fake_adapter.send = AsyncMock(side_effect=_capture)
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+
+    async def _fast_sleep(_):
+        await _orig_sleep(0)
+
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    assert len(delivered) == 1
+    recv_chat_id, msg = delivered[0]
+    assert recv_chat_id == "tg-e2e-block"
+    assert "blocked" in msg
+    assert "waiting for external data" in msg
+
+
+@pytest.mark.asyncio
+async def test_create_then_complete_notifies_telegram(kanban_home, monkeypatch):
+    """End-to-end: kanban_create with Telegram session auto-subscribes;
+    a subsequent completed event delivers a 'done' notification to the chat."""
+    import json as _json
+    from tools import kanban_tools as kt
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "tg-e2e-done")
+    monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+
+    out = kt._handle_create({"title": "e2e complete flow", "assignee": "bob"})
+    d = _json.loads(out)
+    assert d["ok"] is True, d
+    assert d["subscribed"] is True, d
+    tid = d["task_id"]
+
+    conn = kb.connect()
+    try:
+        kb.complete_task(conn, tid, result="analysis complete")
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+
+    delivered: list = []
+
+    async def _capture(chat_id, msg, metadata=None):
+        delivered.append((chat_id, msg))
+        runner._running = False
+
+    fake_adapter = MagicMock()
+    fake_adapter.send = AsyncMock(side_effect=_capture)
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+
+    async def _fast_sleep(_):
+        await _orig_sleep(0)
+
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    assert len(delivered) == 1
+    recv_chat_id, msg = delivered[0]
+    assert recv_chat_id == "tg-e2e-done"
+    assert "completed" in msg or "done" in msg.lower()
+
+
+def test_auto_subscribe_idempotent_no_duplicate(kanban_home, monkeypatch):
+    """Repeated add_notify_sub calls for the same (task, platform, chat_id,
+    thread_id) must produce exactly one subscription row — the primary key
+    constraint is the deduplication mechanism."""
+    import json as _json
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "tg-dedup")
+    monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+
+    out = kt._handle_create({"title": "dedup test", "assignee": "carol"})
+    d = _json.loads(out)
+    assert d["ok"] is True, d
+    assert d["subscribed"] is True, d
+    tid = d["task_id"]
+
+    conn = kb.connect()
+    try:
+        # Adding the same subscription two more times must not grow the table.
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="tg-dedup")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="tg-dedup")
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+
+    assert len(subs) == 1, f"Expected 1 subscription row, got {len(subs)}: {subs}"
+    assert subs[0]["platform"] == "telegram"
+    assert subs[0]["chat_id"] == "tg-dedup"

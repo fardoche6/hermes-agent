@@ -12399,7 +12399,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             response = result.get("final_response", "") if result else ""
 
             # Auto-generate session title after first exchange (non-blocking)
-            if response and result and not result.get("failed") and not result.get("partial"):
+            _title_cfg = ((self.config or {}).get("auxiliary") or {}).get("title_generation") or {}
+            _title_enabled = bool(_title_cfg.get("enabled", True))
+            if _title_enabled and response and result and not result.get("failed") and not result.get("partial"):
                 try:
                     from agent.title_generator import maybe_auto_title
                     # Route title-generation failures through the agent's

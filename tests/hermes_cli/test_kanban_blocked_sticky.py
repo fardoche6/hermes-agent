@@ -207,6 +207,66 @@ def test_unblock_clears_sticky_state_and_lets_block_recover(kanban_home: Path) -
 
 
 # ---------------------------------------------------------------------------
+# Review gates for review-required blocks must not deadlock behind parents
+# ---------------------------------------------------------------------------
+
+
+def test_review_gate_child_of_review_required_block_promotes_and_claims(kanban_home: Path) -> None:
+    """A review gate is the unblocker for a review-required block.
+
+    If a worker creates the review card with the blocked implementation as a
+    parent dependency, the normal parent rule would deadlock forever: parent is
+    blocked waiting for review, child is todo waiting for parent done. Reviewer
+    assignees are allowed to run when every non-terminal parent is explicitly
+    blocked for ``review-required``.
+    """
+    with kb.connect() as conn:
+        implementation = kb.create_task(conn, title="implementation")
+        kb.claim_task(conn, implementation)
+        kb.block_task(
+            conn,
+            implementation,
+            reason="review-required: implementation complete, please review",
+            expected_run_id=kb.get_task(conn, implementation).current_run_id,
+        )
+        review = kb.create_task(
+            conn,
+            title="Native review gate: implementation",
+            assignee="code-reviewer",
+            parents=[implementation],
+        )
+
+        assert kb.get_task(conn, review).status == "todo"
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, review).status == "ready"
+        assert kb.claim_task(conn, review) is not None
+        assert kb.get_task(conn, review).status == "running"
+
+
+def test_non_reviewer_child_of_review_required_block_stays_todo(kanban_home: Path) -> None:
+    """Only reviewer lanes get the review-required dependency exception."""
+    with kb.connect() as conn:
+        implementation = kb.create_task(conn, title="implementation")
+        kb.claim_task(conn, implementation)
+        kb.block_task(
+            conn,
+            implementation,
+            reason="review-required: implementation complete, please review",
+            expected_run_id=kb.get_task(conn, implementation).current_run_id,
+        )
+        followup = kb.create_task(
+            conn,
+            title="more implementation",
+            assignee="programmer",
+            parents=[implementation],
+        )
+
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, followup).status == "todo"
+        assert kb.claim_task(conn, followup) is None
+
+
+# ---------------------------------------------------------------------------
 # Full bug-shaped loop: block → promote → crash → gave_up → next tick
 # ---------------------------------------------------------------------------
 

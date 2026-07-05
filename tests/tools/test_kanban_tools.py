@@ -136,7 +136,7 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     expected = {
         "kanban_list",
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
-        "kanban_comment", "kanban_create", "kanban_link",
+        "kanban_comment", "kanban_create", "kanban_update", "kanban_link",
         "kanban_unblock",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
@@ -979,6 +979,38 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_update_priority_orchestrator_path(monkeypatch, worker_env):
+    """Orchestrator tool can update priority without recreating the card."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_update({"task_id": worker_env, "priority": 42})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["priority"] == 42
+    assert d["updated"] == {"priority": 42}
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.priority == 42
+        events = kb.list_events(conn, worker_env)
+        assert any(e.kind == "updated" for e in events)
+    finally:
+        conn.close()
+
+
+def test_update_hidden_from_worker_runtime(worker_env):
+    """Even if called directly, workers cannot use orchestrator update."""
+    from tools import kanban_tools as kt
+
+    d = json.loads(kt._handle_update({"task_id": worker_env, "priority": 42}))
+    assert "error" in d
+    assert "orchestrator-only" in d["error"]
+
+
 def test_create_inherits_worker_dir_workspace(monkeypatch, worker_env):
     """A worker scoped to a dir: task that spawns a child without a
     workspace arg inherits the dir, not scratch (so follow-up code-gen
@@ -1805,6 +1837,24 @@ def test_board_param_routes_show_to_alt_board(multi_board_env):
     assert "not found" in bad.get("error", "")
 
     # With board override, it's readable.
+    good = json.loads(kt._handle_show({"task_id": alt_seed, "board": "alt"}))
+    assert good["task"]["id"] == alt_seed
+    assert good["task"]["title"] == "seed-alt"
+
+
+def test_board_param_overrides_env_pinned_db_for_show(monkeypatch, multi_board_env):
+    """A per-call board slug must override dispatcher-injected DB pinning.
+
+    Regression coverage for worker/orchestrator sessions where
+    ``HERMES_KANBAN_DB`` points at one board, but the tool call explicitly
+    targets another board (for example, ``board="subsidysmart"`` from a
+    Telegram-side routing layer).
+    """
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(multi_board_env["default_db"]))
+
+    alt_seed = multi_board_env["alt_seed"]
     good = json.loads(kt._handle_show({"task_id": alt_seed, "board": "alt"}))
     assert good["task"]["id"] == alt_seed
     assert good["task"]["title"] == "seed-alt"

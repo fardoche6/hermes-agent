@@ -1246,6 +1246,66 @@ def test_recompute_ready_skips_tasks_at_failure_limit(kanban_home):
         assert task.consecutive_failures == 0
 
 
+def test_recompute_ready_allows_fresh_completed_remediation_parent(kanban_home):
+    """A completed remediation parent after a circuit-breaker block should
+    release the blocked task once, then close again if the task fails again.
+
+    This is the blocked-task-fixer path: an automated prerequisite repairs the
+    stale blocker after the selected task had already hit the failure limit.
+    The original #35072 guard must still prevent a permanent retry loop.
+    """
+    with kb.connect() as conn:
+        child = kb.create_task(conn, title="blocked worker", assignee="a")
+        kb.claim_task(conn, child)
+        kb._record_task_failure(
+            conn, child, error="worker exited cleanly 1", outcome="crashed",
+            release_claim=True, end_run=True, failure_limit=2,
+        )
+        kb.claim_task(conn, child)
+        kb._record_task_failure(
+            conn, child, error="worker exited cleanly 2", outcome="crashed",
+            release_claim=True, end_run=True, failure_limit=2,
+        )
+        first_failure = conn.execute(
+            "SELECT MAX(created_at) FROM task_events "
+            "WHERE task_id = ? AND kind = 'gave_up'",
+            (child,),
+        ).fetchone()[0]
+
+        parent = kb.create_task(conn, title="repair prerequisite", assignee="a")
+        kb.link_tasks(conn, parent, child)
+        conn.execute(
+            "UPDATE task_events SET created_at = ? "
+            "WHERE task_id = ? AND kind = 'linked'",
+            (int(first_failure) + 1, child),
+        )
+        kb.claim_task(conn, parent)
+        kb.complete_task(conn, parent, summary="repaired")
+
+        task = kb.get_task(conn, child)
+        assert task is not None
+        if task.status == "blocked":
+            assert kb.recompute_ready(conn, failure_limit=1) == 1
+            task = kb.get_task(conn, child)
+            assert task is not None
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+        assert task.last_failure_error is None
+
+        kb.claim_task(conn, child)
+        kb._record_task_failure(
+            conn, child, error="still broken", outcome="crashed",
+            release_claim=True, end_run=True, failure_limit=1,
+        )
+        task = kb.get_task(conn, child)
+        assert task is not None
+        assert task.status == "blocked"
+        assert kb.recompute_ready(conn, failure_limit=1) == 0
+        task = kb.get_task(conn, child)
+        assert task is not None
+        assert task.status == "blocked"
+
+
 def test_recompute_ready_recovers_below_limit(kanban_home):
     """recompute_ready auto-recovers blocked tasks that haven't hit the
     failure limit yet — the counter is preserved across recovery."""
@@ -2952,6 +3012,62 @@ class TestSharedBoardPaths:
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
 
+    def test_dispatcher_spawn_command_includes_quiet_flag(
+        self, tmp_path, monkeypatch
+    ):
+        # _default_spawn must pass `chat --quiet -q <prompt>` so that the
+        # worker runs in quiet single-query mode.  Without --quiet the
+        # rc=75 rate-limit/tempfail sentinel is never armed, causing 429
+        # exits to be reported as rc=0 / protocol_violation by the dispatcher.
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+
+        captured = {}
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["cmd"] = cmd
+                self.pid = 9999
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+
+        task = kb.Task(
+            id="t_quiet_flag",
+            title="x",
+            body=None,
+            assignee="coder",
+            status="ready",
+            priority=0,
+            created_by=None,
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="worktree",
+            workspace_path=str(tmp_path / "ws"),
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+            branch_name=None,
+        )
+        kb._default_spawn(task, str(tmp_path / "ws"))
+
+        cmd = captured["cmd"]
+        # Locate the "chat" subcommand position and verify --quiet follows it
+        assert "chat" in cmd, "spawn command must contain 'chat' subcommand"
+        chat_idx = cmd.index("chat")
+        tail = cmd[chat_idx:]
+        assert "--quiet" in tail, (
+            f"'--quiet' must appear after 'chat' in spawn command; got: {tail}"
+        )
+        # -q must be present and immediately precede the prompt
+        assert "-q" in tail, "'-q' (query) must appear in spawn command"
+        q_idx = tail.index("-q")
+        assert q_idx + 1 < len(tail), "'-q' must be followed by the prompt string"
+        assert tail[q_idx + 1] == "work kanban task t_quiet_flag"
+        # --quiet must come before -q (ordering sanity check)
+        assert tail.index("--quiet") < q_idx, "--quiet must precede -q in the command"
+
 
 # ---------------------------------------------------------------------------
 # latest_summary / latest_summaries — surface task_runs.summary handoffs
@@ -3817,6 +3933,38 @@ def test_dispatch_review_skips_nonspawnable(kanban_home, monkeypatch):
     monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
     with kb.connect() as conn:
         t = kb.create_task(conn, title="review", assignee="orion-cc")
+        _set_task_status(conn, t, "review")
+        res = kb.dispatch_once(conn, dry_run=True)
+    assert t in res.skipped_nonspawnable
+    assert not res.spawned
+
+
+def test_dispatch_skips_external_claudecode_lane_even_if_profile_exists(kanban_home, monkeypatch):
+    """*-claudecodeN pull-lane cards must not be spawned by native Hermes."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="external lane", assignee="programmer-claudecode2")
+        res = kb.dispatch_once(conn, dry_run=True)
+    assert t in res.skipped_nonspawnable
+    assert not res.spawned
+
+
+def test_has_spawnable_ready_ignores_external_claudecode_lane_with_profile(kanban_home, monkeypatch):
+    """Health telemetry treats claudecode pull lanes as externally owned."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        kb.create_task(conn, title="external lane", assignee="programmer-claudecode2")
+        assert kb.has_spawnable_ready(conn) is False
+
+
+def test_dispatch_review_skips_external_claudecode_lane_even_if_profile_exists(kanban_home, monkeypatch):
+    """Review-column claudecode pull-lane cards are also external."""
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="external review lane", assignee="code-reviewer-claudecode2")
         _set_task_status(conn, t, "review")
         res = kb.dispatch_once(conn, dry_run=True)
     assert t in res.skipped_nonspawnable

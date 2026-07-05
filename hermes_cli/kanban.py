@@ -445,6 +445,27 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_assign.add_argument("task_id")
     p_assign.add_argument("profile", help="Profile name (or 'none' to unassign)")
 
+    # --- update ---
+    p_update = sub.add_parser("update", help="Update task spec/routing fields")
+    p_update.add_argument("task_id")
+    p_update.add_argument("--title", default=None, help="Replacement task title")
+    p_update.add_argument("--body", default=None, help="Replacement task body/spec")
+    p_update.add_argument("--assignee", default=None, help="Replacement assignee profile (or 'none' to unassign)")
+    p_update.add_argument("--priority", type=int, default=None, help="Replacement priority tiebreaker")
+    p_update.add_argument("--max-runtime", default=None, help="Replacement runtime cap; accepts seconds or durations (90s, 30m, 2h, 1d)")
+    p_update.add_argument("--clear-max-runtime", action="store_true", help="Clear the per-task runtime cap")
+    p_update.add_argument("--goal", dest="goal_mode", action="store_true", default=None, help="Enable goal-loop mode")
+    p_update.add_argument("--no-goal", dest="goal_mode", action="store_false", help="Disable goal-loop mode")
+    p_update.add_argument("--goal-max-turns", type=int, default=None, help="Replacement goal-loop turn budget")
+    p_update.add_argument("--clear-goal-max-turns", action="store_true", help="Clear the goal-loop turn budget")
+    p_update.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    # --- set-priority ---
+    p_set_priority = sub.add_parser("set-priority", aliases=["priority"], help="Set a task priority")
+    p_set_priority.add_argument("task_id")
+    p_set_priority.add_argument("priority", type=int)
+    p_set_priority.add_argument("--json", action="store_true", help="Emit JSON output")
+
     # --- reclaim / reassign (recovery) ---
     p_reclaim = sub.add_parser(
         "reclaim",
@@ -920,6 +941,13 @@ def kanban_command(args: argparse.Namespace) -> int:
             )
             return 1
         board_scope = kb.scoped_current_board(normed)
+    else:
+        inferred_board, route_error = _infer_existing_card_board(args, action)
+        if route_error:
+            print(f"kanban: {route_error}", file=sys.stderr)
+            return 1
+        if inferred_board:
+            board_scope = kb.scoped_current_board(inferred_board)
 
     # Auto-initialize the DB before dispatching any subcommand. init_db
     # is idempotent, so running it every invocation is cheap (one
@@ -943,6 +971,9 @@ def kanban_command(args: argparse.Namespace) -> int:
             "ls":       _cmd_list,
             "show":     _cmd_show,
             "assign":   _cmd_assign,
+            "update":   _cmd_update,
+            "set-priority": _cmd_set_priority,
+            "priority": _cmd_set_priority,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
@@ -984,6 +1015,100 @@ def kanban_command(args: argparse.Namespace) -> int:
         except (ValueError, RuntimeError) as exc:
             print(f"kanban: {exc}", file=sys.stderr)
             return 1
+
+
+# ---------------------------------------------------------------------------
+# Existing-card board routing
+# ---------------------------------------------------------------------------
+
+_SINGLE_TASK_ID_ACTIONS = {
+    "show", "assign", "update", "set-priority", "priority",
+    "reclaim", "reassign", "claim", "comment", "edit", "tail",
+    "log", "runs", "heartbeat", "context", "notify-subscribe",
+    "notify-unsubscribe",
+}
+
+
+def _existing_card_route_ids(args: argparse.Namespace, action: str) -> list[str]:
+    """Return task ids that should pin an existing-card command to a board."""
+    ids: list[str] = []
+    if action in _SINGLE_TASK_ID_ACTIONS:
+        tid = getattr(args, "task_id", None)
+        if tid:
+            ids.append(tid)
+    elif action == "notify-list":
+        tid = getattr(args, "task_id", None)
+        if tid:
+            ids.append(tid)
+    elif action == "diagnostics":
+        tid = getattr(args, "task", None)
+        if tid:
+            ids.append(tid)
+    elif action in {"specify", "decompose"} and not getattr(args, "all_triage", False):
+        tid = getattr(args, "task_id", None)
+        if tid:
+            ids.append(tid)
+    elif action in {"complete", "unblock"}:
+        ids.extend(getattr(args, "task_ids", None) or [])
+    elif action in {"block", "schedule", "promote"}:
+        tid = getattr(args, "task_id", None)
+        if tid:
+            ids.append(tid)
+        ids.extend(getattr(args, "ids", None) or [])
+    elif action == "archive":
+        ids.extend(getattr(args, "task_ids", None) or [])
+        ids.extend(getattr(args, "purge_ids", None) or [])
+    elif action in {"link", "unlink"}:
+        for attr in ("parent_id", "child_id"):
+            tid = getattr(args, attr, None)
+            if tid:
+                ids.append(tid)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for tid in ids:
+        if tid not in seen:
+            deduped.append(tid)
+            seen.add(tid)
+    return deduped
+
+
+def _infer_existing_card_board(args: argparse.Namespace, action: str) -> tuple[Optional[str], Optional[str]]:
+    """Infer a board slug for existing-card operations.
+
+    Returns ``(slug, error)``. ``slug`` is ``None`` when no unambiguous
+    cross-board route is needed/found; ``error`` is a user-facing message that
+    should stop the command.  Explicit ``--board`` is handled by the caller and
+    bypasses this helper.
+    """
+    ids = _existing_card_route_ids(args, action)
+    if not ids:
+        return None, None
+
+    found: dict[str, list[str]] = {}
+    for tid in ids:
+        boards = kb.task_boards(tid)
+        if boards:
+            found[tid] = boards
+    if not found:
+        return None, None
+
+    common = set.intersection(*(set(v) for v in found.values()))
+    current = kb.get_current_board()
+    if current in common:
+        return None, None
+    if len(common) == 1:
+        return next(iter(common)), None
+
+    if not common:
+        return None, (
+            "task ids resolve to different boards; rerun the operation per "
+            "board with `hermes kanban --board <slug> ...`"
+        )
+    return None, (
+        "task id is present on multiple boards; pass "
+        "`hermes kanban --board <slug> ...` to choose one"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1613,6 +1738,142 @@ def _cmd_show(args: argparse.Namespace) -> int:
             if r.error:
                 print(f"        ! {r.error.splitlines()[0][:160]}")
     return 0
+
+
+def _update_task_fields(
+    conn,
+    task_id: str,
+    *,
+    title: Optional[str] = None,
+    body: Any = None,
+    body_set: bool = False,
+    assignee: Any = None,
+    assignee_set: bool = False,
+    priority: Optional[int] = None,
+    max_runtime_seconds: Any = None,
+    max_runtime_set: bool = False,
+    goal_mode: Optional[bool] = None,
+    goal_max_turns: Any = None,
+    goal_max_turns_set: bool = False,
+) -> Optional[kb.Task]:
+    """Update task fields shared by CLI update/set-priority commands."""
+    row = conn.execute(
+        "SELECT id, status, claim_lock, assignee FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return None
+
+    updates: list[str] = []
+    values: list[Any] = []
+    changed: dict[str, Any] = {}
+
+    if title is not None:
+        title = title.strip()
+        if not title:
+            raise ValueError("title cannot be empty")
+        updates.append("title = ?")
+        values.append(title)
+        changed["title"] = title
+
+    if body_set:
+        updates.append("body = ?")
+        values.append(body)
+        changed["body"] = body
+
+    if assignee_set:
+        if row["status"] == "running" and row["claim_lock"] is not None:
+            raise RuntimeError(
+                f"cannot reassign {task_id}: currently running (claimed). "
+                "Wait for completion or reclaim the stale lock first."
+            )
+        updates.append("assignee = ?")
+        values.append(assignee)
+        changed["assignee"] = assignee
+        if row["assignee"] != assignee:
+            updates.append("consecutive_failures = 0")
+            updates.append("last_failure_error = NULL")
+
+    if priority is not None:
+        updates.append("priority = ?")
+        values.append(int(priority))
+        changed["priority"] = int(priority)
+
+    if max_runtime_set:
+        updates.append("max_runtime_seconds = ?")
+        values.append(max_runtime_seconds)
+        changed["max_runtime_seconds"] = max_runtime_seconds
+
+    if goal_mode is not None:
+        updates.append("goal_mode = ?")
+        values.append(1 if goal_mode else 0)
+        changed["goal_mode"] = bool(goal_mode)
+
+    if goal_max_turns_set:
+        updates.append("goal_max_turns = ?")
+        values.append(goal_max_turns)
+        changed["goal_max_turns"] = goal_max_turns
+
+    if not updates:
+        raise ValueError("no update fields provided")
+
+    with kb.write_txn(conn):
+        values.append(task_id)
+        conn.execute(f"UPDATE tasks SET {', '.join(updates)} WHERE id = ?", values)
+        kb._append_event(conn, task_id, "updated", changed)
+    return kb.get_task(conn, task_id)
+
+
+def _print_updated_task(task: kb.Task, *, json_output: bool) -> int:
+    if json_output:
+        print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
+    else:
+        print(f"Updated {task.id}  (priority={task.priority}, assignee={task.assignee or '-'})")
+    return 0
+
+
+def _cmd_update(args: argparse.Namespace) -> int:
+    try:
+        max_runtime_set = bool(getattr(args, "clear_max_runtime", False)) or getattr(args, "max_runtime", None) is not None
+        max_runtime = None
+        if getattr(args, "max_runtime", None) is not None:
+            max_runtime = _parse_duration(args.max_runtime)
+        goal_max_turns_set = bool(getattr(args, "clear_goal_max_turns", False)) or getattr(args, "goal_max_turns", None) is not None
+        goal_max_turns = None if getattr(args, "clear_goal_max_turns", False) else getattr(args, "goal_max_turns", None)
+        assignee_set = getattr(args, "assignee", None) is not None
+        assignee = None if assignee_set and args.assignee.lower() in {"none", "-", "null"} else getattr(args, "assignee", None)
+        with kb.connect_closing() as conn:
+            task = _update_task_fields(
+                conn,
+                args.task_id,
+                title=getattr(args, "title", None),
+                body=getattr(args, "body", None),
+                body_set=getattr(args, "body", None) is not None,
+                assignee=assignee,
+                assignee_set=assignee_set,
+                priority=getattr(args, "priority", None),
+                max_runtime_seconds=max_runtime,
+                max_runtime_set=max_runtime_set,
+                goal_mode=getattr(args, "goal_mode", None),
+                goal_max_turns=goal_max_turns,
+                goal_max_turns_set=goal_max_turns_set,
+            )
+    except ValueError as exc:
+        print(f"kanban update: {exc}", file=sys.stderr)
+        return 2
+    if task is None:
+        print(f"no such task: {args.task_id}", file=sys.stderr)
+        return 1
+    return _print_updated_task(task, json_output=getattr(args, "json", False))
+
+
+def _cmd_set_priority(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        task = _update_task_fields(conn, args.task_id, priority=args.priority)
+    if task is None:
+        print(f"no such task: {args.task_id}", file=sys.stderr)
+        return 1
+    return _print_updated_task(task, json_output=getattr(args, "json", False))
 
 
 def _cmd_assign(args: argparse.Namespace) -> int:

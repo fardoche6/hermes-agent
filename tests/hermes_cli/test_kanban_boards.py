@@ -126,12 +126,26 @@ class TestPathResolution:
             fresh_home / "kanban" / "boards" / "other" / "logs"
         )
 
-    def test_env_var_db_override_still_wins(self, fresh_home, tmp_path, monkeypatch):
-        """``HERMES_KANBAN_DB`` pins the file regardless of board= arg."""
+    def test_env_var_db_override_only_wins_without_explicit_board(self, fresh_home, tmp_path, monkeypatch):
+        """``HERMES_KANBAN_DB`` pins implicit routing; explicit board= wins."""
         forced = tmp_path / "custom.db"
         monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
         assert kb.kanban_db_path() == forced
-        assert kb.kanban_db_path(board="ignored") == forced
+        assert kb.kanban_db_path(board="ignored") == (
+            fresh_home / "kanban" / "boards" / "ignored" / "kanban.db"
+        )
+
+    def test_scoped_current_board_overrides_env_var_db(self, fresh_home, tmp_path, monkeypatch):
+        """CLI --board scope must beat a worker/env-pinned DB for one call."""
+        kb.create_board("scoped")
+        forced = tmp_path / "custom.db"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
+        assert kb.kanban_db_path() == forced
+        with kb.scoped_current_board("scoped"):
+            assert kb.kanban_db_path() == (
+                fresh_home / "kanban" / "boards" / "scoped" / "kanban.db"
+            )
+        assert kb.kanban_db_path() == forced
 
     def test_env_var_workspaces_override(self, fresh_home, tmp_path, monkeypatch):
         forced = tmp_path / "ws"
@@ -531,6 +545,38 @@ class TestCLI:
         assert titlesA == ["Task A"]
         assert titlesB == ["Task B"]
         assert titlesD == []
+
+    def test_existing_card_commands_auto_route_to_task_board(self, tmp_path):
+        env = {"HERMES_HOME": str(tmp_path)}
+        assert _cli(["boards", "create", "projA"], env_extra=env).returncode == 0
+        assert _cli(["boards", "switch", "default"], env_extra=env).returncode == 0
+
+        created = _cli(
+            ["--board", "projA", "create", "Task A", "--assignee", "dev", "--json"],
+            env_extra=env,
+        )
+        assert created.returncode == 0, created.stderr
+        task_id = json.loads(created.stdout)["id"]
+
+        shown = _cli(["show", task_id, "--json"], env_extra=env)
+        assert shown.returncode == 0, shown.stderr
+        assert json.loads(shown.stdout)["task"]["title"] == "Task A"
+
+        commented = _cli(["comment", task_id, "routed comment"], env_extra=env)
+        assert commented.returncode == 0, commented.stderr
+        assert "Comment added" in commented.stdout
+
+        updated = _cli(["set-priority", task_id, "17", "--json"], env_extra=env)
+        assert updated.returncode == 0, updated.stderr
+        assert json.loads(updated.stdout)["priority"] == 17
+
+        # The default board stayed empty; the mutation landed on projA.
+        default_list = _cli(["list", "--json"], env_extra=env)
+        proj_list = _cli(["--board", "projA", "list", "--json"], env_extra=env)
+        assert json.loads(default_list.stdout) == []
+        proj_tasks = json.loads(proj_list.stdout)
+        assert proj_tasks[0]["id"] == task_id
+        assert proj_tasks[0]["priority"] == 17
 
     def test_board_flag_rejects_unknown(self, tmp_path):
         env = {"HERMES_HOME": str(tmp_path)}

@@ -950,6 +950,123 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(f"kanban_create: {e}")
 
 
+def _handle_update(args: dict, **kw) -> str:
+    """Update an existing Kanban task's routing/spec fields."""
+    guard = _require_orchestrator_tool("kanban_update")
+    if guard:
+        return guard
+    tid = args.get("task_id")
+    if not tid:
+        return tool_error("task_id is required")
+
+    allowed_fields = {
+        "title", "body", "assignee", "priority",
+        "max_runtime_seconds", "goal_mode", "goal_max_turns",
+    }
+    requested = {k for k in allowed_fields if k in args}
+    if not requested:
+        return tool_error(
+            "at least one update field is required: "
+            + ", ".join(sorted(allowed_fields))
+        )
+
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            with kb.write_txn(conn):
+                row = conn.execute(
+                    "SELECT id, status, claim_lock, assignee FROM tasks WHERE id = ?",
+                    (str(tid),),
+                ).fetchone()
+                if not row:
+                    return tool_error(f"unknown task {tid}")
+
+                updates: list[str] = []
+                values: list[Any] = []
+                changed: dict[str, Any] = {}
+
+                if "title" in args:
+                    title = str(args.get("title") or "").strip()
+                    if not title:
+                        return tool_error("title cannot be empty")
+                    updates.append("title = ?")
+                    values.append(title)
+                    changed["title"] = title
+
+                if "body" in args:
+                    body = args.get("body")
+                    updates.append("body = ?")
+                    values.append(None if body is None else str(body))
+                    changed["body"] = None if body is None else str(body)
+
+                if "assignee" in args:
+                    assignee = args.get("assignee")
+                    if row["status"] == "running" and row["claim_lock"] is not None:
+                        return tool_error(
+                            f"cannot reassign {tid}: currently running (claimed). "
+                            "Wait for completion or reclaim the stale lock first."
+                        )
+                    updates.append("assignee = ?")
+                    values.append(assignee)
+                    changed["assignee"] = assignee
+                    if row["assignee"] != assignee:
+                        updates.append("consecutive_failures = 0")
+                        updates.append("last_failure_error = NULL")
+
+                if "priority" in args:
+                    priority = int(args.get("priority"))
+                    updates.append("priority = ?")
+                    values.append(priority)
+                    changed["priority"] = priority
+
+                if "max_runtime_seconds" in args:
+                    raw = args.get("max_runtime_seconds")
+                    value = int(raw) if raw is not None else None
+                    updates.append("max_runtime_seconds = ?")
+                    values.append(value)
+                    changed["max_runtime_seconds"] = value
+
+                if "goal_mode" in args:
+                    goal_mode, bool_error = _parse_bool_arg(args, "goal_mode")
+                    if bool_error:
+                        return tool_error(bool_error)
+                    updates.append("goal_mode = ?")
+                    values.append(1 if goal_mode else 0)
+                    changed["goal_mode"] = goal_mode
+
+                if "goal_max_turns" in args:
+                    raw = args.get("goal_max_turns")
+                    value = int(raw) if raw is not None else None
+                    updates.append("goal_max_turns = ?")
+                    values.append(value)
+                    changed["goal_max_turns"] = value
+
+                values.append(str(tid))
+                conn.execute(
+                    f"UPDATE tasks SET {', '.join(updates)} WHERE id = ?",
+                    values,
+                )
+                kb._append_event(conn, str(tid), "updated", changed)
+
+            task = kb.get_task(conn, str(tid))
+            return _ok(
+                task_id=str(tid),
+                title=task.title if task else None,
+                assignee=task.assignee if task else None,
+                status=task.status if task else None,
+                priority=task.priority if task else None,
+                updated=changed,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_update: {e}")
+    except Exception as e:
+        logger.exception("kanban_update failed")
+        return tool_error(f"kanban_update: {e}")
+
+
 def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     """Auto-subscribe the calling session to task completion / block events.
 
@@ -1547,6 +1664,44 @@ KANBAN_CREATE_SCHEMA = {
     },
 }
 
+
+KANBAN_UPDATE_SCHEMA = {
+    "name": "kanban_update",
+    "description": (
+        "Update an existing Kanban task's spec/routing fields. "
+        "Orchestrator-only; use for priority changes, title/body corrections, "
+        "reassignment, and goal/runtime tuning without deleting/recreating "
+        "the card or losing its thread."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": "Task id to update."},
+            "title": {"type": "string", "description": "Replacement title."},
+            "body": {"type": "string", "description": "Replacement opening/spec body."},
+            "assignee": {"type": "string", "description": "Replacement assignee profile."},
+            "priority": {
+                "type": "integer",
+                "description": "Dispatcher tiebreaker. Higher = picked sooner.",
+            },
+            "max_runtime_seconds": {
+                "type": "integer",
+                "description": "Replacement per-task runtime cap in seconds; null clears it.",
+            },
+            "goal_mode": {
+                "type": "boolean",
+                "description": "Whether the worker should run in goal-loop mode.",
+            },
+            "goal_max_turns": {
+                "type": "integer",
+                "description": "Replacement goal-loop turn budget; null clears it.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id"],
+    },
+}
+
 KANBAN_UNBLOCK_SCHEMA = {
     "name": "kanban_unblock",
     "description": (
@@ -1651,6 +1806,16 @@ registry.register(
     handler=_handle_create,
     check_fn=_check_kanban_mode,
     emoji="➕",
+)
+
+
+registry.register(
+    name="kanban_update",
+    toolset="kanban",
+    schema=KANBAN_UPDATE_SCHEMA,
+    handler=_handle_update,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="✏️",
 )
 
 registry.register(

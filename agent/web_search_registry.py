@@ -239,6 +239,71 @@ def get_active_extract_provider() -> Optional[WebSearchProvider]:
     return _resolve(explicit, capability="extract")
 
 
+def _read_config_backends(*path: str) -> list:
+    """Read an ordered list of backend names from config.yaml at *path*.
+
+    Returns an empty list when the key is unset or the value is not a list.
+    Used by :func:`get_search_chain` / :func:`get_extract_chain` to discover
+    the failover chain configured under ``web.search_backends`` /
+    ``web.extract_backends``.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        cur = cfg
+        for segment in path:
+            if not isinstance(cur, dict):
+                return []
+            cur = cur.get(segment)
+        if isinstance(cur, list):
+            return [str(v).strip() for v in cur if str(v).strip()]
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Could not read config %s: %s", ".".join(path), exc)
+    return []
+
+
+def get_search_chain() -> list:
+    """Return the ordered list of search providers configured for failover.
+
+    Reads ``web.search_backends`` from config.yaml; each entry is resolved
+    via :func:`get_provider` so only *registered* providers are included.
+    Returns an empty list when no chain is configured (legacy single-provider
+    path stays unchanged).
+    """
+    names = _read_config_backends("web", "search_backends")
+    with _lock:
+        snapshot = dict(_providers)
+    chain = []
+    for name in names:
+        provider = snapshot.get(name)
+        if provider is not None and provider.supports_search():
+            chain.append(provider)
+        else:
+            logger.debug("get_search_chain: skipping unknown/incapable provider '%s'", name)
+    return chain
+
+
+def get_extract_chain() -> list:
+    """Return the ordered list of extract providers configured for failover.
+
+    Reads ``web.extract_backends`` from config.yaml; each entry is resolved
+    via :func:`get_provider`.  Returns an empty list when no chain is
+    configured.
+    """
+    names = _read_config_backends("web", "extract_backends")
+    with _lock:
+        snapshot = dict(_providers)
+    chain = []
+    for name in names:
+        provider = snapshot.get(name)
+        if provider is not None and provider.supports_extract():
+            chain.append(provider)
+        else:
+            logger.debug("get_extract_chain: skipping unknown/incapable provider '%s'", name)
+    return chain
+
+
 def _reset_for_tests() -> None:
     """Clear the registry. **Test-only.**"""
     with _lock:

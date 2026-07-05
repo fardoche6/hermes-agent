@@ -27,11 +27,13 @@ Board resolution order (highest precedence first, all optional):
 * ``board=`` argument passed directly to :func:`connect` / :func:`init_db`
   (explicit — used by the CLI ``--board`` flag and the dashboard
   ``?board=...`` query param).
+* Scoped board override from :func:`scoped_current_board` (used by the CLI
+  ``--board`` flag for subcommands that don't thread ``board=`` directly).
+* ``HERMES_KANBAN_DB`` env var (pins the DB file path directly for calls
+  without an explicit ``board=`` — legacy override still honoured and used
+  for dispatcher→worker handoff).
 * ``HERMES_KANBAN_BOARD`` env var (used by the dispatcher to pin workers
   to the board their task lives on — workers cannot see other boards).
-* ``HERMES_KANBAN_DB`` env var (pins the DB file path directly — legacy
-  override still honoured; highest precedence when the file path itself
-  is what the caller wants to force).
 * ``<root>/kanban/current`` — a one-line text file holding the slug of
   the "currently selected" board. Written by ``hermes kanban boards
   switch <slug>``. When absent, the active board is ``default``.
@@ -133,8 +135,22 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+EXTERNAL_CLAUDECODE_LANE_RE = re.compile(r"[-_]claudecode\d*$", re.IGNORECASE)
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
+
+
+def _is_external_claudecode_lane_assignee(assignee: Optional[str]) -> bool:
+    """Return true for Claude Code pull-lane assignees.
+
+    ``*-claudecode`` and numbered variants like ``programmer-claudecode2`` are
+    owned by the external Claude lane poller/wrapper.  They are not safe for the
+    stock dispatcher to spawn via ``hermes -p <assignee>`` even if a matching
+    Hermes profile directory happens to exist; that native shell can exit rc=0
+    conversationally without writing a terminal Kanban state.
+    """
+    return bool(assignee and EXTERNAL_CLAUDECODE_LANE_RE.search(str(assignee)))
+
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
@@ -517,20 +533,33 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
 
     Resolution (highest precedence first):
 
-    1. ``HERMES_KANBAN_DB`` env var — pins the path directly. Honoured for
-       back-compat and for the dispatcher→worker handoff (defense in
-       depth: dispatcher injects this into worker env so workers are
-       immune to any path-resolution disagreement).
-    2. When ``board`` arg is None, the active board from
+    1. Explicit ``board`` arg — per-call board routing must be able to
+       override a dispatcher-pinned worker env.
+    2. Scoped board override from :func:`scoped_current_board` — CLI
+       ``--board`` uses this path for subcommands that don't pass ``board=``.
+    3. ``HERMES_KANBAN_DB`` env var when no board arg/scoped board is given — pins the
+       path directly for back-compat and for the dispatcher→worker handoff
+       (defense in depth: dispatcher injects this into worker env so workers
+       are immune to any path-resolution disagreement).
+    4. When no explicit/scoped/db pin is present, the active board from
        :func:`get_current_board` is used.
-    3. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
+    5. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
        Other boards → ``<root>/kanban/boards/<slug>/kanban.db``.
     """
-    override = os.environ.get("HERMES_KANBAN_DB", "").strip()
-    if override:
-        return Path(override).expanduser()
     slug = _normalize_board_slug(board)
     if slug is None:
+        scoped = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
+        if scoped:
+            try:
+                normed = _normalize_board_slug(scoped)
+                if normed and board_exists(normed):
+                    slug = normed
+            except ValueError:
+                pass
+    if slug is None:
+        override = os.environ.get("HERMES_KANBAN_DB", "").strip()
+        if override:
+            return Path(override).expanduser()
         slug = get_current_board()
     if slug == DEFAULT_BOARD:
         return kanban_home() / "kanban.db"
@@ -782,6 +811,41 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
             entries.append(meta)
             seen.add(normed)
     return entries
+
+
+def task_boards(task_id: str, *, include_archived: bool = False) -> list[str]:
+    """Return board slugs containing ``task_id``.
+
+    This is intentionally a small, read-only lookup for CLI recovery/routing:
+    when an operator runs ``hermes kanban show t_...`` from the wrong current
+    board, existing-card operations can find the card's real board instead of
+    reporting a false ``no such task``.  Duplicate task ids are theoretically
+    possible across boards, so callers get the full list and can require an
+    explicit ``--board`` when the match is ambiguous.
+    """
+    tid = (task_id or "").strip()
+    if not tid:
+        return []
+
+    matches: list[str] = []
+    for entry in list_boards(include_archived=include_archived):
+        slug = str(entry.get("slug") or "").strip()
+        if not slug:
+            continue
+        try:
+            with connect_closing(board=slug) as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM tasks WHERE id = ? LIMIT 1",
+                    (tid,),
+                ).fetchone()
+        except Exception:
+            # A corrupt/unreadable board should not make a lookup for a task on
+            # another board unusable. The command's normal board-specific path
+            # will still surface the real DB error if the user targets it.
+            continue
+        if row:
+            matches.append(slug)
+    return matches
 
 
 def remove_board(slug: str, *, archive: bool = True) -> dict:
@@ -3278,6 +3342,119 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+def _latest_block_reason(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Return the latest explicit kanban_block reason, if still active."""
+    row = conn.execute(
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not row or row["kind"] != "blocked":
+        return None
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return None
+    reason = payload.get("reason")
+    return str(reason) if reason is not None else None
+
+
+def _is_review_assignee(assignee: Optional[str]) -> bool:
+    name = _canonical_assignee(assignee) or ""
+    return "reviewer" in name or name in {"code-reviewer", "code-reviewer-claudecode"}
+
+
+def _parent_is_review_required_block(conn: sqlite3.Connection, parent_id: str) -> bool:
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (parent_id,),
+    ).fetchone()
+    if not row or row["status"] != "blocked":
+        return False
+    reason = (_latest_block_reason(conn, parent_id) or "").casefold()
+    return "review-required" in reason
+
+
+def _review_gate_parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
+    task = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if not task or not _is_review_assignee(task["assignee"]):
+        return False
+    parents = conn.execute(
+        "SELECT t.id, t.status FROM tasks t "
+        "JOIN task_links l ON l.parent_id = t.id "
+        "WHERE l.child_id = ?",
+        (task_id,),
+    ).fetchall()
+    return bool(parents) and all(
+        p["status"] in ("done", "archived")
+        or _parent_is_review_required_block(conn, p["id"])
+        for p in parents
+    )
+
+
+def _has_completed_remediation_parent_after_latest_give_up(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> bool:
+    """Return True when a blocked task has fresh completed remediation.
+
+    Circuit-breaker blocks normally stay blocked once their failure counter
+    reaches the effective limit; otherwise a repeatedly failing task can loop
+    forever. A blocked-task fixer can legitimately repair the underlying
+    condition by linking a prerequisite/remediation parent after the ``gave_up``
+    event. When that newer parent is now terminal, the task deserves one fresh
+    dispatch attempt. If it fails again, the new ``gave_up`` is newer than the
+    remediation completion and this predicate flips back to False.
+    """
+    latest_failure = conn.execute(
+        "SELECT id FROM task_events "
+        "WHERE task_id = ? AND kind = 'gave_up' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    failure_event_id = int(latest_failure["id"]) if latest_failure else None
+    if failure_event_id is None:
+        return False
+
+    parents = conn.execute(
+        "SELECT parent_id FROM task_links WHERE child_id = ?",
+        (task_id,),
+    ).fetchall()
+    if not parents:
+        return False
+
+    for parent in parents:
+        parent_id = parent["parent_id"]
+        row = conn.execute(
+            "SELECT status, completed_at FROM tasks WHERE id = ?",
+            (parent_id,),
+        ).fetchone()
+        if not row or row["status"] not in ("done", "archived"):
+            continue
+        completed = conn.execute(
+            "SELECT id FROM task_events "
+            "WHERE task_id = ? AND kind IN ('completed', 'archived') "
+            "ORDER BY id DESC LIMIT 1",
+            (parent_id,),
+        ).fetchone()
+        completed_event_id = int(completed["id"]) if completed else None
+        if completed_event_id is not None and completed_event_id > failure_event_id:
+            return True
+        linked = conn.execute(
+            "SELECT MAX(id) AS event_id FROM task_events "
+            "WHERE task_id = ? AND kind = 'linked' "
+            "  AND json_extract(payload, '$.parent') = ? "
+            "  AND json_extract(payload, '$.child') = ?",
+            (task_id, parent_id, task_id),
+        ).fetchone()
+        linked_event_id = linked["event_id"] if linked else None
+        if linked_event_id is not None and int(linked_event_id) > failure_event_id:
+            return True
+    return False
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -3327,12 +3504,14 @@ def recompute_ready(
                 # this predicate back).
                 continue
             parents = conn.execute(
-                "SELECT t.status FROM tasks t "
+                "SELECT t.id, t.status FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            parents_satisfied = all(p["status"] in ("done", "archived") for p in parents)
+            review_gate_exception = _review_gate_parents_satisfied(conn, task_id)
+            if parents_satisfied or review_gate_exception:
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -3349,12 +3528,28 @@ def recompute_ready(
                         else int(failure_limit)
                     )
                     if failures >= effective_limit:
-                        continue
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready' "
-                        "WHERE id = ? AND status = 'blocked'",
-                        (task_id,),
-                    )
+                        if not _has_completed_remediation_parent_after_latest_give_up(
+                            conn, task_id,
+                        ):
+                            continue
+                        # A newer completed remediation parent is evidence
+                        # that the underlying blocker changed after the
+                        # circuit-breaker fired. Give the task a fresh budget
+                        # for exactly this new state; if it fails again, the
+                        # next gave_up event is newer than the remediation and
+                        # this escape hatch closes again.
+                        conn.execute(
+                            "UPDATE tasks SET status = 'ready', "
+                            "consecutive_failures = 0, last_failure_error = NULL "
+                            "WHERE id = ? AND status = 'blocked'",
+                            (task_id,),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE tasks SET status = 'ready' "
+                            "WHERE id = ? AND status = 'blocked'",
+                            (task_id,),
+                        )
                 else:
                     conn.execute(
                         "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
@@ -3399,7 +3594,7 @@ def claim_task(
             "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
             (task_id,),
         ).fetchone()
-        if undone:
+        if undone and not _review_gate_parents_satisfied(conn, task_id):
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'",
@@ -6899,6 +7094,8 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
     for row in rows:
+        if _is_external_claudecode_lane_assignee(row["assignee"]):
+            continue
         if profile_exists(row["assignee"]):
             return True
     return False
@@ -6924,6 +7121,8 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     except Exception:
         return True
     for row in rows:
+        if _is_external_claudecode_lane_assignee(row["assignee"]):
+            continue
         if profile_exists(row["assignee"]):
             return True
     return False
@@ -7198,6 +7397,9 @@ def _dispatch_once_locked(
             from hermes_cli.profiles import profile_exists  # local import: avoids cycle
         except Exception:
             profile_exists = None  # type: ignore[assignment]
+        if _is_external_claudecode_lane_assignee(row_assignee):
+            result.skipped_nonspawnable.append(row["id"])
+            continue
         if profile_exists is not None and not profile_exists(row_assignee):
             # Bucket separately from skipped_unassigned: the operator
             # cannot fix this by assigning a profile (the assignee IS the
@@ -7338,6 +7540,9 @@ def _dispatch_once_locked(
             from hermes_cli.profiles import profile_exists
         except Exception:
             profile_exists = None  # type: ignore[assignment]
+        if _is_external_claudecode_lane_assignee(row["assignee"]):
+            result.skipped_nonspawnable.append(row["id"])
+            continue
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
@@ -7793,6 +7998,7 @@ def _default_spawn(
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
         "chat",
+        "--quiet",
         "-q", prompt,
     ])
     # Redirect output to a per-task log under <board-root>/logs/.
