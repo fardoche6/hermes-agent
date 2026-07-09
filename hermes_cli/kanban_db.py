@@ -102,6 +102,19 @@ _log = logging.getLogger(__name__)
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
+REVIEWER_PROFILE = "code-reviewer"
+REVIEWER_SKILL = "code-review"
+REVIEW_BOUNCE_ESCALATION_LIMIT = 3
+REVIEW_GATED_ASSIGNEES = frozenset({
+    "programmer",
+    "coder",
+    "codex",
+    "openai-codex",
+    "gpt-5.5",
+    "orchestrator-codex",
+    "programmer-codex",
+})
+
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
 # instead of all landing in one undifferentiated ``blocked`` bucket that a cron
@@ -3236,6 +3249,391 @@ def _synthesize_ended_run(
     return int(cur.lastrowid or 0)
 
 
+def _normalise_assignee_name(name: Optional[str]) -> str:
+    return (name or "").strip().casefold().replace("_", "-")
+
+
+def _is_review_gated_assignee(name: Optional[str]) -> bool:
+    return _normalise_assignee_name(name) in REVIEW_GATED_ASSIGNEES
+
+
+def _insert_comment_unlocked(
+    conn: sqlite3.Connection,
+    task_id: str,
+    author: str,
+    body: str,
+    *,
+    run_id: Optional[int] = None,
+) -> int:
+    """Insert a comment inside an existing write transaction."""
+    if not body or not body.strip():
+        raise ValueError("comment body is required")
+    if not author or not author.strip():
+        raise ValueError("comment author is required")
+    now = int(time.time())
+    cur = conn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (task_id, author.strip(), body.strip(), now),
+    )
+    _append_event(
+        conn,
+        task_id,
+        "commented",
+        {"author": author.strip(), "len": len(body.strip())},
+        run_id=run_id,
+    )
+    return int(cur.lastrowid or 0)
+
+
+def _latest_review_submit_payload(
+    conn: sqlite3.Connection, task_id: str
+) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'submitted_for_review' "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not row or not row["payload"]:
+        return {}
+    try:
+        payload = json.loads(row["payload"])
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _review_original_assignee(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    payload = _latest_review_submit_payload(conn, task_id)
+    assignee = payload.get("implementer_assignee")
+    return str(assignee).strip() if assignee else None
+
+
+def _review_rejection_count(conn: sqlite3.Connection, task_id: str) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_rejected'",
+        (task_id,),
+    ).fetchone()
+    return int(row["n"] if row else 0)
+
+
+def _format_review_findings(findings: Optional[Iterable[Any]]) -> str:
+    if not findings:
+        return "- No structured findings supplied."
+    lines: list[str] = []
+    for item in findings:
+        if isinstance(item, dict):
+            bits = []
+            severity = item.get("severity")
+            location = ""
+            if item.get("file"):
+                location = str(item.get("file"))
+                if item.get("line") is not None:
+                    location += f":{item.get('line')}"
+            issue = item.get("issue") or item.get("summary") or item.get("message")
+            if severity:
+                bits.append(str(severity))
+            if location:
+                bits.append(location)
+            if issue:
+                bits.append(str(issue))
+            lines.append("- " + " — ".join(bits) if bits else f"- {item}")
+        else:
+            lines.append(f"- {item}")
+    return "\n".join(lines)
+
+
+def _append_review_findings_to_body(
+    body: Optional[str],
+    *,
+    cycle: int,
+    summary: Optional[str],
+    findings: Optional[Iterable[Any]],
+) -> str:
+    section = [
+        f"Review findings (cycle {cycle})",
+        "",
+        (summary or "Code review requested changes.").strip(),
+        "",
+        _format_review_findings(findings),
+    ]
+    return ((body or "").rstrip() + "\n\n" + "\n".join(section).strip() + "\n").lstrip()
+
+
+def _has_review_pass_comment(conn: sqlite3.Connection, task_id: str) -> bool:
+    return bool(conn.execute(
+        "SELECT 1 FROM task_comments "
+        "WHERE task_id = ? AND body LIKE '%REVIEW-PASS%' LIMIT 1",
+        (task_id,),
+    ).fetchone())
+
+
+def _validate_review_done_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+) -> None:
+    missing: list[str] = []
+    if not _has_review_pass_comment(conn, task_id):
+        missing.append("REVIEW-PASS comment")
+    if not isinstance(metadata, dict):
+        missing.extend([
+            "pr_url",
+            "human_merged",
+            "claude_verdict",
+            "gemini_code_assist",
+            "github_review_threads_resolved",
+            "review_threads_resolution_proof",
+        ])
+    else:
+        if not metadata.get("pr_url"):
+            missing.append("pr_url")
+        if metadata.get("human_merged") is not True:
+            missing.append("human_merged")
+        if not (
+            metadata.get("claude_verdict")
+            or metadata.get("claude_review")
+            or metadata.get("claude_code_verdict")
+        ):
+            missing.append("claude_verdict")
+        if not (
+            metadata.get("gemini_code_assist")
+            or metadata.get("gemini_verdict")
+            or metadata.get("gemini_status")
+        ):
+            missing.append("gemini_code_assist")
+        if metadata.get("github_review_threads_resolved") is not True:
+            missing.append("github_review_threads_resolved")
+        if not metadata.get("review_threads_resolution_proof"):
+            missing.append("review_threads_resolution_proof")
+    if missing:
+        raise ValueError(
+            "review->done requires " + ", ".join(dict.fromkeys(missing))
+        )
+
+
+def submit_task_for_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Transition an implementer run from ``running`` to ``review``.
+
+    This is the coding-worker handoff: the implementation run closes with
+    ``submitted_for_review`` evidence, but the task itself is not done.
+    """
+    if metadata is not None and not isinstance(metadata, dict):
+        raise ValueError("metadata must be a dict")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "running":
+            return False
+        if expected_run_id is not None and row["current_run_id"] != int(expected_run_id):
+            return False
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status        = 'review',
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL
+             WHERE id = ?
+               AND status = 'running'
+            """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+            (task_id,) if expected_run_id is None else (task_id, int(expected_run_id)),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="submitted_for_review",
+            status="review",
+            summary=summary,
+            metadata=metadata,
+        )
+        if run_id is None and (summary or metadata):
+            run_id = _synthesize_ended_run(
+                conn,
+                task_id,
+                outcome="submitted_for_review",
+                summary=summary,
+                metadata=metadata,
+            )
+        payload = {
+            "summary": summary,
+            "metadata": metadata,
+            "implementer_assignee": row["assignee"],
+            "reviewer_profile": REVIEWER_PROFILE,
+        }
+        _append_event(conn, task_id, "submitted_for_review", payload, run_id=run_id)
+    return True
+
+
+def record_review_verdict(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    approved: bool,
+    findings: Optional[Iterable[Any]] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    reviewer: str = REVIEWER_PROFILE,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Record a reviewer verdict and route the task.
+
+    ``approved=True`` records ``REVIEW-PASS`` and leaves the task in review for
+    human merge/done. Blocking findings bounce to the original implementer; the
+    third rejection escalates to blocked for human review.
+    """
+    if metadata is not None and not isinstance(metadata, dict):
+        raise ValueError("metadata must be a dict")
+    findings_list = list(findings or [])
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, assignee, body, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "running":
+            return False
+        if _normalise_assignee_name(row["assignee"]) != _normalise_assignee_name(reviewer):
+            return False
+        if expected_run_id is not None and row["current_run_id"] != int(expected_run_id):
+            return False
+
+        verdict_metadata = dict(metadata or {})
+        verdict_metadata["findings"] = findings_list
+
+        if approved:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status        = 'review',
+                       claim_lock    = NULL,
+                       claim_expires = NULL,
+                       worker_pid    = NULL
+                 WHERE id = ?
+                   AND status = 'running'
+                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+                (task_id,) if expected_run_id is None else (task_id, int(expected_run_id)),
+            )
+            if cur.rowcount != 1:
+                return False
+            run_id = _end_run(
+                conn,
+                task_id,
+                outcome="review_passed",
+                status="review",
+                summary=summary,
+                metadata=verdict_metadata,
+            )
+            body = "REVIEW-PASS"
+            if summary:
+                body += f": {summary.strip()}"
+            _insert_comment_unlocked(conn, task_id, reviewer, body, run_id=run_id)
+            _append_event(
+                conn,
+                task_id,
+                "review_passed",
+                {"summary": summary, "metadata": metadata},
+                run_id=run_id,
+            )
+            return True
+
+        cycle = _review_rejection_count(conn, task_id) + 1
+        original_assignee = _review_original_assignee(conn, task_id) or row["assignee"]
+        escalated = cycle >= REVIEW_BOUNCE_ESCALATION_LIMIT
+        new_status = "blocked" if escalated else "ready"
+        new_body = _append_review_findings_to_body(
+            row["body"], cycle=cycle, summary=summary, findings=findings_list,
+        )
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status        = ?,
+                   assignee      = ?,
+                   body          = ?,
+                   claim_lock    = NULL,
+                   claim_expires = NULL,
+                   worker_pid    = NULL,
+                   block_kind    = CASE WHEN ? THEN 'needs_input' ELSE block_kind END
+             WHERE id = ?
+               AND status = 'running'
+            """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
+            (
+                new_status,
+                original_assignee,
+                new_body,
+                1 if escalated else 0,
+                task_id,
+            ) if expected_run_id is None else (
+                new_status,
+                original_assignee,
+                new_body,
+                1 if escalated else 0,
+                task_id,
+                int(expected_run_id),
+            ),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="review_rejected",
+            status=new_status,
+            summary=summary,
+            metadata=verdict_metadata,
+        )
+        comment = (
+            f"REVIEW-REQUEST-CHANGES cycle {cycle}: "
+            f"{(summary or 'blocking review findings').strip()}\n\n"
+            + _format_review_findings(findings_list)
+        )
+        if escalated:
+            comment += (
+                f"\n\nreview-cycle cap reached ({cycle}/{REVIEW_BOUNCE_ESCALATION_LIMIT}); "
+                "blocked for human escalation."
+            )
+        _insert_comment_unlocked(conn, task_id, reviewer, comment, run_id=run_id)
+        if escalated:
+            _append_event(
+                conn,
+                task_id,
+                "blocked",
+                {
+                    "reason": "review-cycle cap reached",
+                    "kind": "needs_input",
+                    "cycle": cycle,
+                    "limit": REVIEW_BOUNCE_ESCALATION_LIMIT,
+                },
+                run_id=run_id,
+            )
+        _append_event(
+            conn,
+            task_id,
+            "review_rejected",
+            {
+                "cycle": cycle,
+                "escalated": escalated,
+                "findings": findings_list,
+                "summary": summary,
+                "implementer_assignee": original_assignee,
+            },
+            run_id=run_id,
+        )
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Dependency resolution (todo -> ready)
 # ---------------------------------------------------------------------------
@@ -3497,27 +3895,24 @@ def claim_review_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    reviewer_profile: str = REVIEWER_PROFILE,
 ) -> Optional[Task]:
-    """Atomically transition ``review -> running``.
+    """Atomically transition ``review -> running`` under the reviewer lane.
 
-    Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``review`` status).
-
-    Unlike ``claim_task`` (which handles ``ready -> running``), this
-    does NOT check parent dependencies — the task already passed that
-    gate on its original ``todo -> ready -> running`` transition.
-
-    Creates a new run entry so the review agent's lifecycle is tracked
-    independently from the original worker run.
+    Review cards are never claimed by the implementer assignee. The dispatcher
+    forces them through ``code-reviewer`` so the same coding worker cannot mark
+    its own PR clean or spawn a duplicate implementation run.
     """
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    reviewer_profile = reviewer_profile or REVIEWER_PROFILE
     with write_txn(conn):
         cur = conn.execute(
             """
             UPDATE tasks
                SET status        = 'running',
+                   assignee      = ?,
                    claim_lock    = ?,
                    claim_expires = ?,
                    started_at    = COALESCE(started_at, ?)
@@ -3525,12 +3920,12 @@ def claim_review_task(
                AND status = 'review'
                AND claim_lock IS NULL
             """,
-            (lock, expires, now, task_id),
+            (reviewer_profile, lock, expires, now, task_id),
         )
         if cur.rowcount != 1:
             return None
         trow = conn.execute(
-            "SELECT assignee, max_runtime_seconds, current_step_key "
+            "SELECT max_runtime_seconds, current_step_key "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -3544,7 +3939,7 @@ def claim_review_task(
             """,
             (
                 task_id,
-                trow["assignee"] if trow else None,
+                reviewer_profile,
                 trow["current_step_key"] if trow else None,
                 lock,
                 expires,
@@ -3560,7 +3955,7 @@ def claim_review_task(
         _append_event(
             conn, task_id, "claimed",
             {"lock": lock, "expires": expires, "run_id": run_id,
-             "source_status": "review"},
+             "source_status": "review", "reviewer_profile": reviewer_profile},
             run_id=run_id,
         )
         return get_task(conn, task_id)
@@ -3985,11 +4380,12 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Transition ``running|ready -> done`` and record ``result``.
+    """Transition ``running|ready|review -> done`` and record ``result``.
 
-    Accepts a task that is merely ``ready`` too, so a manual CLI
-    completion (``hermes kanban complete <id>``) works without requiring
-    a claim/start/complete sequence.
+    Ready/manual completions remain supported. Review-gated coding workers
+    cannot close their own ``running`` tasks directly; they must submit to the
+    review lane first. ``review -> done`` requires structured review/merge
+    evidence.
 
     ``summary`` and ``metadata`` are stored on the closing run (if any)
     and surfaced to downstream children via :func:`build_worker_context`.
@@ -4043,6 +4439,22 @@ def complete_task(
         verified_cards = []
 
     with write_txn(conn):
+        state_row = conn.execute(
+            "SELECT status, assignee FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if state_row is None:
+            return False
+        cur_status = state_row["status"]
+        if cur_status == "blocked":
+            return False
+        if cur_status == "review":
+            _validate_review_done_evidence(conn, task_id, metadata)
+        if cur_status == "running" and _is_review_gated_assignee(state_row["assignee"]):
+            raise ValueError(
+                "review-gated coding task must be submitted to review; "
+                "direct running->done is rejected"
+            )
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -4056,7 +4468,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'review')
                 """,
                 (result, now, task_id),
             )
@@ -4073,7 +4485,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'review')
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
@@ -4086,8 +4498,8 @@ def complete_task(
             summary=summary if summary is not None else result,
             metadata=metadata,
         )
-        # If complete_task was called on a never-claimed task (ready or
-        # blocked → done with no run in flight), synthesize a
+        # If complete_task was called on a never-claimed task (ready/review
+        # → done with no run in flight), synthesize a
         # zero-duration run so the handoff fields are persisted in
         # attempt history instead of silently lost.
         if run_id is None and (summary or metadata or result):
@@ -6905,28 +7317,22 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
 
 
 def has_spawnable_review(conn: sqlite3.Connection) -> bool:
-    """Return True iff there is at least one review+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
+    """Return True iff a review card can be claimed by ``code-reviewer``.
 
-    Mirror of :func:`has_spawnable_ready` for the review column —
-    used by the health telemetry to decide whether the dispatcher
-    should have spawned a review agent.
+    Review status is a lane, not an assignee-specific worker queue: implementer
+    assignees must not reclaim their own review cards.
     """
-    rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
-        "WHERE status = 'review' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
-    ).fetchall()
-    if not rows:
+    row = conn.execute(
+        "SELECT 1 FROM tasks "
+        "WHERE status = 'review' AND claim_lock IS NULL LIMIT 1"
+    ).fetchone()
+    if not row:
         return False
     try:
         from hermes_cli.profiles import profile_exists  # local import: avoids cycle
     except Exception:
         return True
-    for row in rows:
-        if profile_exists(row["assignee"]):
-            return True
-    return False
+    return bool(profile_exists(REVIEWER_PROFILE))
 
 
 def dispatch_once(
@@ -7315,36 +7721,50 @@ def _dispatch_once_locked(
                 result.auto_blocked.append(claimed.id)
 
     # ---- review column dispatch ----
-    # Review tasks are tasks that a worker moved to 'review' after
-    # creating a PR.  The dispatcher spawns a review agent (loading
-    # sdlc-review skill) that verifies the PR and either merges (→ done)
-    # or rejects (→ back to running for the worker to fix).
+    # Review tasks are tasks that an implementer moved to 'review' after
+    # creating a PR. The dispatcher always claims them as the native
+    # code-reviewer profile; the implementer assignee is not eligible to
+    # review its own output. Review pass is recorded as a REVIEW-PASS comment;
+    # human merge/done stays separate.
     #
     # Same concurrency model as ready dispatch: review spawns count
     # against max_spawn alongside ready tasks, so the total number of
     # running workers stays bounded.
     review_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id FROM tasks "
         "WHERE status = 'review' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     for row in review_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
-        if not row["assignee"]:
-            result.skipped_unassigned.append(row["id"])
-            continue
         try:
             from hermes_cli.profiles import profile_exists
         except Exception:
             profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        if profile_exists is not None and not profile_exists(REVIEWER_PROFILE):
             result.skipped_nonspawnable.append(row["id"])
             continue
+        if _per_profile_cap is not None:
+            current = _per_profile_running.get(REVIEWER_PROFILE, 0)
+            if current >= _per_profile_cap:
+                result.skipped_per_profile_capped.append(
+                    (row["id"], REVIEWER_PROFILE, current)
+                )
+                continue
         if dry_run:
-            result.spawned.append((row["id"], row["assignee"], ""))
+            result.spawned.append((row["id"], REVIEWER_PROFILE, ""))
+            if _per_profile_cap is not None:
+                _per_profile_running[REVIEWER_PROFILE] = (
+                    _per_profile_running.get(REVIEWER_PROFILE, 0) + 1
+                )
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_review_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            reviewer_profile=REVIEWER_PROFILE,
+        )
         if claimed is None:
             continue
         try:
@@ -7366,12 +7786,12 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        # Force-load the sdlc-review skill for review agents — it carries
-        # the review logic (AC verification, merge, etc.). The mandatory
+        # Force-load the code-review skill for review agents — it carries
+        # the GitHub PR review workflow and Kanban verdict rules. The mandatory
         # kanban lifecycle is already injected into every worker's system
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
-        claimed.skills = ["sdlc-review"]
+        claimed.skills = [REVIEWER_SKILL]
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
@@ -7387,6 +7807,10 @@ def _dispatch_once_locked(
                 _set_worker_pid(conn, claimed.id, int(pid))
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
+            if _per_profile_cap is not None and claimed.assignee:
+                _per_profile_running[claimed.assignee] = (
+                    _per_profile_running.get(claimed.assignee, 0) + 1
+                )
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),

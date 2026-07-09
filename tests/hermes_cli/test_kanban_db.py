@@ -1170,6 +1170,52 @@ def test_complete_records_result(kanban_home):
     assert task.completed_at is not None
 
 
+def test_review_gated_worker_cannot_complete_running_task_directly(kanban_home):
+    """Programmer/code lanes must submit coding work to review, not done."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="coding card", assignee="programmer")
+        kb.claim_task(conn, t)
+        task_before = kb.get_task(conn, t)
+        assert task_before is not None
+        run_id = task_before.current_run_id
+
+        with pytest.raises(ValueError, match="review"):
+            kb.complete_task(conn, t, summary="PR is ready", expected_run_id=run_id)
+
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "running"
+        assert task.current_run_id == run_id
+
+
+def test_review_gated_worker_cannot_complete_running_task_without_run_gate(kanban_home):
+    """Direct running->done is rejected even for non-worker/manual callers."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="coding card", assignee="programmer")
+        kb.claim_task(conn, t)
+
+        with pytest.raises(ValueError, match="review"):
+            kb.complete_task(conn, t, summary="manual shortcut")
+
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "running"
+
+
+
+def test_complete_rejects_blocked_to_done_without_unblock(kanban_home):
+    """Blocked tasks must leave blocked via an explicit unblock, not done."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="needs human", assignee="researcher")
+        kb.claim_task(conn, t)
+        assert kb.block_task(conn, t, reason="needs decision")
+
+        assert kb.complete_task(conn, t, summary="skip the gate") is False
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "blocked"
+
+
 def test_block_then_unblock(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
@@ -3682,6 +3728,217 @@ def test_claim_review_task_transitions_to_running(kanban_home):
     assert claimed.claim_lock is not None
 
 
+def test_submit_task_for_review_moves_running_task_to_review(kanban_home):
+    """Implementer handoff closes the worker run but does not mark done."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="ship code", assignee="programmer")
+        kb.claim_task(conn, t)
+        task_before = kb.get_task(conn, t)
+        assert task_before is not None
+        run_id = task_before.current_run_id
+
+        ok = kb.submit_task_for_review(
+            conn,
+            t,
+            summary="PR ready for review",
+            metadata={"pr_url": "https://github.com/acme/repo/pull/1"},
+            expected_run_id=run_id,
+        )
+
+        assert ok is True
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "review"
+        assert task.current_run_id is None
+        run = kb.latest_run(conn, t)
+        assert run is not None
+        assert run.outcome == "submitted_for_review"
+        assert run.status == "review"
+        assert run.metadata == {"pr_url": "https://github.com/acme/repo/pull/1"}
+
+
+def test_claim_review_task_forces_code_reviewer_profile(kanban_home):
+    """Review cards are claimable only by the native code-reviewer lane."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review me", assignee="programmer")
+        _set_task_status(conn, t, "review")
+        claimed = kb.claim_review_task(conn, t)
+
+        assert claimed is not None
+        assert claimed.assignee == "code-reviewer"
+        run = kb.latest_run(conn, t)
+        assert run is not None
+        assert run.profile == "code-reviewer"
+
+
+def test_review_verdict_requires_code_reviewer_run(kanban_home):
+    """Implementer runs cannot self-record review verdicts."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="ship code", assignee="programmer")
+        kb.claim_task(conn, t)
+        task_before = kb.get_task(conn, t)
+        assert task_before is not None
+        run_id = task_before.current_run_id
+
+        ok = kb.record_review_verdict(
+            conn,
+            t,
+            approved=True,
+            summary="self-approved",
+            expected_run_id=run_id,
+        )
+
+        assert ok is False
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "running"
+        assert task.assignee == "programmer"
+        assert not any("REVIEW-PASS" in c.body for c in kb.list_comments(conn, t))
+
+
+
+def test_review_request_changes_returns_to_original_implementer(kanban_home):
+    """Correctness findings bounce review -> ready with findings as new spec."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="fix parser",
+            body="Original spec",
+            assignee="programmer",
+        )
+        kb.claim_task(conn, t)
+        kb.submit_task_for_review(conn, t, summary="PR ready")
+        kb.claim_review_task(conn, t)
+
+        ok = kb.record_review_verdict(
+            conn,
+            t,
+            approved=False,
+            findings=[{"severity": "correctness", "file": "parser.py", "line": 12, "issue": "parser drops empty fields"}],
+            summary="Correctness issue: parser drops empty fields",
+        )
+
+        assert ok is True
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.assignee == "programmer"
+        assert "Review findings (cycle 1)" in (task.body or "")
+        assert "parser drops empty fields" in (task.body or "")
+
+
+def test_third_blocking_review_failure_escalates_to_blocked(kanban_home):
+    """After two review bounces, the third failure escalates to a human block."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="fix parser", assignee="programmer")
+        for cycle in range(1, 4):
+            task = kb.get_task(conn, t)
+            assert task is not None
+            if task.status == "ready":
+                kb.claim_task(conn, t)
+            kb.submit_task_for_review(conn, t, summary=f"PR ready cycle {cycle}")
+            kb.claim_review_task(conn, t)
+            kb.record_review_verdict(
+                conn,
+                t,
+                approved=False,
+                findings=[{"severity": "correctness", "issue": f"bug {cycle}"}],
+                summary=f"blocking issue {cycle}",
+            )
+
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.assignee == "programmer"
+        comments = kb.list_comments(conn, t)
+        assert any("review-cycle cap" in c.body for c in comments)
+
+
+def test_review_escalation_stays_blocked_until_unblocked(kanban_home):
+    """Third blocking review failure is sticky-blocked for human escalation."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="fix parser", assignee="programmer")
+        for cycle in range(1, 4):
+            task = kb.get_task(conn, t)
+            assert task is not None
+            if task.status == "ready":
+                kb.claim_task(conn, t)
+            kb.submit_task_for_review(conn, t, summary=f"PR ready cycle {cycle}")
+            kb.claim_review_task(conn, t)
+            kb.record_review_verdict(
+                conn,
+                t,
+                approved=False,
+                findings=[{"severity": "correctness", "issue": f"bug {cycle}"}],
+                summary=f"blocking issue {cycle}",
+            )
+
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "blocked"
+        assert kb.recompute_ready(conn) == 0
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "blocked"
+
+
+
+def test_review_pass_records_review_pass_comment_without_done(kanban_home):
+    """A clean review records REVIEW-PASS and leaves human merge/done separate."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review me", assignee="programmer")
+        kb.claim_task(conn, t)
+        kb.submit_task_for_review(conn, t, summary="PR ready")
+        kb.claim_review_task(conn, t)
+
+        ok = kb.record_review_verdict(
+            conn,
+            t,
+            approved=True,
+            findings=[],
+            summary="Claude verdict: approve",
+            metadata={"claude_verdict": "approve", "gemini_code_assist": "timed_out"},
+        )
+
+        assert ok is True
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "review"
+        assert task.assignee == "code-reviewer"
+        comments = kb.list_comments(conn, t)
+        assert any("REVIEW-PASS" in c.body for c in comments)
+
+
+def test_review_done_requires_review_evidence_and_human_merge(kanban_home):
+    """Review -> done is guarded by pass, Claude, Gemini note, threads, merge."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="review me", assignee="programmer")
+        _set_task_status(conn, t, "review")
+        kb.add_comment(conn, t, "code-reviewer", "REVIEW-PASS: clean at abc123")
+
+        with pytest.raises(ValueError, match="human_merged"):
+            kb.complete_task(conn, t, summary="done", metadata={"claude_verdict": "approve"})
+
+        ok = kb.complete_task(
+            conn,
+            t,
+            summary="human merged after review clean",
+            metadata={
+                "pr_url": "https://github.com/acme/repo/pull/1",
+                "human_merged": True,
+                "claude_verdict": "approve",
+                "gemini_code_assist": "timed_out",
+                "github_review_threads_resolved": True,
+                "review_threads_resolution_proof": "gh api graphql reviewThreads all isResolved=true",
+            },
+        )
+
+        assert ok is True
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "done"
+
+
 def test_claim_review_task_fails_on_non_review(kanban_home):
     """claim_review_task returns None if task is not in review status."""
     with kb.connect() as conn:
@@ -3718,7 +3975,7 @@ def test_dispatch_review_dry_run(kanban_home, all_assignees_spawnable):
 def test_dispatch_review_spawns_with_correct_skills(
     kanban_home, all_assignees_spawnable,
 ):
-    """Review tasks get sdlc-review skill set before spawning."""
+    """Review tasks get code-review skill set before spawning."""
     spawned_tasks = []
 
     def capture_spawn(task, workspace, board=None):
@@ -3731,17 +3988,20 @@ def test_dispatch_review_spawns_with_correct_skills(
         res = kb.dispatch_once(conn, spawn_fn=capture_spawn)
     assert len(res.spawned) == 1
     assert len(spawned_tasks) == 1
-    assert spawned_tasks[0].skills == ["sdlc-review"]
+    assert spawned_tasks[0].assignee == "code-reviewer"
+    assert spawned_tasks[0].skills == ["code-review"]
 
 
-def test_dispatch_review_skips_unassigned(kanban_home):
-    """Unassigned review tasks go to skipped_unassigned, not spawned."""
+def test_dispatch_review_unassigned_routes_to_code_reviewer(
+    kanban_home, all_assignees_spawnable,
+):
+    """Unassigned review tasks are still claimable by code-reviewer."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="review floater")
         _set_task_status(conn, t, "review")
         res = kb.dispatch_once(conn, dry_run=True)
-    assert t in res.skipped_unassigned
-    assert not res.spawned
+    assert res.spawned == [(t, "code-reviewer", "")]
+    assert not res.skipped_unassigned
 
 
 def test_dispatch_review_counts_toward_max_spawn(
@@ -3766,6 +4026,23 @@ def test_dispatch_review_counts_toward_max_spawn(
     assert len(spawns) == 2
 
 
+def test_dispatch_review_respects_per_profile_cap(
+    kanban_home, all_assignees_spawnable,
+):
+    """Review dispatch applies the code-reviewer per-profile cap."""
+    with kb.connect() as conn:
+        t1 = kb.create_task(conn, title="review 1", assignee="programmer")
+        t2 = kb.create_task(conn, title="review 2", assignee="programmer")
+        _set_task_status(conn, t1, "review")
+        _set_task_status(conn, t2, "review")
+
+        res = kb.dispatch_once(conn, dry_run=True, max_in_progress_per_profile=1)
+
+    assert res.spawned == [(t1, "code-reviewer", "")]
+    assert res.skipped_per_profile_capped == [(t2, "code-reviewer", 1)]
+
+
+
 def test_dispatch_review_spawns_when_ready_empty(
     kanban_home, all_assignees_spawnable,
 ):
@@ -3784,7 +4061,7 @@ def test_dispatch_review_spawns_when_ready_empty(
     assert spawns[0] == t
 
 
-def test_has_spawnable_review_true(kanban_home):
+def test_has_spawnable_review_true(kanban_home, all_assignees_spawnable):
     """has_spawnable_review returns True when review tasks exist with real profiles."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="review me", assignee="default")

@@ -55,7 +55,8 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     names = {s["function"].get("name") for s in schema if "function" in s}
     kanban = {n for n in names if n and n.startswith("kanban_")}
     expected = {
-        "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
+        "kanban_show", "kanban_complete", "kanban_submit_review",
+        "kanban_review_verdict", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
@@ -135,7 +136,8 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     kanban = {n for n in names if n and n.startswith("kanban_")}
     expected = {
         "kanban_list",
-        "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
+        "kanban_show", "kanban_complete", "kanban_submit_review",
+        "kanban_review_verdict", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
         "kanban_unblock",
     }
@@ -335,6 +337,59 @@ def test_complete_metadata_round_trips_through_show(worker_env):
     assert shown["task"]["status"] == "done"
     assert shown["runs"][-1]["summary"] == "finished with structured evidence"
     assert shown["runs"][-1]["metadata"] == handoff
+
+
+def test_submit_review_happy_path(worker_env):
+    """kanban_submit_review moves the scoped worker task into review."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_submit_review({
+        "summary": "PR ready for review",
+        "metadata": {"pr_url": "https://github.com/acme/repo/pull/1"},
+    })
+    assert json.loads(out)["ok"] is True
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.status == "review"
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None
+        assert run.outcome == "submitted_for_review"
+    finally:
+        conn.close()
+
+
+def test_review_verdict_request_changes_routes_back_to_ready(worker_env):
+    """kanban_review_verdict can bounce a review card back to the implementer."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        assert kb.submit_task_for_review(conn, worker_env, summary="PR ready")
+        assert kb.claim_review_task(conn, worker_env)
+    finally:
+        conn.close()
+
+    out = kt._handle_review_verdict({
+        "approved": False,
+        "summary": "Correctness issue found",
+        "findings": [{"severity": "correctness", "issue": "wrong result"}],
+    })
+    assert json.loads(out)["ok"] is True
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.assignee == "test-worker"
+        assert "wrong result" in (task.body or "")
+    finally:
+        conn.close()
 
 
 def test_complete_stamps_worker_session_id_from_env(monkeypatch, worker_env):

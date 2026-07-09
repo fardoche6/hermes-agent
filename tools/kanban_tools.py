@@ -665,6 +665,133 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(f"kanban_complete: {e}")
 
 
+def _handle_submit_review(args: dict, **kw) -> str:
+    """Move the current implementation task to the review lane."""
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    summary = args.get("summary") or args.get("result")
+    metadata = args.get("metadata")
+    if not summary:
+        return tool_error("summary is required — include PR/review evidence")
+    summary = redact_sensitive_text(str(summary), force=True)
+    if metadata is not None and not isinstance(metadata, dict):
+        return tool_error(
+            f"metadata must be an object/dict, got {type(metadata).__name__}"
+        )
+    if isinstance(metadata, dict):
+        meta_json = redact_sensitive_text(json.dumps(metadata), force=True)
+        try:
+            metadata = json.loads(meta_json)
+        except json.JSONDecodeError:
+            pass
+    metadata = _stamp_worker_session_metadata(tid, metadata)
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            ok = kb.submit_task_for_review(
+                conn,
+                tid,
+                summary=summary,
+                metadata=metadata,
+                expected_run_id=_worker_run_id(tid),
+            )
+            if not ok:
+                return tool_error(
+                    f"could not submit {tid} for review (unknown id, not running, "
+                    "or stale run)"
+                )
+            run = kb.latest_run(conn, tid)
+            task = kb.get_task(conn, tid)
+            return _ok(
+                task_id=tid,
+                run_id=run.id if run else None,
+                status=task.status if task else "review",
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_submit_review: {e}")
+    except Exception as e:
+        logger.exception("kanban_submit_review failed")
+        return tool_error(f"kanban_submit_review: {e}")
+
+
+def _handle_review_verdict(args: dict, **kw) -> str:
+    """Record a code-review verdict and route the task."""
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    approved = args.get("approved")
+    if not isinstance(approved, bool):
+        return tool_error("approved must be a boolean")
+    summary = args.get("summary")
+    if summary is not None:
+        summary = redact_sensitive_text(str(summary), force=True)
+    findings = args.get("findings") or []
+    if not isinstance(findings, list):
+        return tool_error(
+            f"findings must be a list, got {type(findings).__name__}"
+        )
+    metadata = args.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return tool_error(
+            f"metadata must be an object/dict, got {type(metadata).__name__}"
+        )
+    try:
+        scrubbed = redact_sensitive_text(
+            json.dumps({"findings": findings, "metadata": metadata}), force=True
+        )
+        parsed = json.loads(scrubbed)
+        findings = parsed.get("findings", findings)
+        metadata = parsed.get("metadata", metadata)
+    except Exception:
+        pass
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            ok = kb.record_review_verdict(
+                conn,
+                tid,
+                approved=approved,
+                findings=findings,
+                summary=summary,
+                metadata=metadata,
+                expected_run_id=_worker_run_id(tid),
+            )
+            if not ok:
+                return tool_error(
+                    f"could not record review verdict for {tid} "
+                    "(unknown id, not in review-run state, or stale run)"
+                )
+            run = kb.latest_run(conn, tid)
+            task = kb.get_task(conn, tid)
+            return _ok(
+                task_id=tid,
+                run_id=run.id if run else None,
+                status=task.status if task else None,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_review_verdict: {e}")
+    except Exception as e:
+        logger.exception("kanban_review_verdict failed")
+        return tool_error(f"kanban_review_verdict: {e}")
+
+
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
     tid = _default_task_id(args.get("task_id"))
@@ -1287,6 +1414,102 @@ KANBAN_COMPLETE_SCHEMA = {
     },
 }
 
+KANBAN_SUBMIT_REVIEW_SCHEMA = {
+    "name": "kanban_submit_review",
+    "description": (
+        "Move the current implementation task from running to review. "
+        "Coding workers use this instead of kanban_complete after opening "
+        "a PR and running verification; the task is not done until review "
+        "passes, blocking review threads are resolved with substance, and "
+        "a human merge is recorded. Include the PR URL and test/check proof "
+        "in summary and/or metadata."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "summary": {
+                "type": "string",
+                "description": (
+                    "Human-readable handoff for the reviewer: PR URL, "
+                    "changed scope, and verification evidence."
+                ),
+            },
+            "metadata": {
+                "type": "object",
+                "description": (
+                    "Structured review handoff facts, e.g. pr_url, branch, "
+                    "changed_files, tests_run, ci_status, and residual risk."
+                ),
+            },
+            "result": {
+                "type": "string",
+                "description": "Legacy alias for summary; prefer summary.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": [],
+    },
+}
+
+KANBAN_REVIEW_VERDICT_SCHEMA = {
+    "name": "kanban_review_verdict",
+    "description": (
+        "Record the code-reviewer verdict for a review card. approved=true "
+        "records a REVIEW-PASS comment and leaves the card in review for "
+        "human merge/done; approved=false appends blocking findings to the "
+        "task body and routes it back to the original implementer (third "
+        "blocking failure escalates to blocked). Gemini/code-assist absence "
+        "is advisory: record timed_out/absent in metadata instead of blocking."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "approved": {
+                "type": "boolean",
+                "description": (
+                    "True for a clean Claude reviewer verdict; false when "
+                    "blocking correctness findings require implementer fixes."
+                ),
+            },
+            "summary": {
+                "type": "string",
+                "description": (
+                    "Concise reviewer verdict. Include Claude verdict and "
+                    "whether Gemini/code-assist was present, timed out, or absent."
+                ),
+            },
+            "findings": {
+                "type": "array",
+                "items": {"type": "object"},
+                "description": (
+                    "Structured findings. Correctness-level findings are "
+                    "blocking; style-level findings are advisory and should "
+                    "be recorded without setting approved=false unless they "
+                    "hide a correctness risk."
+                ),
+            },
+            "metadata": {
+                "type": "object",
+                "description": (
+                    "Structured verdict facts such as claude_verdict, "
+                    "gemini_code_assist, pr_url, head_sha, review_threads, "
+                    "and github_comment_urls."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["approved"],
+    },
+}
+
 KANBAN_BLOCK_SCHEMA = {
     "name": "kanban_block",
     "description": (
@@ -1615,6 +1838,24 @@ registry.register(
     handler=_handle_complete,
     check_fn=_check_kanban_mode,
     emoji="✔",
+)
+
+registry.register(
+    name="kanban_submit_review",
+    toolset="kanban",
+    schema=KANBAN_SUBMIT_REVIEW_SCHEMA,
+    handler=_handle_submit_review,
+    check_fn=_check_kanban_mode,
+    emoji="🔍",
+)
+
+registry.register(
+    name="kanban_review_verdict",
+    toolset="kanban",
+    schema=KANBAN_REVIEW_VERDICT_SCHEMA,
+    handler=_handle_review_verdict,
+    check_fn=_check_kanban_mode,
+    emoji="✅",
 )
 
 registry.register(
