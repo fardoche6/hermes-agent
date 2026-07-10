@@ -3991,6 +3991,11 @@ def complete_task(
     completion (``hermes kanban complete <id>``) works without requiring
     a claim/start/complete sequence.
 
+    ``blocked`` tasks are rejected (returns ``False`` and records a
+    ``completion_rejected_transition`` event) — ``unblock_task`` is the
+    only legitimate way out of ``blocked``, so completion must not be
+    usable to silently bypass it.
+
     ``summary`` and ``metadata`` are stored on the closing run (if any)
     and surfaced to downstream children via :func:`build_worker_context`.
     When ``summary`` is omitted we fall back to ``result`` so single-run
@@ -4042,6 +4047,29 @@ def complete_task(
     else:
         verified_cards = []
 
+    # Gate: 'blocked' tasks must go through the explicit unblock_task()
+    # path before they can be completed. Without this check a task a
+    # worker/operator deliberately blocked for human review could be
+    # marked done directly, silently skipping the review step. This is
+    # a read-then-decide check outside the main write txn (mirrors the
+    # created_cards gate above); the narrowed ``status IN (...)``
+    # clauses in the UPDATE below are the actual enforcement point and
+    # protect against a race where the status changes between this
+    # check and the write.
+    current = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if current is not None and current["status"] == "blocked":
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_rejected_transition",
+                {
+                    "reason": "blocked tasks require explicit unblock before completion",
+                    "status": "blocked",
+                },
+            )
+        return False
+
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -4056,7 +4084,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready')
                 """,
                 (result, now, task_id),
             )
@@ -4073,7 +4101,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready')
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
