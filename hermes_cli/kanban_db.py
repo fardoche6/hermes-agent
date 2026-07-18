@@ -859,6 +859,15 @@ class Task:
     project_id: Optional[str] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
+    canonical_goal: Optional[str] = None
+    task_type: str = "general"
+    review_required: bool = False
+    original_assignee: Optional[str] = None
+    review_assignee: Optional[str] = None
+    review_verdict: Optional[str] = None
+    review_evidence: Optional[dict] = None
+    merge_evidence: Optional[dict] = None
+    dispatcher_state: Optional[dict] = None
     # Unified non-success counter. Incremented on any of:
     #   * spawn failure (dispatcher couldn't launch the worker)
     #   * timed_out outcome (worker exceeded max_runtime_seconds)
@@ -948,6 +957,15 @@ class Task:
             tenant=row["tenant"] if "tenant" in keys else None,
             result=row["result"] if "result" in keys else None,
             idempotency_key=row["idempotency_key"] if "idempotency_key" in keys else None,
+            canonical_goal=row["canonical_goal"] if "canonical_goal" in keys else None,
+            task_type=row["task_type"] if "task_type" in keys and row["task_type"] else "general",
+            review_required=bool(row["review_required"]) if "review_required" in keys else False,
+            original_assignee=row["original_assignee"] if "original_assignee" in keys else None,
+            review_assignee=row["review_assignee"] if "review_assignee" in keys else None,
+            review_verdict=row["review_verdict"] if "review_verdict" in keys else None,
+            review_evidence=json.loads(row["review_evidence"]) if "review_evidence" in keys and row["review_evidence"] else None,
+            merge_evidence=json.loads(row["merge_evidence"]) if "merge_evidence" in keys and row["merge_evidence"] else None,
+            dispatcher_state=json.loads(row["dispatcher_state"]) if "dispatcher_state" in keys and row["dispatcher_state"] else None,
             consecutive_failures=(
                 row["consecutive_failures"] if "consecutive_failures" in keys
                 # Pre-migration fallback: ``_migrate_add_optional_columns`` always
@@ -1117,6 +1135,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     tenant               TEXT,
     result               TEXT,
     idempotency_key      TEXT,
+    canonical_goal       TEXT,
+    task_type            TEXT NOT NULL DEFAULT 'general',
+    review_required      INTEGER NOT NULL DEFAULT 0,
+    original_assignee    TEXT,
+    review_assignee      TEXT,
+    review_verdict       TEXT,
+    review_evidence      TEXT,
+    merge_evidence      TEXT,
+    dispatcher_state    TEXT,
     -- Unified consecutive-failure counter. Incremented on spawn
     -- failure, timeout, or crash; reset only on successful completion.
     -- The circuit breaker in _record_task_failure trips when this
@@ -1868,6 +1895,20 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "idempotency_key", "idempotency_key TEXT"
         )
+    if "canonical_goal" not in cols:
+        _add_column_if_missing(conn, "tasks", "canonical_goal", "canonical_goal TEXT")
+    for name, definition in (
+        ("task_type", "task_type TEXT NOT NULL DEFAULT 'general'"),
+        ("review_required", "review_required INTEGER NOT NULL DEFAULT 0"),
+        ("original_assignee", "original_assignee TEXT"),
+        ("review_assignee", "review_assignee TEXT"),
+        ("review_verdict", "review_verdict TEXT"),
+        ("review_evidence", "review_evidence TEXT"),
+        ("merge_evidence", "merge_evidence TEXT"),
+        ("dispatcher_state", "dispatcher_state TEXT"),
+    ):
+        if name not in cols:
+            _add_column_if_missing(conn, "tasks", name, definition)
     # ``idx_tasks_idempotency`` is created unconditionally below alongside
     # the other additive-column indexes — see the block after the
     # legacy-column migration. Creating it here too would be redundant.
@@ -1878,6 +1919,55 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # initial snapshot did not. Re-snapshot here so the legacy-column migration
     # below is truly idempotent and never re-adds columns that already exist.
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "canonical_goal" in cols:
+        body_expr = "body" if "body" in cols else "NULL"
+        for row in conn.execute(
+            f"SELECT id, title, {body_expr} AS body, tenant FROM tasks WHERE canonical_goal IS NULL"
+        ).fetchall():
+            conn.execute(
+                "UPDATE tasks SET canonical_goal = ? WHERE id = ?",
+                (
+                    _canonical_goal_key(
+                        canonical_goal=None,
+                        title=row["title"],
+                        body=row["body"],
+                        tenant=row["tenant"],
+                    ),
+                    row["id"],
+                ),
+            )
+    # Legacy duplicate keys are reconciled deterministically before unique
+    # indexes are created. Archived rows retain their keys, so reuse is not
+    # silently allowed; callers must choose a new idempotency key.
+    conn.execute(
+        "UPDATE tasks SET idempotency_key = NULL WHERE rowid NOT IN "
+        "(SELECT MIN(rowid) FROM tasks WHERE idempotency_key IS NOT NULL GROUP BY idempotency_key) "
+        "AND idempotency_key IS NOT NULL"
+    )
+    conn.execute(
+        "UPDATE tasks SET canonical_goal = NULL WHERE rowid NOT IN "
+        "(SELECT MIN(rowid) FROM tasks WHERE canonical_goal IS NOT NULL GROUP BY tenant, canonical_goal) "
+        "AND canonical_goal IS NOT NULL"
+    )
+    has_status = "status" in cols
+    conn.execute("DROP INDEX IF EXISTS idx_tasks_idempotency_unique")
+    idempotency_where = (
+        "idempotency_key IS NOT NULL AND status != 'archived'"
+        if has_status else "idempotency_key IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency_unique "
+        f"ON tasks(idempotency_key) WHERE {idempotency_where}"
+    )
+    conn.execute("DROP INDEX IF EXISTS idx_tasks_canonical_goal_unique")
+    canonical_where = (
+        "canonical_goal IS NOT NULL AND status != 'archived'"
+        if has_status else "canonical_goal IS NOT NULL"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_canonical_goal_unique "
+        f"ON tasks(tenant, canonical_goal) WHERE {canonical_where}"
+    )
 
     # Legacy column migration: ``spawn_failures`` → ``consecutive_failures``
     # and ``last_spawn_error`` → ``last_failure_error``.
@@ -2384,6 +2474,40 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _canonical_goal_key(*, canonical_goal: Optional[str], title: str, body: Optional[str], tenant: Optional[str]) -> str:
+    raw = str(canonical_goal if canonical_goal is not None else f"{title}\n{body or ''}").strip().lower()
+    scope = str(tenant or "").strip().lower()
+    return hashlib.sha256(f"{scope}\0{raw}".encode("utf-8")).hexdigest()
+
+
+def _validate_dispatcher_state(state: Optional[dict]) -> None:
+    """Require the typed dispatcher contract before admitting coding work."""
+    if not isinstance(state, dict):
+        raise ValueError(
+            "DISPATCHER_STATE_REQUIRED: coding admission needs a typed dispatcher packet"
+        )
+    required_types = {
+        "review_capacity": int,
+        "review_sla_seconds": int,
+        "typed_predicates": list,
+    }
+    if state.get("state_type") != "coding-admission-v1":
+        raise ValueError("DISPATCHER_STATE_INVALID: state_type must be coding-admission-v1")
+    for key, expected in required_types.items():
+        value = state.get(key)
+        if not isinstance(value, expected):
+            raise ValueError(f"DISPATCHER_STATE_INVALID: {key} is missing or has the wrong type")
+    if state["review_capacity"] < 1 or state["review_sla_seconds"] < 1:
+        raise ValueError("DISPATCHER_STATE_INVALID: review capacity and SLA must be positive")
+    if "review_required" not in state["typed_predicates"]:
+        raise ValueError("DISPATCHER_STATE_INVALID: review_required predicate is missing")
+    if "task_type" not in state["typed_predicates"]:
+        raise ValueError("DISPATCHER_STATE_INVALID: task_type predicate is missing")
+    per_profile = state.get("review_capacity_per_profile", state["review_capacity"])
+    if not isinstance(per_profile, int) or per_profile < 1:
+        raise ValueError("DISPATCHER_STATE_INVALID: review_capacity_per_profile is invalid")
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2399,6 +2523,10 @@ def create_task(
     parents: Iterable[str] = (),
     triage: bool = False,
     idempotency_key: Optional[str] = None,
+    canonical_goal: Optional[str] = None,
+    dispatcher_state: Optional[dict] = None,
+    task_type: str = "general",
+    review_required: Optional[bool] = None,
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None,
@@ -2433,8 +2561,31 @@ def create_task(
     translation skill regardless of the profile's default config).
     """
     assignee = _canonical_assignee(assignee)
+    task_type = str(task_type or "").strip().lower()
+    if task_type not in {"general", "coding", "research", "docs"}:
+        raise ValueError("task_type must be one of coding, docs, general, research")
+    if task_type == "coding" and review_required is None:
+        raise ValueError("coding tasks require explicit review_required=true")
+    if review_required is None:
+        review_required = False
+    review_required = bool(review_required)
+    if task_type == "coding" and not review_required:
+        raise ValueError("coding tasks require review_required=true")
+    if task_type == "coding":
+        _validate_dispatcher_state(dispatcher_state)
+    if task_type == "coding" and workspace_kind != "worktree":
+        raise ValueError("coding tasks require workspace_kind='worktree'")
+    if task_type == "coding" and not workspace_path and not project_id:
+        raise ValueError("coding tasks require an explicit workspace_path or project_id")
     if not title or not title.strip():
         raise ValueError("title is required")
+    tenant = str(tenant or "").strip().lower()
+    canonical_goal = _canonical_goal_key(
+        canonical_goal=canonical_goal,
+        title=title,
+        body=body,
+        tenant=tenant,
+    )
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
@@ -2635,9 +2786,11 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
+                        canonical_goal, task_type, review_required, original_assignee,
+                        dispatcher_state,
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2654,6 +2807,11 @@ def create_task(
                         project_id,
                         tenant,
                         idempotency_key,
+                        canonical_goal,
+                        task_type,
+                        1 if review_required else 0,
+                        assignee,
+                        json.dumps(dispatcher_state, ensure_ascii=False) if dispatcher_state is not None else None,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
                         json.dumps(skills_list) if skills_list is not None else None,
                         int(max_retries) if max_retries is not None else None,
@@ -2682,7 +2840,25 @@ def create_task(
                     },
                 )
             return task_id
-        except sqlite3.IntegrityError:
+        except sqlite3.IntegrityError as exc:
+            if "canonical_goal" in str(exc).lower():
+                if idempotency_key:
+                    row = conn.execute(
+                        "SELECT id FROM tasks WHERE idempotency_key = ?",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if row:
+                        return row["id"]
+                raise ValueError(
+                    "canonical goal already exists in this tenant/board scope"
+                ) from exc
+            if idempotency_key and "idempotency" in str(exc).lower():
+                row = conn.execute(
+                    "SELECT id FROM tasks WHERE idempotency_key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if row:
+                    return row["id"]
             if attempt == 1:
                 raise
             # Retry with a fresh id.
@@ -3626,6 +3802,18 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        state_row = conn.execute(
+            "SELECT dispatcher_state FROM tasks WHERE id = ? AND status = 'review'",
+            (task_id,),
+        ).fetchone()
+        if state_row and state_row["dispatcher_state"]:
+            try:
+                packet = json.loads(state_row["dispatcher_state"])
+                sla = int(packet["review_sla_seconds"])
+                if sla > 0:
+                    expires = min(expires, now + sla)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -3890,7 +4078,7 @@ def reclaim_task(
         cur = conn.execute(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
+            "WHERE id = ? AND status IN ('running', 'ready', 'blocked', 'review') "
             "AND claim_lock IS ?",
             (task_id, prev_lock),
         )
@@ -4087,6 +4275,97 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+def submit_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reviewer_assignee: str,
+    evidence: Optional[dict] = None,
+) -> bool:
+    """Move a review-required running task to same-card reviewer work."""
+    reviewer_assignee = _canonical_assignee(reviewer_assignee)
+    with write_txn(conn):
+        cur = conn.execute(
+            """UPDATE tasks SET status = 'review',
+                      original_assignee = COALESCE(original_assignee, assignee),
+                      review_assignee = ?, assignee = ?, review_verdict = NULL,
+                      review_evidence = ?, claim_lock = NULL,
+                      claim_expires = NULL, worker_pid = NULL, current_run_id = NULL
+               WHERE id = ? AND status = 'running' AND review_required = 1
+                 AND assignee != ?""",
+            (reviewer_assignee, reviewer_assignee,
+             json.dumps(evidence) if evidence is not None else None,
+             task_id, reviewer_assignee),
+        )
+        if cur.rowcount != 1:
+            return False
+        conn.execute(
+            "UPDATE task_runs SET status = 'done', outcome = 'review_submitted', "
+            "ended_at = ?, claim_lock = NULL, claim_expires = NULL "
+            "WHERE task_id = ? AND ended_at IS NULL",
+            (int(time.time()), task_id),
+        )
+        _append_event(conn, task_id, "review_submitted", {
+            "reviewer": reviewer_assignee,
+            "evidence": evidence or {},
+        })
+    return True
+
+
+def review_verdict(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    verdict: str,
+    reviewer: str,
+    evidence: Optional[dict] = None,
+) -> bool:
+    """Record an executable reviewer verdict on the same card."""
+    verdict = str(verdict).strip().lower()
+    if verdict not in {"approved", "changes_requested"}:
+        raise ValueError("verdict must be approved or changes_requested")
+    reviewer = _canonical_assignee(reviewer)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT original_assignee, review_assignee FROM tasks "
+            "WHERE id = ? AND status = 'running' AND review_required = 1",
+            (task_id,),
+        ).fetchone()
+        if not row or row["review_assignee"] != reviewer:
+            return False
+        ended_run = _end_run(
+            conn, task_id, outcome="review_verdict",
+            summary=f"review verdict: {verdict}",
+            metadata={"reviewer": reviewer},
+        )
+        if ended_run is None:
+            return False
+        if verdict == "approved":
+            cur = conn.execute(
+                """UPDATE tasks SET status = 'review', assignee = ?,
+                          review_verdict = 'approved', review_evidence = ?,
+                          claim_lock = NULL, claim_expires = NULL,
+                          worker_pid = NULL, current_run_id = NULL
+                   WHERE id = ? AND status = 'running'""",
+                (row["original_assignee"], json.dumps(evidence or {}), task_id),
+            )
+        else:
+            cur = conn.execute(
+                """UPDATE tasks SET status = 'ready', assignee = ?,
+                          review_verdict = 'changes_requested', review_evidence = ?,
+                          claim_lock = NULL, claim_expires = NULL,
+                          worker_pid = NULL, current_run_id = NULL
+                   WHERE id = ? AND status = 'running'""",
+                (row["original_assignee"], json.dumps(evidence or {}), task_id),
+            )
+        if cur.rowcount != 1:
+            return False
+        _append_event(conn, task_id, "review_verdict", {
+            "verdict": verdict, "reviewer": reviewer, "evidence": evidence or {},
+        })
+    return True
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -4130,6 +4409,19 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+
+    task_before = get_task(conn, task_id)
+    merge_evidence = None
+    if task_before and task_before.review_required:
+        merge_evidence = metadata.get("merge_evidence") if isinstance(metadata, dict) else None
+        if (
+            task_before.status != "review"
+            or task_before.review_verdict != "approved"
+            or not isinstance(task_before.review_evidence, dict)
+            or not isinstance(merge_evidence, dict)
+            or merge_evidence.get("merged") is not True
+        ):
+            return False
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -4175,7 +4467,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked', 'review')
                 """,
                 (result, now, task_id),
             )
@@ -4192,13 +4484,18 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked', 'review')
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
             return False
+        if task_before and task_before.review_required:
+            conn.execute(
+                "UPDATE tasks SET merge_evidence = ? WHERE id = ?",
+                (json.dumps(merge_evidence), task_id),
+            )
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):
@@ -6053,6 +6350,9 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_review_capacity: list[tuple[str, str, str]] = field(default_factory=list)
+    """Review rows skipped because typed global/per-profile capacity is full,
+    the review packet is invalid, or the row is already finalized."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -7436,6 +7736,32 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def _review_dispatch_capacity(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    active_global: int,
+    active_by_profile: dict[str, int],
+) -> tuple[bool, str]:
+    """Fail closed and account for live review capacity from the typed packet."""
+    if row["task_type"] != "coding" or not bool(row["review_required"]):
+        return False, "typed_predicate"
+    try:
+        packet = json.loads(row["dispatcher_state"] or "")
+        _validate_dispatcher_state(packet)
+        capacity = int(packet["review_capacity"])
+        per_profile = int(packet.get("review_capacity_per_profile", capacity))
+    except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+        return False, "invalid_packet"
+    if row["review_verdict"] == "approved":
+        return False, "finalized"
+    assignee = row["assignee"] or ""
+    if active_global >= capacity:
+        return False, "global_capacity"
+    if active_by_profile.get(assignee, 0) >= per_profile:
+        return False, "profile_capacity"
+    return True, ""
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -7831,15 +8157,32 @@ def _dispatch_once_locked(
     # against max_spawn alongside ready tasks, so the total number of
     # running workers stays bounded.
     review_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, task_type, review_required, dispatcher_state, "
+        "review_verdict FROM tasks "
         "WHERE status = 'review' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+    active_review_rows = conn.execute(
+        "SELECT assignee, COUNT(*) AS n FROM tasks "
+        "WHERE status = 'running' AND review_required = 1 "
+        "AND review_assignee IS NOT NULL AND review_verdict IS NULL "
+        "GROUP BY assignee"
+    ).fetchall()
+    active_review_by_profile = {r["assignee"]: int(r["n"]) for r in active_review_rows}
+    active_review_global = sum(active_review_by_profile.values())
     for row in review_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
+            continue
+        admitted, reason = _review_dispatch_capacity(
+            conn, row, active_review_global, active_review_by_profile,
+        )
+        if not admitted:
+            result.skipped_review_capacity.append(
+                (row["id"], row["assignee"] or "", reason)
+            )
             continue
         try:
             from hermes_cli.profiles import profile_exists
@@ -7854,6 +8197,10 @@ def _dispatch_once_locked(
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        active_review_global += 1
+        active_review_by_profile[row["assignee"]] = (
+            active_review_by_profile.get(row["assignee"], 0) + 1
+        )
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":

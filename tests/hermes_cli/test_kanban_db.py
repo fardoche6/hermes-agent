@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -3859,9 +3860,21 @@ def test_dispatch_max_in_progress_none_is_unlimited(kanban_home, all_assignees_s
 # ---------------------------------------------------------------------------
 
 
-def _set_task_status(conn: sqlite3.Connection, task_id: str, status: str) -> None:
+def _set_task_status(conn, task_id: str, status: str) -> None:
     """Test helper: set a task's status directly."""
     conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
+    if status == "review":
+        conn.execute(
+            "UPDATE tasks SET task_type='coding', review_required=1, "
+            "dispatcher_state=? WHERE id=?",
+            (json.dumps({
+                "state_type": "coding-admission-v1",
+                "review_capacity": 8,
+                "review_capacity_per_profile": 8,
+                "review_sla_seconds": 3600,
+                "typed_predicates": ["task_type", "review_required"],
+            }), task_id),
+        )
 
 
 def test_claim_review_task_transitions_to_running(kanban_home):

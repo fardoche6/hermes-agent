@@ -595,6 +595,8 @@ def get_task(
 
 class CreateTaskBody(BaseModel):
     title: str
+    task_type: str = "general"
+    review_required: Optional[bool] = None
     body: Optional[str] = None
     assignee: Optional[str] = None
     tenant: Optional[str] = None
@@ -604,6 +606,8 @@ class CreateTaskBody(BaseModel):
     parents: list[str] = Field(default_factory=list)
     triage: bool = False
     idempotency_key: Optional[str] = None
+    canonical_goal: Optional[str] = None
+    dispatcher_state: Optional[dict[str, Any]] = None
     max_runtime_seconds: Optional[int] = None
     skills: Optional[list[str]] = None
     goal_mode: bool = False
@@ -628,6 +632,10 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             parents=payload.parents,
             triage=payload.triage,
             idempotency_key=payload.idempotency_key,
+            canonical_goal=payload.canonical_goal,
+            dispatcher_state=payload.dispatcher_state,
+            task_type=payload.task_type,
+            review_required=payload.review_required,
             max_runtime_seconds=payload.max_runtime_seconds,
             skills=payload.skills,
             goal_mode=payload.goal_mode,

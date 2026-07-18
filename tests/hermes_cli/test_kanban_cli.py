@@ -174,8 +174,12 @@ def test_run_slash_dispatch_dry_run_counts(kanban_home):
     assert "Spawned:" in out
 
 
-def test_run_slash_context_output_format(kanban_home):
-    out = kc.run_slash("create 'tech spec' --assignee alice --body 'write an RFC'")
+def test_run_slash_context_output_format(kanban_home, tmp_path):
+    body_file = tmp_path / "body.txt"
+    body_file.write_text("write an RFC", encoding="utf-8")
+    out = kc.run_slash(
+        f"create 'tech spec' --assignee alice --body-file {body_file}"
+    )
     import re
     tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
     kc.run_slash(f"comment {tid} 'remember to include performance section'")

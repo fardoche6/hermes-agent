@@ -1,0 +1,35 @@
+{
+  "purpose": "Final direct Hermes lifecycle proof pass",
+  "base_commit": "d59b79fadd1e9edd7afc5c679cc3b143838e7c01",
+  "preserved_existing_change_backups": [
+    "/tmp/hermes-final-pass-existing.patch",
+    "/tmp/hermes-final-pass-untracked.tgz"
+  ],
+  "changed_files": [
+    "AGENTS.md",
+    "AGENTS.reference.md",
+    ".install_method",
+    "agent/prompt_builder.py",
+    "hermes_cli/kanban.py",
+    "hermes_cli/kanban_db.py",
+    "lifecycle-proof-manifest.json",
+    "plugins/kanban/dashboard/plugin_api.py",
+    "scripts/list_latest_nonhuman_blocked_kanban_tasks.py",
+    "tests/hermes_cli/test_kanban_cli.py",
+    "tests/hermes_cli/test_kanban_db.py",
+    "tests/tools/test_kanban_tools.py",
+    "tests/test_kanban_create_body_transport.py",
+    "tests/test_kanban_lifecycle_contract.py",
+    "tests/test_kanban_public_review_matrix.py",
+    "tests/test_kanban_review_dispatch_e2e.py",
+    "tools/kanban_tools.py",
+    "toolsets.py"
+  ],
+  "scope_exclusions": ["SubsidySmart", "credentials", "protected kanban-worker"],
+  "status": "verified",
+  "verification": {
+    "focused_regression": "11 passed",
+    "broad_kanban_regression": "688 passed, 6 warnings",
+    "unrelated_full_collection_blocker": "pytest_asyncio missing; no dependency installed"
+  }
+}

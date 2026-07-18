@@ -304,9 +304,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Absolute path to use as default workdir. Omit to clear.")
 
     # --- create ---
-    p_create = sub.add_parser("create", help="Create a new task")
+    p_create = sub.add_parser("create", help="Create a new task", allow_abbrev=False)
     p_create.add_argument("title", help="Task title")
-    p_create.add_argument("--body", default=None, help="Optional opening post")
+    p_create.add_argument("--body-file", default=None, help="Read opening post from a file; keeps it out of argv")
+    p_create.add_argument("--task-type", choices=["coding", "docs", "general", "research"], default="general")
+    p_create.add_argument("--review-required", action=argparse.BooleanOptionalAction, default=None)
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
@@ -326,6 +328,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--idempotency-key", default=None,
                           help="Dedup key. If a non-archived task with this key exists, "
                                "its id is returned instead of creating a duplicate.")
+    p_create.add_argument("--canonical-goal", default=None,
+                          help="Canonical goal identity; identical goals collide within tenant/board scope.")
+    p_create.add_argument("--dispatcher-state-file", default=None,
+                          help="JSON typed dispatcher admission packet (required for coding tasks)")
     p_create.add_argument("--max-runtime", default=None,
                           help="Per-task runtime cap. Accepts seconds (300) or "
                                "durations (90s, 30m, 2h, 1d). When exceeded, "
@@ -1349,22 +1355,54 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    body = getattr(args, "body", None)
+    if body is not None:
+        print("--body is rejected; use --body-file", file=sys.stderr)
+        return 2
+    body_file = getattr(args, "body_file", None)
+    if body_file:
+        if body is not None:
+            print("--body and --body-file are mutually exclusive", file=sys.stderr)
+            return 2
+        try:
+            body = Path(body_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"could not read --body-file: {exc}", file=sys.stderr)
+            return 2
+    dispatcher_state = None
+    state_file = getattr(args, "dispatcher_state_file", None)
+    if state_file:
+        try:
+            dispatcher_state = json.loads(Path(state_file).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"could not read --dispatcher-state-file: {exc}", file=sys.stderr)
+            return 2
+    elif os.environ.get("HERMES_KANBAN_DISPATCHER_STATE"):
+        try:
+            dispatcher_state = json.loads(os.environ["HERMES_KANBAN_DISPATCHER_STATE"])
+        except json.JSONDecodeError as exc:
+            print(f"invalid HERMES_KANBAN_DISPATCHER_STATE: {exc}", file=sys.stderr)
+            return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
             title=args.title,
-            body=args.body,
-            assignee=args.assignee,
-            created_by=args.created_by or _profile_author(),
+            body=body,
+            task_type=getattr(args, "task_type", "general"),
+            review_required=getattr(args, "review_required", None),
+            assignee=getattr(args, "assignee", None),
+            created_by=getattr(args, "created_by", None) or _profile_author(),
             workspace_kind=ws_kind,
             workspace_path=ws_path,
             branch_name=branch_name,
             project_id=getattr(args, "project", None),
-            tenant=args.tenant,
-            priority=args.priority,
-            parents=tuple(args.parent or ()),
+            tenant=getattr(args, "tenant", None),
+            priority=getattr(args, "priority", 0),
+            parents=tuple(getattr(args, "parent", None) or ()),
             triage=bool(getattr(args, "triage", False)),
             idempotency_key=getattr(args, "idempotency_key", None),
+            canonical_goal=getattr(args, "canonical_goal", None),
+            dispatcher_state=dispatcher_state,
             max_runtime_seconds=max_runtime,
             skills=getattr(args, "skills", None) or None,
             max_retries=max_retries,

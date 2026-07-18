@@ -672,6 +672,57 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(f"kanban_complete: {e}")
 
 
+def _handle_submit_review(args: dict, **kw) -> str:
+    tid = _default_task_id(args.get("task_id"))
+    reviewer = str(args.get("reviewer_assignee") or "").strip()
+    if not tid or not reviewer:
+        return tool_error("task_id and reviewer_assignee are required")
+    guard = _enforce_worker_task_ownership(tid)
+    if guard:
+        return guard
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            ok = kb.submit_review(conn, tid, reviewer_assignee=reviewer,
+                                  evidence=args.get("evidence"))
+            return _ok(task_id=tid, status="review") if ok else tool_error(
+                "review submission rejected: task is not a review-required running task"
+            )
+        finally:
+            conn.close()
+    except (TypeError, ValueError) as exc:
+        return tool_error(f"kanban_submit_review: {exc}")
+
+
+def _handle_review_verdict(args: dict, **kw) -> str:
+    tid = _default_task_id(args.get("task_id"))
+    verdict = str(args.get("verdict") or "").strip()
+    reviewer = str(os.environ.get("HERMES_PROFILE") or "").strip()
+    if not tid or not verdict or not reviewer:
+        return tool_error("task_id and verdict are required; reviewer identity is trusted from HERMES_PROFILE")
+    guard = _enforce_worker_task_ownership(tid)
+    if guard:
+        return guard
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            task = kb.get_task(conn, tid)
+            run = kb.latest_run(conn, tid)
+            if not task or task.review_assignee != reviewer or task.status != "running":
+                return tool_error("review verdict rejected: active review owner mismatch")
+            if not run or run.status != "running" or run.profile != reviewer:
+                return tool_error("review verdict rejected: no active claimed review run")
+            ok = kb.review_verdict(conn, tid, verdict=verdict, reviewer=reviewer,
+                                   evidence=args.get("evidence"))
+            return _ok(task_id=tid, verdict=verdict) if ok else tool_error(
+                "review verdict rejected: reviewer does not own the active review"
+            )
+        finally:
+            conn.close()
+    except (TypeError, ValueError) as exc:
+        return tool_error(f"kanban_review_verdict: {exc}")
+
+
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
     tid = _default_task_id(args.get("task_id"))
@@ -1147,6 +1198,8 @@ def _handle_create(args: dict, **kw) -> str:
                 project_id=project_id,
                 triage=triage,
                 idempotency_key=idempotency_key,
+                task_type=str(args.get("task_type") or "general"),
+                review_required=args.get("review_required"),
                 max_runtime_seconds=(
                     int(max_runtime_seconds)
                     if max_runtime_seconds is not None else None
@@ -1419,6 +1472,28 @@ KANBAN_LIST_SCHEMA = {
         },
         "required": [],
     },
+}
+
+KANBAN_SUBMIT_REVIEW_SCHEMA = {
+    "name": "kanban_submit_review",
+    "description": "Submit this coding card to an independent reviewer on the same card; never create a child card.",
+    "parameters": {"type": "object", "properties": {
+        "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+        "reviewer_assignee": {"type": "string"},
+        "evidence": {"type": "object"},
+        "board": _board_schema_prop(),
+    }, "required": ["reviewer_assignee"]},
+}
+
+KANBAN_REVIEW_VERDICT_SCHEMA = {
+    "name": "kanban_review_verdict",
+    "description": "Record an executable same-card reviewer verdict: approved or changes_requested.",
+    "parameters": {"type": "object", "properties": {
+        "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+        "verdict": {"type": "string", "enum": ["approved", "changes_requested"]},
+        "evidence": {"type": "object"},
+        "board": _board_schema_prop(),
+    }, "required": ["verdict"]},
 }
 
 KANBAN_COMPLETE_SCHEMA = {
@@ -1804,6 +1879,15 @@ KANBAN_CREATE_SCHEMA = {
                     "the body before work starts."
                 ),
             },
+            "task_type": {
+                "type": "string",
+                "enum": ["coding", "docs", "general", "research"],
+                "description": "Explicit task type. Coding requires worktree + review.",
+            },
+            "review_required": {
+                "type": "boolean",
+                "description": "Whether this card must pass same-card review before merged-proof completion.",
+            },
             "idempotency_key": {
                 "type": "string",
                 "description": (
@@ -1941,6 +2025,24 @@ registry.register(
     handler=_handle_complete,
     check_fn=_check_kanban_mode,
     emoji="✔",
+)
+
+registry.register(
+    name="kanban_submit_review",
+    toolset="kanban",
+    schema=KANBAN_SUBMIT_REVIEW_SCHEMA,
+    handler=_handle_submit_review,
+    check_fn=_check_kanban_mode,
+    emoji="🔎",
+)
+
+registry.register(
+    name="kanban_review_verdict",
+    toolset="kanban",
+    schema=KANBAN_REVIEW_VERDICT_SCHEMA,
+    handler=_handle_review_verdict,
+    check_fn=_check_kanban_mode,
+    emoji="✅",
 )
 
 registry.register(
