@@ -414,24 +414,22 @@ def _validate_task_scope(
     """Validate reserved scopes against the connection being mutated."""
     normalized_board = _normalize_board_slug(board)
     normalized_tenant = _normalize_tenant(tenant)
-    connection_board, explicit_connection_scope = _CONNECTION_SCOPES.get(
-        id(conn), (None, False)
-    )
-    if explicit_connection_scope:
-        if normalized_board is None and connection_board in _APPROVED_BOARD_TENANTS:
-            validate_board_tenant_scope(normalized_board, normalized_tenant)
-        if normalized_board is None and connection_board not in _APPROVED_BOARD_TENANTS:
-            normalized_board = connection_board
-        if normalized_board != connection_board:
+    connection_board, _ = _CONNECTION_SCOPES.get(conn, (None, False))
+    if connection_board in {"hermes", "kanban"}:
+        raise ValueError(f"board {connection_board!r} is not an approved Kanban scope")
+    if connection_board in _APPROVED_BOARD_TENANTS:
+        if normalized_board is not None and normalized_board != connection_board:
             raise ValueError(
                 "explicit board does not match the board connection being mutated"
             )
-        if connection_board in _APPROVED_BOARD_TENANTS:
-            _, normalized_tenant = validate_board_tenant_scope(
-                normalized_board, normalized_tenant
-            )
-            return normalized_tenant
-        return tenant
+        _, normalized_tenant = validate_board_tenant_scope(
+            connection_board, normalized_tenant
+        )
+        return normalized_tenant
+    if normalized_board is not None and normalized_board != connection_board:
+        raise ValueError(
+            "explicit board does not match the board connection being mutated"
+        )
 
     reserved_boards = set(_APPROVED_BOARD_TENANTS) | {"hermes", "kanban"}
     approved_tenants = {
@@ -439,24 +437,13 @@ def _validate_task_scope(
         for tenant_names in _APPROVED_BOARD_TENANTS.values()
         for tenant_name in tenant_names
     }
-    if connection_board in {"hermes", "kanban"}:
-        raise ValueError(f"board {connection_board!r} is not an approved Kanban scope")
-    if (
-        normalized_board in _APPROVED_BOARD_TENANTS
-        and connection_board != normalized_board
-    ):
-        raise ValueError("explicit board does not match the board connection being mutated")
+
     if (
         (normalized_board in reserved_boards)
         or normalized_tenant in approved_tenants
     ):
-        if (
-            connection_board in _APPROVED_BOARD_TENANTS
-            and normalized_board != connection_board
-        ):
-            raise ValueError(
-                "explicit board does not match the board connection being mutated"
-            )
+        if connection_board is None:
+            raise ValueError("database connection has no recognized board identity")
         _, normalized_tenant = validate_board_tenant_scope(
             normalized_board, normalized_tenant
         )
@@ -848,7 +835,7 @@ def create_board(
         default_workdir=default_workdir,
     )
     # Touch the DB so list_boards() sees it immediately.
-    init_db(board=normed)
+    init_db(board=normed, _allow_reserved=True)
     return meta
 
 
@@ -1424,7 +1411,15 @@ def _resolve_busy_timeout_ms() -> int:
     return DEFAULT_BUSY_TIMEOUT_MS
 
 
-_CONNECTION_SCOPES: dict[int, tuple[Optional[str], bool]] = {}
+class _ScopedConnection(sqlite3.Connection):
+    """SQLite connection that removes its admission scope when closed."""
+
+    def close(self) -> None:
+        _CONNECTION_SCOPES.pop(self, None)
+        super().close()
+
+
+_CONNECTION_SCOPES: dict[sqlite3.Connection, tuple[Optional[str], bool]] = {}
 
 
 def _sqlite_connect(
@@ -1436,8 +1431,9 @@ def _sqlite_connect(
         str(path),
         isolation_level=None,
         timeout=busy_timeout_ms / 1000.0,
+        factory=_ScopedConnection,
     )
-    _CONNECTION_SCOPES[id(conn)] = (board, explicit_scope)
+    _CONNECTION_SCOPES[conn] = (board, explicit_scope)
     # ``sqlite3.connect(timeout=...)`` normally maps to busy_timeout, but set
     # the PRAGMA explicitly so it is observable and survives future wrapper
     # changes. Parameter binding is not supported for PRAGMA assignments.
@@ -1800,6 +1796,7 @@ def connect(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
+    _allow_reserved: bool = False,
 ) -> sqlite3.Connection:
     """Open (and initialize if needed) the kanban DB.
 
@@ -1824,7 +1821,7 @@ def connect(
         path = db_path
     else:
         path = kanban_db_path(board=board)
-    if normalized_board in {"hermes", "kanban"}:
+    if normalized_board in {"hermes", "kanban"} and not _allow_reserved:
         if not path.exists() and not board_metadata_path(normalized_board).exists():
             raise ValueError(
                 f"board {normalized_board!r} does not exist; create it explicitly first"
@@ -1836,7 +1833,7 @@ def connect(
             raise ValueError(
                 f"board {normalized_board!r} does not match the resolved database path"
             )
-    if normalized_board in {"hermes", "kanban"}:
+    if normalized_board in {"hermes", "kanban"} and not _allow_reserved:
         raise ValueError(f"board {normalized_board!r} is not an approved Kanban scope")
     if normalized_board is not None and connection_board != normalized_board:
         raise ValueError("explicit board does not match the resolved database path")
@@ -1962,6 +1959,7 @@ def init_db(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
+    _allow_reserved: bool = False,
 ) -> Path:
     """Create the schema if it doesn't exist; return the path used.
 
@@ -1980,6 +1978,7 @@ def init_db(
     normalized_board = _normalize_board_slug(board)
     if (
         normalized_board in {"hermes", "kanban"}
+        and not _allow_reserved
         and not path.exists()
         and not board_metadata_path(normalized_board).exists()
     ):
@@ -1993,7 +1992,9 @@ def init_db(
     with _INIT_LOCK:
         _INITIALIZED_PATHS.discard(resolved)
     connect_board = None if normalized_board in {"hermes", "kanban"} else normalized_board
-    with contextlib.closing(connect(path, board=connect_board)):
+    with contextlib.closing(
+        connect(path, board=connect_board, _allow_reserved=_allow_reserved)
+    ):
         pass
     return path
 
@@ -2599,6 +2600,14 @@ def create_task(
     # Validate explicit board/tenant scope before any project lookup,
     # idempotency read, or write transaction.
     tenant = _validate_task_scope(conn, board, tenant)
+    connection_board, _ = _CONNECTION_SCOPES.get(conn, (None, False))
+    if connection_board in _APPROVED_BOARD_TENANTS:
+        if not body or not str(body).strip():
+            raise ValueError("body/specification is required for scoped Kanban tasks")
+        if not assignee:
+            raise ValueError("assignee is required for scoped Kanban tasks")
+        if not created_by or not str(created_by).strip():
+            raise ValueError("created_by/source audit identity is required")
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch

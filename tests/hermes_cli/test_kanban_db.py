@@ -238,7 +238,13 @@ def test_create_task_accepts_approved_board_tenant_scope(kanban_home):
             kb.create_board(board)
         with kb.connect(board=board) as conn:
             task_id = kb.create_task(
-                conn, title="scoped task", board=board, tenant=tenant.upper()
+                conn,
+                title="scoped task",
+                body="scoped specification",
+                assignee="worker",
+                created_by="test",
+                board=board,
+                tenant=tenant.upper(),
             )
             task = kb.get_task(conn, task_id)
         assert task is not None
@@ -272,6 +278,42 @@ def test_create_task_rejects_invalid_scope_before_sqlite_mutation(kanban_home):
             "tasks": conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0],
             "events": conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0],
         }
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    ("body", "assignee", "created_by"),
+    [
+        (None, "worker", "test"),
+        (" ", "worker", "test"),
+        ("spec", None, "test"),
+        ("spec", "worker", None),
+    ],
+)
+def test_scoped_task_rejects_malformed_admission_before_mutation(
+    kanban_home, body, assignee, created_by
+):
+    with kb.connect(board="default") as conn:
+        before = (
+            conn.total_changes,
+            conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0],
+        )
+        with pytest.raises(ValueError):
+            kb.create_task(
+                conn,
+                title="malformed",
+                body=body,
+                assignee=assignee,
+                created_by=created_by,
+                board="default",
+                tenant="kanban",
+            )
+        after = (
+            conn.total_changes,
+            conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0],
+        )
     assert after == before
 
 
@@ -333,7 +375,15 @@ def test_default_operations_do_not_recreate_absent_reserved_boards(kanban_home):
     assert not (boards / "hermes").exists()
     assert not (boards / "kanban").exists()
     with kb.connect(board="default") as conn:
-        kb.create_task(conn, title="approved default operation", board="default", tenant="kanban")
+        kb.create_task(
+            conn,
+            title="approved default operation",
+            body="approved specification",
+            assignee="worker",
+            created_by="test",
+            board="default",
+            tenant="kanban",
+        )
     assert not (boards / "hermes").exists()
     assert not (boards / "kanban").exists()
 
