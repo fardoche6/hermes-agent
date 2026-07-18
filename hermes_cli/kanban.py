@@ -1361,7 +1361,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             workspace_path=ws_path,
             branch_name=branch_name,
             project_id=getattr(args, "project", None),
-            tenant=os.environ.get("HERMES_TENANT") or args.tenant,
+            tenant=args.tenant or os.environ.get("HERMES_TENANT"),
             priority=args.priority,
             parents=tuple(args.parent or ()),
             triage=bool(getattr(args, "triage", False)),

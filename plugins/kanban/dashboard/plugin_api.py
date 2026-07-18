@@ -595,9 +595,9 @@ def get_task(
 
 class CreateTaskBody(BaseModel):
     title: str
-    body: Optional[str] = None
-    assignee: Optional[str] = None
-    tenant: Optional[str] = None
+    body: str
+    assignee: str
+    tenant: str
     priority: int = 0
     workspace_kind: str = "scratch"
     workspace_path: Optional[str] = None
@@ -612,7 +612,9 @@ class CreateTaskBody(BaseModel):
 
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
-    board = _resolve_board(board) or kanban_db.get_current_board()
+    board = _resolve_board(board)
+    if board is None:
+        raise HTTPException(status_code=400, detail="explicit board is required for task creation")
     conn = _conn(board=board)
     try:
         task_id = kanban_db.create_task(
@@ -624,7 +626,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             workspace_kind=payload.workspace_kind,
             workspace_path=payload.workspace_path,
             tenant=payload.tenant,
-            board=board or kanban_db.get_current_board(),
+            board=board,
             priority=payload.priority,
             parents=payload.parents,
             triage=payload.triage,

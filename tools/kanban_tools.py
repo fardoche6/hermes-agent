@@ -1121,6 +1121,8 @@ def _handle_create(args: dict, **kw) -> str:
     # A tenant-bearing mutation must carry an independently selected board;
     # never derive a board from tenant presence or current-board fallback.
     board = explicit_board
+    if not board:
+        return tool_error("explicit board is required for task creation")
     try:
         kb, conn = _connect(board=board)
         try:

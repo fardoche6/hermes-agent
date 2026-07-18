@@ -271,7 +271,13 @@ def test_create_task_rejects_invalid_scope_before_sqlite_mutation(kanban_home):
         for board, tenant in rejected:
             with pytest.raises(ValueError):
                 kb.create_task(
-                    conn, title="must not be inserted", board=board, tenant=tenant
+                    conn,
+                    title="must not be inserted",
+                    body="valid specification",
+                    assignee="worker",
+                    created_by="test",
+                    board=board,
+                    tenant=tenant,
                 )
         after = {
             "changes": conn.total_changes,
@@ -335,6 +341,15 @@ def test_explicit_connection_scope_binds_board_and_rejects_missing_or_mismatch(
         assert conn.total_changes == before
     with kb.connect() as conn:
         before = conn.total_changes
+        with pytest.raises(ValueError, match="explicit board and tenant"):
+            kb.create_task(
+                conn,
+                title="implicit missing scope",
+                body="valid specification",
+                assignee="worker",
+                created_by="test",
+                tenant="kanban",
+            )
         with pytest.raises(ValueError, match="does not match"):
             kb.create_task(
                 conn,
@@ -350,7 +365,7 @@ def test_reserved_absent_board_rejection_has_no_filesystem_mutation(kanban_home)
     for slug in ("hermes", "kanban"):
         path = boards / slug
         assert not path.exists()
-        with pytest.raises(ValueError, match="does not exist"):
+        with pytest.raises(ValueError, match="not an approved"):
             kb.connect(board=slug)
         assert not path.exists()
 
@@ -359,13 +374,15 @@ def test_reserved_existing_board_is_rejected_before_task_mutation(kanban_home):
     kb.create_board("hermes")
     with pytest.raises(ValueError, match="not an approved"):
         kb.connect(board="hermes")
+    with pytest.raises(ValueError, match="not an approved"):
+        kb.init_db(board="hermes")
     assert (kb.boards_root() / "hermes" / "kanban.db").exists()
 
 
 def test_init_db_absent_reserved_board_does_not_create_filesystem_state(kanban_home):
     path = kb.boards_root() / "kanban"
     assert not path.exists()
-    with pytest.raises(ValueError, match="does not exist"):
+    with pytest.raises(ValueError, match="not an approved"):
         kb.init_db(board="kanban")
     assert not path.exists()
 
@@ -2400,7 +2417,16 @@ def test_worktree_no_path_no_board_default_raises(kanban_home, tmp_path, monkeyp
     _init_git_repo(decoy_repo)
     monkeypatch.chdir(decoy_repo)
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="ship", workspace_kind="worktree")
+        t = kb.create_task(
+            conn,
+            title="ship",
+            body="worktree specification",
+            assignee="worker",
+            created_by="test",
+            board="default",
+            tenant="kanban",
+            workspace_kind="worktree",
+        )
         task = kb.get_task(conn, t)
         assert task is not None
         with pytest.raises(ValueError, match="default_workdir"):
@@ -3231,7 +3257,15 @@ class TestSharedBoardPaths:
         self._set_home(monkeypatch, tmp_path, default_home)
         kb.init_db()
         with kb.connect() as conn:
-            task_id = kb.create_task(conn, title="cross-profile")
+            task_id = kb.create_task(
+                conn,
+                title="cross-profile",
+                body="cross-profile specification",
+                assignee="worker",
+                created_by="test",
+                board="default",
+                tenant="kanban",
+            )
 
         # Worker switches to the profile HERMES_HOME and reads.
         monkeypatch.setenv("HERMES_HOME", str(profile_home))
