@@ -624,6 +624,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             workspace_kind=payload.workspace_kind,
             workspace_path=payload.workspace_path,
             tenant=payload.tenant,
+            board=board or kanban_db.get_current_board(),
             priority=payload.priority,
             parents=payload.parents,
             triage=payload.triage,

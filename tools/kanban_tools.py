@@ -1117,7 +1117,11 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
-    board = args.get("board")
+    board = (
+        args.get("board")
+        or os.environ.get("HERMES_KANBAN_BOARD")
+        or ("default" if tenant else None)
+    )
     try:
         kb, conn = _connect(board=board)
         try:
@@ -1141,6 +1145,7 @@ def _handle_create(args: dict, **kw) -> str:
                 assignee=str(assignee),
                 parents=tuple(parents),
                 tenant=tenant,
+                board=board,
                 priority=int(priority) if priority is not None else 0,
                 workspace_kind=str(workspace_kind),
                 workspace_path=workspace_path,

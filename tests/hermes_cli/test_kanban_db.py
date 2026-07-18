@@ -275,9 +275,54 @@ def test_create_task_rejects_invalid_scope_before_sqlite_mutation(kanban_home):
     assert after == before
 
 
+def test_explicit_connection_scope_binds_board_and_rejects_missing_or_mismatch(
+    kanban_home,
+):
+    kb.create_board("subsidysmart")
+    with kb.connect(board="default") as conn:
+        before = conn.total_changes
+        with pytest.raises(ValueError, match="explicit board and tenant"):
+            kb.create_task(conn, title="missing scope")
+        with pytest.raises(ValueError, match="does not match"):
+            kb.create_task(
+                conn,
+                title="wrong connection",
+                board="subsidysmart",
+                tenant="login",
+            )
+        assert conn.total_changes == before
+    with kb.connect() as conn:
+        before = conn.total_changes
+        with pytest.raises(ValueError, match="does not match"):
+            kb.create_task(
+                conn,
+                title="implicit wrong connection",
+                board="subsidysmart",
+                tenant="login",
+            )
+        assert conn.total_changes == before
+
+
+def test_reserved_absent_board_rejection_has_no_filesystem_mutation(kanban_home):
+    boards = kb.boards_root()
+    for slug in ("hermes", "kanban"):
+        path = boards / slug
+        assert not path.exists()
+        with pytest.raises(ValueError, match="does not exist"):
+            kb.connect(board=slug)
+        assert not path.exists()
+
+
 def test_generic_tenant_without_explicit_scope_remains_supported(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="generic tenant", tenant="biz-a")
+    assert task_id
+
+
+def test_generic_named_board_scope_remains_supported(kanban_home):
+    kb.create_board("alt")
+    with kb.connect(board="alt") as conn:
+        task_id = kb.create_task(conn, title="generic named board", tenant="biz-a")
     assert task_id
 
 

@@ -1371,6 +1371,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            board=kb.get_current_board(),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -1409,6 +1410,7 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
             verifier_assignee=args.verifier,
             synthesizer_assignee=args.synthesizer,
             tenant=args.tenant,
+            board=kb.get_current_board(),
             created_by=args.created_by or _profile_author(),
             priority=args.priority,
             idempotency_key=getattr(args, "idempotency_key", None),
