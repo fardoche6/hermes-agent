@@ -669,6 +669,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                              f"(spawn_failed, timed_out, or crashed; default: {kb.DEFAULT_SPAWN_FAILURE_LIMIT})")
     p_disp.add_argument("--json", action="store_true")
 
+    # --- Home lifecycle relay ---
+    p_relay = sub.add_parser(
+        "home-relay",
+        help="Mirror new concise lifecycle events from all boards to Hermes Home",
+    )
+    p_relay.add_argument("--dry-run", action="store_true",
+                         help="Queue and validate events without delivering")
+    p_relay.add_argument("--target", default=None,
+                         help="Home delivery target (default: telegram or HERMES_KANBAN_HOME_TARGET)")
+    p_relay.add_argument("--json", action="store_true")
+
     # --- daemon (deprecated) ---
     p_daemon = sub.add_parser(
         "daemon",
@@ -984,6 +995,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
+            "home-relay": _cmd_home_relay,
             "daemon":   _cmd_daemon,
             "watch":    _cmd_watch,
             "stats":    _cmd_stats,
@@ -2319,6 +2331,23 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
+        )
+    return 0
+
+
+def _cmd_home_relay(args: argparse.Namespace) -> int:
+    """Run one durable, best-effort Home relay pass across all boards."""
+    from hermes_cli.kanban_home_relay import HomeRelay
+
+    result = HomeRelay(target=getattr(args, "target", None)).run_once(
+        dry_run=bool(getattr(args, "dry_run", False))
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        print(
+            "home-relay: boards={boards} queued={queued} sent={sent} "
+            "failed={failed} permanent_failures={permanent_failures} target={target}".format(**result)
         )
     return 0
 
