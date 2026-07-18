@@ -108,6 +108,11 @@ def _resolve_board(board: Optional[str]) -> Optional[str]:
         normed = kanban_db._normalize_board_slug(board)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    if normed in {"hermes", "kanban"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"board {normed!r} is not an approved Kanban scope",
+        )
     if normed and normed != kanban_db.DEFAULT_BOARD and not kanban_db.board_exists(normed):
         raise HTTPException(
             status_code=404,
@@ -595,9 +600,9 @@ def get_task(
 
 class CreateTaskBody(BaseModel):
     title: str
-    body: str
-    assignee: str
-    tenant: str
+    body: Optional[str] = None
+    assignee: Optional[str] = None
+    tenant: Optional[str] = None
     priority: int = 0
     workspace_kind: str = "scratch"
     workspace_path: Optional[str] = None
@@ -613,8 +618,10 @@ class CreateTaskBody(BaseModel):
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
-    if board is None:
-        raise HTTPException(status_code=400, detail="explicit board is required for task creation")
+    try:
+        kanban_db.validate_task_admission(board, payload.tenant)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     conn = _conn(board=board)
     try:
         task_id = kanban_db.create_task(

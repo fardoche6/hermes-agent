@@ -408,6 +408,24 @@ def validate_board_tenant_scope(
     return normalized_board, normalized_tenant
 
 
+def validate_task_admission(
+    board: Optional[str], tenant: Optional[str]
+) -> tuple[Optional[str], Optional[str]]:
+    """Validate task scope without resolving or mutating a board."""
+    normalized_board = _normalize_board_slug(board)
+    normalized_tenant = _normalize_tenant(tenant)
+    if normalized_board in {"hermes", "kanban"}:
+        raise ValueError(f"board {normalized_board!r} is not an approved Kanban scope")
+    protected_tenants = {
+        tenant_name
+        for tenant_names in _APPROVED_BOARD_TENANTS.values()
+        for tenant_name in tenant_names
+    }
+    if normalized_board in _APPROVED_BOARD_TENANTS or normalized_tenant in protected_tenants:
+        return validate_board_tenant_scope(normalized_board, normalized_tenant)
+    return normalized_board, normalized_tenant
+
+
 def _validate_task_scope(
     conn: sqlite3.Connection, board: Optional[str], tenant: Optional[str]
 ) -> Optional[str]:

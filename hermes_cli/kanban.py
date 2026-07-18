@@ -1350,7 +1350,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
         )
         return 2
     board = kb.get_current_board()
-    with kb.connect_closing(board=board) as conn:
+    requested_board = getattr(args, "board", None)
+    requested_tenant = args.tenant or os.environ.get("HERMES_TENANT")
+    admission_board = board if requested_board else None
+    with kb.connect_closing(board=admission_board) as conn:
         task_id = kb.create_task(
             conn,
             title=args.title,
@@ -1361,7 +1364,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             workspace_path=ws_path,
             branch_name=branch_name,
             project_id=getattr(args, "project", None),
-            tenant=args.tenant or os.environ.get("HERMES_TENANT"),
+            tenant=requested_tenant,
             priority=args.priority,
             parents=tuple(args.parent or ()),
             triage=bool(getattr(args, "triage", False)),
@@ -1372,7 +1375,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
-            board=board,
+            board=admission_board,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):

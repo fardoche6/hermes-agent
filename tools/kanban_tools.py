@@ -1118,12 +1118,12 @@ def _handle_create(args: dict, **kw) -> str:
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
     explicit_board = args.get("board") or os.environ.get("HERMES_KANBAN_BOARD")
-    # A tenant-bearing mutation must carry an independently selected board;
-    # never derive a board from tenant presence or current-board fallback.
+    # Protected tenant-bearing mutations need an independently selected board;
+    # fully unscoped legacy calls remain a generic-board path.
     board = explicit_board
-    if not board:
-        return tool_error("explicit board is required for task creation")
     try:
+        from hermes_cli import kanban_db as _kb
+        _kb.validate_task_admission(board, tenant)
         kb, conn = _connect(board=board)
         try:
             # Inherit the spawning worker's own task workspace when the
