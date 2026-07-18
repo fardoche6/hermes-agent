@@ -415,10 +415,25 @@ def _validate_task_scope(
     normalized_board = _normalize_board_slug(board)
     normalized_tenant = _normalize_tenant(tenant)
     connection_board = getattr(conn, "_hermes_board", None)
+    explicit_connection_scope = bool(getattr(conn, "_hermes_explicit_scope", False))
     if connection_board in {"hermes", "kanban"}:
         raise ValueError(f"board {connection_board!r} is not an approved Kanban scope")
     if connection_board in _APPROVED_BOARD_TENANTS:
-        if normalized_board is None or normalized_tenant is None:
+        # Bare ``connect()`` is a long-standing low-level API used by generic
+        # callers and tests. Keep that legacy path working unless it attempts
+        # to use an approved tenant; approved-scope mutations must carry both
+        # explicit values so a tenant can never select a board implicitly.
+        if normalized_board is None:
+            if normalized_tenant in {
+                tenant_name
+                for tenant_names in _APPROVED_BOARD_TENANTS.values()
+                for tenant_name in tenant_names
+            } or explicit_connection_scope:
+                raise ValueError(
+                    "explicit board and tenant are required for scoped Kanban mutations"
+                )
+            return tenant
+        if normalized_tenant is None:
             raise ValueError("explicit board and tenant are required for scoped Kanban mutations")
         if normalized_board != connection_board:
             raise ValueError("explicit board does not match the board connection being mutated")
@@ -1416,12 +1431,22 @@ def _sqlite_connect(
 ) -> sqlite3.Connection:
     """Open a Kanban SQLite connection with consistent lock waiting."""
     busy_timeout_ms = _resolve_busy_timeout_ms()
-    conn = sqlite3.connect(
-        str(path),
-        isolation_level=None,
-        timeout=busy_timeout_ms / 1000.0,
-        factory=_ScopedConnection,
-    )
+    try:
+        conn = sqlite3.connect(
+            str(path),
+            isolation_level=None,
+            timeout=busy_timeout_ms / 1000.0,
+            factory=_ScopedConnection,
+        )
+    except TypeError as exc:
+        # Some callers (notably test doubles and legacy wrappers) inject their
+        # own sqlite connection factory and pass ``factory`` through. Do not
+        # make the scope metadata mechanism break those wrappers.
+        if "multiple values for keyword argument 'factory'" not in str(exc):
+            raise
+        conn = sqlite3.connect(
+            str(path), isolation_level=None, timeout=busy_timeout_ms / 1000.0
+        )
     conn._hermes_board = board
     conn._hermes_explicit_scope = explicit_scope
     # ``sqlite3.connect(timeout=...)`` normally maps to busy_timeout, but set
@@ -2584,7 +2609,15 @@ def create_task(
     # idempotency read, or write transaction.
     tenant = _validate_task_scope(conn, board, tenant)
     connection_board = getattr(conn, "_hermes_board", None)
-    if connection_board in _APPROVED_BOARD_TENANTS:
+    explicit_connection_scope = bool(getattr(conn, "_hermes_explicit_scope", False))
+    approved_tenant = _normalize_tenant(tenant) in {
+        tenant_name
+        for tenant_names in _APPROVED_BOARD_TENANTS.values()
+        for tenant_name in tenant_names
+    }
+    if connection_board in _APPROVED_BOARD_TENANTS and (
+        explicit_connection_scope or board is not None or approved_tenant
+    ):
         if not body or not str(body).strip():
             raise ValueError("body/specification is required for scoped Kanban tasks")
         if not assignee:
