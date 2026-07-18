@@ -1117,8 +1117,14 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
-    board = args.get("board")
+    explicit_board = args.get("board") or os.environ.get("HERMES_KANBAN_BOARD")
+    # A protected tenant-bearing mutation must carry an independently selected
+    # board; never derive a board from tenant presence or current-board
+    # fallback. Fully unscoped calls remain a legacy generic-board path.
+    board = explicit_board
     try:
+        from hermes_cli import kanban_db as _kb
+        _kb.validate_task_admission(board, tenant)
         kb, conn = _connect(board=board)
         try:
             # Inherit the spawning worker's own task workspace when the
@@ -1141,6 +1147,7 @@ def _handle_create(args: dict, **kw) -> str:
                 assignee=str(assignee),
                 parents=tuple(parents),
                 tenant=tenant,
+                board=board,
                 priority=int(priority) if priority is not None else 0,
                 workspace_kind=str(workspace_kind),
                 workspace_path=workspace_path,

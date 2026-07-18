@@ -222,6 +222,225 @@ def test_create_task_no_parents_is_ready(kanban_home):
     assert t.workspace_kind == "scratch"
 
 
+def test_create_task_accepts_approved_board_tenant_scope(kanban_home):
+    for board, tenant in (
+        ("default", "kanban"),
+        ("subsidysmart", "login"),
+        ("subsidysmart", "profile"),
+        ("subsidysmart", "admin"),
+        ("subsidysmart", "matching"),
+        ("subsidysmart", "backend"),
+        ("subsidysmart", "infra"),
+        ("subsidysmart", "pipeline"),
+        ("subsidysmart", "none"),
+    ):
+        if board != "default":
+            kb.create_board(board)
+        with kb.connect(board=board) as conn:
+            task_id = kb.create_task(
+                conn,
+                title="scoped task",
+                body="scoped specification",
+                assignee="worker",
+                created_by="test",
+                board=board,
+                tenant=tenant.upper(),
+            )
+            task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.tenant == tenant
+
+
+def test_create_task_rejects_invalid_scope_before_sqlite_mutation(kanban_home):
+    rejected = (
+        ("hermes", "kanban"),
+        ("kanban", "kanban"),
+        ("default", None),
+        (None, "kanban"),
+        ("subsidysmart", None),
+        ("subsidysmart", "kanban"),
+        ("default", "login"),
+        ("unknown", "kanban"),
+    )
+    with kb.connect(board="default") as conn:
+        before = {
+            "changes": conn.total_changes,
+            "tasks": conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0],
+            "events": conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0],
+        }
+        for board, tenant in rejected:
+            with pytest.raises(ValueError):
+                kb.create_task(
+                    conn,
+                    title="must not be inserted",
+                    body="valid specification",
+                    assignee="worker",
+                    created_by="test",
+                    board=board,
+                    tenant=tenant,
+                )
+        after = {
+            "changes": conn.total_changes,
+            "tasks": conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0],
+            "events": conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0],
+        }
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    ("body", "assignee", "created_by"),
+    [
+        (None, "worker", "test"),
+        (" ", "worker", "test"),
+        ("spec", None, "test"),
+        ("spec", "worker", None),
+    ],
+)
+def test_scoped_task_rejects_malformed_admission_before_mutation(
+    kanban_home, body, assignee, created_by
+):
+    with kb.connect(board="default") as conn:
+        before = (
+            conn.total_changes,
+            conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0],
+        )
+        with pytest.raises(ValueError):
+            kb.create_task(
+                conn,
+                title="malformed",
+                body=body,
+                assignee=assignee,
+                created_by=created_by,
+                board="default",
+                tenant="kanban",
+            )
+        after = (
+            conn.total_changes,
+            conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0],
+            conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0],
+        )
+    assert after == before
+
+
+def test_explicit_connection_scope_binds_board_and_rejects_missing_or_mismatch(
+    kanban_home,
+):
+    kb.create_board("subsidysmart")
+    with kb.connect(board="default") as conn:
+        before = conn.total_changes
+        with pytest.raises(ValueError, match="explicit board and tenant"):
+            kb.create_task(conn, title="missing scope")
+        with pytest.raises(ValueError, match="does not match"):
+            kb.create_task(
+                conn,
+                title="wrong connection",
+                board="subsidysmart",
+                tenant="login",
+            )
+        assert conn.total_changes == before
+    with kb.connect() as conn:
+        before = conn.total_changes
+        with pytest.raises(ValueError, match="explicit board and tenant"):
+            kb.create_task(
+                conn,
+                title="implicit missing scope",
+                body="valid specification",
+                assignee="worker",
+                created_by="test",
+                tenant="kanban",
+            )
+        with pytest.raises(ValueError, match="does not match"):
+            kb.create_task(
+                conn,
+                title="implicit wrong connection",
+                board="subsidysmart",
+                tenant="login",
+            )
+        assert conn.total_changes == before
+
+
+def test_reserved_absent_board_rejection_has_no_filesystem_mutation(kanban_home):
+    boards = kb.boards_root()
+    for slug in ("hermes", "kanban"):
+        path = boards / slug
+        assert not path.exists()
+        with pytest.raises(ValueError, match="not an approved"):
+            kb.connect(board=slug)
+        assert not path.exists()
+
+
+def test_reserved_existing_board_is_rejected_before_task_mutation(kanban_home):
+    kb.create_board("hermes")
+    with pytest.raises(ValueError, match="not an approved"):
+        kb.connect(board="hermes")
+    with pytest.raises(ValueError, match="not an approved"):
+        kb.init_db(board="hermes")
+    assert (kb.boards_root() / "hermes" / "kanban.db").exists()
+
+
+def test_init_db_absent_reserved_board_does_not_create_filesystem_state(kanban_home):
+    path = kb.boards_root() / "kanban"
+    assert not path.exists()
+    with pytest.raises(ValueError, match="not an approved"):
+        kb.init_db(board="kanban")
+    assert not path.exists()
+
+
+def test_default_operations_do_not_recreate_absent_reserved_boards(kanban_home):
+    boards = kb.boards_root()
+    assert not (boards / "hermes").exists()
+    assert not (boards / "kanban").exists()
+    with kb.connect(board="default") as conn:
+        kb.create_task(
+            conn,
+            title="approved default operation",
+            body="approved specification",
+            assignee="worker",
+            created_by="test",
+            board="default",
+            tenant="kanban",
+        )
+    assert not (boards / "hermes").exists()
+    assert not (boards / "kanban").exists()
+
+
+def test_explicit_board_rejects_env_database_path_mismatch(kanban_home, monkeypatch):
+    kb.create_board("subsidysmart")
+    subsidysmart_db = kb.kanban_db_path(board="subsidysmart")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(subsidysmart_db))
+    with pytest.raises(ValueError, match="does not match"):
+        kb.connect(board="default")
+    with kb.connect(board="subsidysmart") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_approved_scope_rejects_unknown_explicit_database_path(kanban_home, tmp_path):
+    custom_db = tmp_path / "custom" / "kanban.db"
+    conn = kb.connect(custom_db)
+    try:
+        before = conn.total_changes
+        with pytest.raises(ValueError, match="does not match"):
+            kb.create_task(conn, title="wrong database", board="default", tenant="kanban")
+        assert conn.total_changes == before
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_generic_tenant_without_explicit_scope_remains_supported(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="generic tenant", tenant="biz-a")
+    assert task_id
+
+
+def test_generic_named_board_scope_remains_supported(kanban_home):
+    kb.create_board("alt")
+    with kb.connect(board="alt") as conn:
+        task_id = kb.create_task(conn, title="generic named board", tenant="biz-a")
+    assert task_id
+
+
 def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
     with kb.connect() as conn:
         p = kb.create_task(conn, title="parent")
@@ -2198,7 +2417,16 @@ def test_worktree_no_path_no_board_default_raises(kanban_home, tmp_path, monkeyp
     _init_git_repo(decoy_repo)
     monkeypatch.chdir(decoy_repo)
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="ship", workspace_kind="worktree")
+        t = kb.create_task(
+            conn,
+            title="ship",
+            body="worktree specification",
+            assignee="worker",
+            created_by="test",
+            board="default",
+            tenant="kanban",
+            workspace_kind="worktree",
+        )
         task = kb.get_task(conn, t)
         assert task is not None
         with pytest.raises(ValueError, match="default_workdir"):
@@ -3029,7 +3257,15 @@ class TestSharedBoardPaths:
         self._set_home(monkeypatch, tmp_path, default_home)
         kb.init_db()
         with kb.connect() as conn:
-            task_id = kb.create_task(conn, title="cross-profile")
+            task_id = kb.create_task(
+                conn,
+                title="cross-profile",
+                body="cross-profile specification",
+                assignee="worker",
+                created_by="test",
+                board="default",
+                tenant="kanban",
+            )
 
         # Worker switches to the profile HERMES_HOME and reads.
         monkeypatch.setenv("HERMES_HOME", str(profile_home))
