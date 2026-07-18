@@ -612,7 +612,7 @@ class CreateTaskBody(BaseModel):
 
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
-    board = _resolve_board(board)
+    board = _resolve_board(board) or kanban_db.get_current_board()
     conn = _conn(board=board)
     try:
         task_id = kanban_db.create_task(

@@ -1117,10 +1117,13 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
-    board = (
-        args.get("board")
-        or os.environ.get("HERMES_KANBAN_BOARD")
-        or ("default" if tenant else None)
+    from hermes_cli import kanban_db as kanban_db_module
+    explicit_board = args.get("board") or os.environ.get("HERMES_KANBAN_BOARD")
+    # Preserve the legacy unscoped tool contract when no tenant is supplied.
+    # A tenant-bearing mutation must resolve a board independently; it must
+    # never derive the board from the tenant value itself.
+    board = explicit_board or (
+        kanban_db_module.get_current_board() if tenant is not None else None
     )
     try:
         kb, conn = _connect(board=board)

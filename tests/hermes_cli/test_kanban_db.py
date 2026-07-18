@@ -313,6 +313,54 @@ def test_reserved_absent_board_rejection_has_no_filesystem_mutation(kanban_home)
         assert not path.exists()
 
 
+def test_reserved_existing_board_is_rejected_before_task_mutation(kanban_home):
+    kb.create_board("hermes")
+    with pytest.raises(ValueError, match="not an approved"):
+        kb.connect(board="hermes")
+    assert (kb.boards_root() / "hermes" / "kanban.db").exists()
+
+
+def test_init_db_absent_reserved_board_does_not_create_filesystem_state(kanban_home):
+    path = kb.boards_root() / "kanban"
+    assert not path.exists()
+    with pytest.raises(ValueError, match="does not exist"):
+        kb.init_db(board="kanban")
+    assert not path.exists()
+
+
+def test_default_operations_do_not_recreate_absent_reserved_boards(kanban_home):
+    boards = kb.boards_root()
+    assert not (boards / "hermes").exists()
+    assert not (boards / "kanban").exists()
+    with kb.connect(board="default") as conn:
+        kb.create_task(conn, title="approved default operation", board="default", tenant="kanban")
+    assert not (boards / "hermes").exists()
+    assert not (boards / "kanban").exists()
+
+
+def test_explicit_board_rejects_env_database_path_mismatch(kanban_home, monkeypatch):
+    kb.create_board("subsidysmart")
+    subsidysmart_db = kb.kanban_db_path(board="subsidysmart")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(subsidysmart_db))
+    with pytest.raises(ValueError, match="does not match"):
+        kb.connect(board="default")
+    with kb.connect(board="subsidysmart") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_approved_scope_rejects_unknown_explicit_database_path(kanban_home, tmp_path):
+    custom_db = tmp_path / "custom" / "kanban.db"
+    conn = kb.connect(custom_db)
+    try:
+        before = conn.total_changes
+        with pytest.raises(ValueError, match="does not match"):
+            kb.create_task(conn, title="wrong database", board="default", tenant="kanban")
+        assert conn.total_changes == before
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_generic_tenant_without_explicit_scope_remains_supported(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="generic tenant", tenant="biz-a")

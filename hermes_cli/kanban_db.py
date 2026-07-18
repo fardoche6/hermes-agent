@@ -433,13 +433,21 @@ def _validate_task_scope(
             return normalized_tenant
         return tenant
 
+    reserved_boards = set(_APPROVED_BOARD_TENANTS) | {"hermes", "kanban"}
     approved_tenants = {
         tenant_name
         for tenant_names in _APPROVED_BOARD_TENANTS.values()
         for tenant_name in tenant_names
     }
+    if connection_board in {"hermes", "kanban"}:
+        raise ValueError(f"board {connection_board!r} is not an approved Kanban scope")
     if (
-        (normalized_board in _APPROVED_BOARD_TENANTS)
+        normalized_board in _APPROVED_BOARD_TENANTS
+        and connection_board != normalized_board
+    ):
+        raise ValueError("explicit board does not match the board connection being mutated")
+    if (
+        (normalized_board in reserved_boards)
         or normalized_tenant in approved_tenants
     ):
         if (
@@ -1821,8 +1829,18 @@ def connect(
             raise ValueError(
                 f"board {normalized_board!r} does not exist; create it explicitly first"
             )
+    connection_board = _board_identity_for_path(path)
+    if normalized_board in _APPROVED_BOARD_TENANTS:
+        expected_path = kanban_db_path(board=normalized_board)
+        if path.resolve() != expected_path.resolve():
+            raise ValueError(
+                f"board {normalized_board!r} does not match the resolved database path"
+            )
+    if normalized_board in {"hermes", "kanban"}:
+        raise ValueError(f"board {normalized_board!r} is not an approved Kanban scope")
+    if normalized_board is not None and connection_board != normalized_board:
+        raise ValueError("explicit board does not match the resolved database path")
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection_board = normalized_board or _board_identity_for_path(path)
 
     # Fast path: once THIS process has initialized this path, the expensive
     # first-open work (header validation, integrity probe, schema + additive
@@ -1959,13 +1977,23 @@ def init_db(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+    normalized_board = _normalize_board_slug(board)
+    if (
+        normalized_board in {"hermes", "kanban"}
+        and not path.exists()
+        and not board_metadata_path(normalized_board).exists()
+    ):
+        raise ValueError(
+            f"board {normalized_board!r} does not exist; create it explicitly first"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     resolved = str(path.resolve())
     # Clear the cache entry so the underlying connect() re-runs the
     # schema + migration pass unconditionally.
     with _INIT_LOCK:
         _INITIALIZED_PATHS.discard(resolved)
-    with contextlib.closing(connect(path)):
+    connect_board = None if normalized_board in {"hermes", "kanban"} else normalized_board
+    with contextlib.closing(connect(path, board=connect_board)):
         pass
     return path
 
