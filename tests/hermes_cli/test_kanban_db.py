@@ -222,6 +222,65 @@ def test_create_task_no_parents_is_ready(kanban_home):
     assert t.workspace_kind == "scratch"
 
 
+def test_create_task_accepts_approved_board_tenant_scope(kanban_home):
+    for board, tenant in (
+        ("default", "kanban"),
+        ("subsidysmart", "login"),
+        ("subsidysmart", "profile"),
+        ("subsidysmart", "admin"),
+        ("subsidysmart", "matching"),
+        ("subsidysmart", "backend"),
+        ("subsidysmart", "infra"),
+        ("subsidysmart", "pipeline"),
+        ("subsidysmart", "none"),
+    ):
+        if board != "default":
+            kb.create_board(board)
+        with kb.connect(board=board) as conn:
+            task_id = kb.create_task(
+                conn, title="scoped task", board=board, tenant=tenant.upper()
+            )
+            task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.tenant == tenant
+
+
+def test_create_task_rejects_invalid_scope_before_sqlite_mutation(kanban_home):
+    rejected = (
+        ("hermes", "kanban"),
+        ("kanban", "kanban"),
+        ("default", None),
+        (None, "kanban"),
+        ("subsidysmart", None),
+        ("subsidysmart", "kanban"),
+        ("default", "login"),
+        ("unknown", "kanban"),
+    )
+    with kb.connect(board="default") as conn:
+        before = {
+            "changes": conn.total_changes,
+            "tasks": conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0],
+            "events": conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0],
+        }
+        for board, tenant in rejected:
+            with pytest.raises(ValueError):
+                kb.create_task(
+                    conn, title="must not be inserted", board=board, tenant=tenant
+                )
+        after = {
+            "changes": conn.total_changes,
+            "tasks": conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0],
+            "events": conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0],
+        }
+    assert after == before
+
+
+def test_generic_tenant_without_explicit_scope_remains_supported(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="generic tenant", tenant="biz-a")
+    assert task_id
+
+
 def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
     with kb.connect() as conn:
         p = kb.create_task(conn, title="parent")

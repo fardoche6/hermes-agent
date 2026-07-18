@@ -330,6 +330,12 @@ def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
 # ---------------------------------------------------------------------------
 
 DEFAULT_BOARD = "default"
+_APPROVED_BOARD_TENANTS: dict[str, frozenset[str]] = {
+    "default": frozenset({"kanban"}),
+    "subsidysmart": frozenset(
+        {"login", "profile", "admin", "matching", "backend", "infra", "pipeline", "none"}
+    ),
+}
 _CURRENT_BOARD_OVERRIDE: ContextVar[str | None] = ContextVar(
     "hermes_kanban_current_board_override",
     default=None,
@@ -366,6 +372,58 @@ def _normalize_board_slug(slug: Optional[str]) -> Optional[str]:
             f"alphanumerics / hyphens / underscores, not starting with '-' or '_'"
         )
     return s
+
+
+def _normalize_tenant(tenant: Optional[str]) -> Optional[str]:
+    """Lowercase + strip an explicit tenant; return ``None`` for empty."""
+    if tenant is None:
+        return None
+    value = str(tenant).strip().lower()
+    return value or None
+
+
+def validate_board_tenant_scope(
+    board: Optional[str], tenant: Optional[str], *, require_explicit: bool = True
+) -> tuple[str, str]:
+    """Validate an approved explicit board/tenant pair before mutation.
+
+    The guard never derives one value from the other or from the current
+    board/profile/environment. The public mutation path keeps strict explicit
+    validation; the optional flag exists for callers that already established
+    both values independently.
+    """
+    normalized_board = _normalize_board_slug(board)
+    normalized_tenant = _normalize_tenant(tenant)
+    if require_explicit and (normalized_board is None or normalized_tenant is None):
+        raise ValueError("explicit board and tenant are required for scoped Kanban mutations")
+    if normalized_board is None or normalized_tenant is None:
+        raise ValueError("board and tenant must both be non-empty")
+    allowed_tenants = _APPROVED_BOARD_TENANTS.get(normalized_board)
+    if allowed_tenants is None:
+        raise ValueError(f"board {normalized_board!r} is not an approved Kanban scope")
+    if normalized_tenant not in allowed_tenants:
+        raise ValueError(
+            f"tenant {normalized_tenant!r} is not approved for board {normalized_board!r}"
+        )
+    return normalized_board, normalized_tenant
+
+
+def _validate_task_scope(board: Optional[str], tenant: Optional[str]) -> Optional[str]:
+    """Validate reserved scopes without changing legacy generic tenants."""
+    normalized_tenant = _normalize_tenant(tenant)
+    approved_tenants = {
+        tenant_name
+        for tenant_names in _APPROVED_BOARD_TENANTS.values()
+        for tenant_name in tenant_names
+    }
+    if (
+        (board is not None and normalized_tenant is not None)
+        or normalized_tenant in approved_tenants
+        or _normalize_board_slug(board) in _APPROVED_BOARD_TENANTS
+    ):
+        _, normalized_tenant = validate_board_tenant_scope(board, normalized_tenant)
+        return normalized_tenant
+    return tenant
 
 
 def kanban_home() -> Path:
@@ -2448,6 +2506,9 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    # Validate explicit board/tenant scope before any project lookup,
+    # idempotency read, or write transaction.
+    tenant = _validate_task_scope(board, tenant)
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
