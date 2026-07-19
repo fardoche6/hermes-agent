@@ -164,13 +164,16 @@ def test_review_submit_verdict_and_completion_keep_one_card_identity(kanban_home
         )
         assert kb.get_task(conn, task_id).status == "review_approved"
         assert kb.get_task(conn, task_id).status != "done"
+        finalization = kb.get_task(conn, task_id)
+        assert finalization is not None
+        assert finalization.current_run_id is not None and finalization.claim_lock is not None
         assert kb.complete_task(
             conn,
             task_id,
             summary="review proof recorded on original card",
             metadata={"review_status": "approved", "tests_run": ["synthetic"]},
-            expected_run_id=reviewed.current_run_id,
-            claimer="reviewer:test",
+            expected_run_id=finalization.current_run_id,
+            claimer=finalization.claim_lock,
         )
         final = kb.get_task(conn, task_id)
         tasks = kb.list_tasks(conn, include_archived=True)

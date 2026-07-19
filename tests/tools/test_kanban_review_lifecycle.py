@@ -293,3 +293,44 @@ def test_reviewer_fallback_skips_unavailable_preferred_profile(tmp_path, monkeyp
         assert kb.get_task(conn, task_id).assignee == "programmer"
     finally:
         conn.close()
+
+
+def test_request_changes_rolls_back_run_and_task_together(tmp_path, monkeypatch):
+    kb = _db(tmp_path, monkeypatch)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="atomic request changes", assignee="programmer")
+        impl = kb.claim_task(conn, task_id, claimer="host:impl")
+        assert kb.submit_review(conn, task_id, expected_run_id=impl.current_run_id, claimer="host:impl")
+        reviewer = kb.claim_review_task(conn, task_id, claimer="host:review")
+        original = kb._end_run_id
+        monkeypatch.setattr(kb, "_end_run_id", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("injected")))
+        with pytest.raises(RuntimeError):
+            kb.review_verdict(conn, task_id, approved=False, summary="changes", expected_run_id=reviewer.current_run_id, claimer="host:review")
+        monkeypatch.setattr(kb, "_end_run_id", original)
+        task = kb.get_task(conn, task_id)
+        run = conn.execute("SELECT status, outcome, ended_at FROM task_runs WHERE id = ?", (reviewer.current_run_id,)).fetchone()
+        assert task.status == "running" and task.current_run_id == reviewer.current_run_id
+        assert run["status"] == "running" and run["outcome"] is None and run["ended_at"] is None
+
+
+def test_approved_finalization_recovery_dispatches_only_finalization(tmp_path, monkeypatch):
+    kb = _db(tmp_path, monkeypatch)
+    repo, commit = _remote_workspace(tmp_path)
+    proof = {"merge_proof": {"commit": commit, "state": "merged", "checks": {"pytest": {"status": "passed"}}, "review_threads": {"resolved": 1, "total": 1}, "readback": {"status": "verified"}}, "live_proof": {"checks": {"health": {"status": "healthy"}}}}
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="finalization recovery", assignee="programmer", workspace_kind="worktree", workspace_path=str(repo))
+        impl = kb.claim_task(conn, task_id, claimer="host:impl")
+        assert kb.submit_review(conn, task_id, expected_run_id=impl.current_run_id, claimer="host:impl")
+        reviewer = kb.claim_review_task(conn, task_id, claimer="host:review")
+        assert kb.review_verdict(conn, task_id, approved=True, metadata=proof, expected_run_id=reviewer.current_run_id, claimer="host:review")
+        final_id = kb.get_task(conn, task_id).current_run_id
+        conn.execute("UPDATE tasks SET claim_expires = 0, worker_pid = NULL WHERE id = ?", (task_id,))
+        assert kb.release_stale_claims(conn) == 1
+        recovered = kb.get_task(conn, task_id)
+        assert recovered.status == "review_approved" and recovered.current_run_id is None
+        captured = []
+        result = kb.dispatch_once(conn, spawn_fn=lambda task, workspace: captured.append(task) or 123)
+        assert result.spawned and captured[0].id == task_id
+        fresh = kb.get_task(conn, task_id)
+        assert fresh.status == "review_approved" and fresh.current_run_id != final_id
+        assert conn.execute("SELECT outcome FROM task_runs WHERE id = ?", (final_id,)).fetchone()["outcome"] == "reclaimed"
