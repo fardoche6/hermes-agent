@@ -94,6 +94,7 @@
   const FALLBACK_COLUMN_LABEL = {
     triage: "Triage",
     todo: "Todo",
+    scheduled: "Scheduled",
     ready: "Ready",
     running: "In Progress",
     blocked: "Blocked",
@@ -103,6 +104,7 @@
   const FALLBACK_COLUMN_HELP = {
     triage: "Raw ideas — a specifier will flesh out the spec",
     todo: "Waiting on dependencies or unassigned",
+    scheduled: "Waiting until its scheduled time",
     ready: "Dependencies satisfied; assign a profile to dispatch",
     running: "Claimed by a worker — in-flight",
     blocked: "Worker asked for human input",
@@ -154,6 +156,7 @@
   const COLUMN_DOT = {
     triage: "hermes-kanban-dot-triage",
     todo: "hermes-kanban-dot-todo",
+    scheduled: "hermes-kanban-dot-scheduled",
     ready: "hermes-kanban-dot-ready",
     running: "hermes-kanban-dot-running",
     blocked: "hermes-kanban-dot-blocked",
