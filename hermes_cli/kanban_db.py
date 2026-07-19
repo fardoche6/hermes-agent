@@ -3823,18 +3823,28 @@ def review_verdict(
             source_payload = {}
         if source_payload.get("source_status") != "review":
             return False
-        cur = conn.execute(
-            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
-            "worker_pid = NULL WHERE id = ? AND status = 'running' "
-            "AND current_run_id = ? AND claim_lock = ?",
-            (target_status, task_id, run_id, lock),
-        )
+        # Approval is a proof gate, not finalization. Keep the reviewer's
+        # exact run+claim live so only that token can finalize the card.
+        if verdict == "approved":
+            cur = conn.execute(
+                "UPDATE tasks SET status = ? WHERE id = ? AND status = 'running' "
+                "AND current_run_id = ? AND claim_lock = ?",
+                (target_status, task_id, run_id, lock),
+            )
+            closed_run = None
+        else:
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+                "worker_pid = NULL, current_run_id = NULL WHERE id = ? AND status = 'running' "
+                "AND current_run_id = ? AND claim_lock = ?",
+                (target_status, task_id, run_id, lock),
+            )
+            closed_run = _end_run(
+                conn, task_id, outcome=f"review_{verdict}", summary=summary,
+                metadata=metadata, status=f"review_{verdict}",
+            )
         if cur.rowcount != 1:
             return False
-        closed_run = _end_run(
-            conn, task_id, outcome=f"review_{verdict}", summary=summary,
-            metadata=metadata, status=f"review_{verdict}",
-        )
         _append_event(
             conn, task_id, "review_verdict",
             {"verdict": verdict, "summary": summary, "metadata": metadata},
@@ -3878,6 +3888,7 @@ def release_stale_claims(
     conn: sqlite3.Connection,
     *,
     signal_fn=None,
+    failure_limit: Optional[int] = None,
 ) -> int:
     """Reset any ``running`` task whose claim has expired.
 
@@ -3992,6 +4003,7 @@ def release_stale_claims(
             _record_task_failure(
                 conn, row["id"], f"stale_lock={row['claim_lock']}",
                 outcome="reclaimed", release_claim=True, end_run=True,
+                failure_limit=failure_limit,
                 event_payload_extra=payload,
             )
             reclaimed += 1
@@ -4004,6 +4016,7 @@ def reclaim_task(
     *,
     reason: Optional[str] = None,
     signal_fn=None,
+    failure_limit: Optional[int] = None,
 ) -> bool:
     """Operator-driven reclaim: release the claim and reset to ``ready``.
 
@@ -4039,6 +4052,7 @@ def reclaim_task(
     had_active_run = _current_run_id(conn, task_id) is not None
     _record_task_failure(
         conn, task_id, error, outcome="reclaimed",
+        failure_limit=failure_limit,
         release_claim=True, end_run=True, event_payload_extra=payload,
     )
     return had_active_run
@@ -4219,19 +4233,43 @@ def _valid_review_proof(metadata: object) -> bool:
     live = metadata.get("live_proof")
     if not isinstance(merge, dict) or not isinstance(live, dict):
         return False
-    commit = merge.get("commit")
+    commit = merge.get("merged_commit", merge.get("commit"))
+    state = merge.get("merged_state", merge.get("state"))
     merge_checks = merge.get("checks")
     live_checks = live.get("checks")
-    if not isinstance(commit, str) or not commit.strip():
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", commit.strip()):
         return False
-    if not isinstance(merge_checks, (list, tuple)) or not merge_checks:
+    if not isinstance(state, str) or state.strip().lower() != "merged":
         return False
-    if not isinstance(live_checks, (list, tuple)) or not live_checks:
+    if not isinstance(merge_checks, dict) or not merge_checks:
         return False
-    return all(
-        isinstance(item, str) and item.strip()
-        for item in list(merge_checks) + list(live_checks)
-    )
+    if not isinstance(live_checks, dict) or not live_checks:
+        return False
+    def concrete_mapping(value: dict) -> bool:
+        for key, item in value.items():
+            if not isinstance(key, str) or not key.strip() or not isinstance(item, dict):
+                return False
+            status = item.get("status", item.get("result"))
+            if not isinstance(status, str) or status.strip().lower() in {
+                "", "synthetic", "true", "false", "placeholder", "fake",
+            }:
+                return False
+            if status.strip().lower() not in {
+                "passed", "pass", "ok", "healthy", "verified", "resolved",
+            }:
+                return False
+        return True
+    if not concrete_mapping(merge_checks) or not concrete_mapping(live_checks):
+        return False
+    threads = merge.get("review_threads", merge.get("threads"))
+    readback = merge.get("readback")
+    if not isinstance(threads, dict) or threads.get("resolved") != threads.get("total"):
+        return False
+    if not isinstance(readback, dict) or str(readback.get("status", "")).lower() not in {
+        "verified", "readback_verified",
+    }:
+        return False
+    return True
 
 
 def _review_approval_proven(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -4259,6 +4297,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    claimer: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -4320,9 +4359,18 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
-    current = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    current = conn.execute(
+        "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
     if current and current["status"] == "review_approved" and not _review_approval_proven(conn, task_id):
         return False
+    if current and current["status"] == "review_approved":
+        if (
+            expected_run_id is None or not claimer
+            or current["current_run_id"] != int(expected_run_id)
+            or current["claim_lock"] != claimer
+        ):
+            return False
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -4355,12 +4403,10 @@ def complete_task(
                        block_recurrences = 0
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked', 'review_approved')
-                   AND (
-                       current_run_id = ?
-                       OR (status = 'review_approved' AND current_run_id IS NULL)
-                   )
-                """,
-                (result, now, task_id, int(expected_run_id)),
+                   AND current_run_id = ?
+                   AND (status != 'review_approved' OR claim_lock = ?)
+                   """,
+                   (result, now, task_id, int(expected_run_id), claimer),
             )
         if cur.rowcount != 1:
             return False
@@ -6877,7 +6923,9 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def detect_crashed_workers(
+    conn: sqlite3.Connection, *, failure_limit: Optional[int] = None,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Appends a ``crashed`` event and drops the task back to ``ready``.
@@ -7091,7 +7139,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 violation_limit = (
                     int(task_override)
                     if task_override is not None
-                    else _PROTOCOL_VIOLATION_FAILURE_LIMIT
+                    else (failure_limit or _PROTOCOL_VIOLATION_FAILURE_LIMIT)
                 )
                 if streak < violation_limit:
                     # Below budget: the task is already back at ``ready``
@@ -7130,7 +7178,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 conn, tid,
                 error=error_text,
                 outcome="crashed",
-                failure_limit=1 if is_systemic else None,
+                failure_limit=(1 if is_systemic else failure_limit),
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "claimer": claimer},
@@ -7685,13 +7733,13 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
-    result.reclaimed = release_stale_claims(conn)
+    result.reclaimed = release_stale_claims(conn, failure_limit=failure_limit)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit,
     )
     result.auto_blocked.extend(getattr(detect_stale_running, "_last_auto_blocked", []))
-    result.crashed = detect_crashed_workers(conn)
+    result.crashed = detect_crashed_workers(conn, failure_limit=failure_limit)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
