@@ -8163,6 +8163,9 @@ def _dispatch_once_locked(
         # Task.assignee remains the implementer in the DB; only the spawned
         # process uses the independent reviewer profile.
         claimed.assignee = reviewer_profile
+        # Fresh reviewer processes must not receive a hard-coded skill that may
+        # be absent from the selected profile; configured skills are resolved
+        # by the profile itself.
         claimed.skills = []
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
