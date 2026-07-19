@@ -3924,7 +3924,7 @@ def test_dispatch_review_spawns_with_correct_skills(
         res = kb.dispatch_once(conn, spawn_fn=capture_spawn)
     assert len(res.spawned) == 1
     assert len(spawned_tasks) == 1
-    assert spawned_tasks[0].skills == ["sdlc-review"]
+    assert spawned_tasks[0].skills == []
 
 
 def test_dispatch_review_skips_unassigned(kanban_home):
@@ -4215,16 +4215,12 @@ def test_detect_stale_skips_blocked_tasks(kanban_home, monkeypatch):
         assert kb.get_task(conn, t).status == "blocked"
 
 
-def test_detect_stale_does_not_tick_failure_counter(kanban_home, monkeypatch):
-    """Stale reclaim must NOT tick consecutive_failures.
+def test_detect_stale_ticks_failure_counter(kanban_home, monkeypatch):
+    """Stale reclaim must tick consecutive_failures.
 
-    Stale detection is dispatcher-side absence-of-heartbeat detection,
-    not a worker failure. Counting it as a failure would let two
-    legitimately-long-running tasks (>4h without explicit heartbeat) trip
-    the circuit breaker and auto-block at the default failure_limit=2,
-    even though no worker actually failed. The 'stale' event in
-    task_events is the right audit surface; the consecutive_failures
-    counter is reserved for spawn_failed / timed_out / crashed.
+    Stale recovery is a bounded worker-failure path just like timeout/crash;
+    its audit event and failure counter must agree so repeated reviewer
+    recovery cannot loop forever.
     """
     import hermes_cli.kanban_db as _kb
 
@@ -4255,15 +4251,11 @@ def test_detect_stale_does_not_tick_failure_counter(kanban_home, monkeypatch):
         )
         assert t in stale, "Task should be reclaimed by stale detection"
 
-        # Critical assertion: the failure counter MUST NOT have ticked.
-        # Stale reclaim resets to ready for re-dispatch without penalty.
+        # Critical assertion: stale recovery is counted for the breaker.
         row = conn.execute(
             "SELECT consecutive_failures FROM tasks WHERE id = ?", (t,)
         ).fetchone()
-        assert row["consecutive_failures"] in (0, None), (
-            f"Stale reclaim ticked consecutive_failures to "
-            f"{row['consecutive_failures']!r}; should remain 0/NULL."
-        )
+        assert row["consecutive_failures"] == 1
 
         # And the audit trail still records the stale event so operators
         # can see what happened.
