@@ -70,7 +70,13 @@ def test_approved_verdict_completes_only_reviewers_claimed_card(tmp_path, monkey
         )
         assert kb.get_task(conn, task_id).status == "review_approved"
         assert kb.get_task(conn, task_id).status != "done"
-        assert kb.complete_task(conn, task_id, summary="completed after approved review", metadata={"review_status": "approved"})
+        assert kb.complete_task(
+            conn, task_id, summary="completed after approved review",
+            metadata={
+                "review_status": "approved",
+                "merge_proof": {"commit": "abc123", "checks": ["pytest"]},
+            },
+        )
         assert kb.get_task(conn, task_id).status == "done"
         payloads = [json.loads(row["payload"]) for row in conn.execute(
             "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_verdict'", (task_id,)
@@ -221,8 +227,10 @@ def test_review_handlers_reject_wrong_run_claim_and_missing_proof(tmp_path, monk
         assert reviewer is not None
         monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(reviewer.current_run_id))
         monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "host:reviewer")
-        assert "could not record verdict" in kanban_tools._handle_review_verdict({
-            "verdict": "approved", "summary": "missing proof", "metadata": {},
-        })
+        verdict = json.loads(kanban_tools._handle_review_verdict({
+            "verdict": "approved", "summary": "review pass", "metadata": {},
+        }))
+        assert verdict["ok"] is True
+        assert not kb.complete_task(conn, task_id, metadata={"review_status": "approved"})
     finally:
         conn.close()

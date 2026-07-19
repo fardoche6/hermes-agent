@@ -3708,11 +3708,35 @@ def _reviewer_profile(implementer: Optional[str]) -> str:
     except Exception:
         configured = None
     candidates = [configured, "code-reviewer", "code-reviewer-claudecode"]
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        profile_exists = None
     for candidate in candidates:
         profile = str(candidate or "").strip()
-        if profile and profile != implementer:
+        if profile and profile != implementer and (
+            profile_exists is None or profile_exists(profile)
+        ):
             return profile
     raise ValueError("no independent reviewer profile is configured")
+
+
+def _block_unspawnable_review(conn: sqlite3.Connection, task_id: str, reason: str) -> bool:
+    """Make a missing reviewer a visible, typed capability blocker."""
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'blocked', block_kind = 'capability', "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status = 'review' AND claim_lock IS NULL",
+            (task_id,),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn, task_id, "review_blocked",
+            {"kind": "capability", "reason": reason},
+        )
+    return True
 
 
 def submit_review(
@@ -3780,10 +3804,8 @@ def review_verdict(
     if expected_run_id is None or not claimer:
         return False
     lock = claimer
-    if verdict == "approved":
-        proof = metadata if isinstance(metadata, dict) else {}
-        if not proof.get("merge_proof") or not proof.get("live_proof"):
-            return False
+    # Approval is an independent review result. Merge/deployment proof belongs
+    # to finalization, which may happen after this reviewer run has ended.
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?",
@@ -4001,6 +4023,12 @@ def release_stale_claims(
                 run_id=run_id,
             )
             reclaimed += 1
+        if recovery_status == "review":
+            _record_task_failure(
+                conn, row["id"], error=f"stale_lock={row['claim_lock']}",
+                outcome="reclaimed", release_claim=False, end_run=False,
+                event_payload_extra={"review_origin": True},
+            )
     return reclaimed
 
 
@@ -4040,7 +4068,7 @@ def reclaim_task(
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "last_failure_error = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked', 'review') "
             "AND claim_lock IS ?",
             (recovery_status, task_id, prev_lock),
@@ -4067,6 +4095,12 @@ def reclaim_task(
             payload,
             run_id=run_id,
         )
+    _record_task_failure(
+        conn, task_id,
+        error=(f"manual_reclaim: {reason}" if reason else f"manual_reclaim lock={prev_lock}"),
+        outcome="reclaimed", release_claim=False, end_run=False,
+        event_payload_extra={"manual": True, "review_origin": recovery_status == "review"},
+    )
     return True
 
 
@@ -4237,8 +4271,33 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _valid_completion_proof(metadata: object) -> bool:
+    """Validate merge proof, with optional typed live/deployment proof."""
+    if not isinstance(metadata, dict):
+        return False
+    merge = metadata.get("merge_proof")
+    if not isinstance(merge, dict):
+        return False
+    if not isinstance(merge.get("commit"), str) or not merge["commit"].strip():
+        return False
+    checks = merge.get("checks")
+    if not isinstance(checks, (list, tuple)) or not checks:
+        return False
+    if not all(isinstance(item, str) and item.strip() for item in checks):
+        return False
+    live = metadata.get("live_proof")
+    if live is None:
+        return True
+    live_checks = live.get("checks") if isinstance(live, dict) else None
+    return (
+        isinstance(live_checks, (list, tuple))
+        and bool(live_checks)
+        and all(isinstance(item, str) and item.strip() for item in live_checks)
+    )
+
+
 def _review_approval_proven(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return true only when the approved verdict recorded both proof gates."""
+    """Return true only when an approved reviewer verdict exists."""
     event = conn.execute(
         "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_verdict' "
         "ORDER BY id DESC LIMIT 1", (task_id,)
@@ -4247,10 +4306,7 @@ def _review_approval_proven(conn: sqlite3.Connection, task_id: str) -> bool:
         return False
     try:
         payload = json.loads(event["payload"])
-        metadata = payload.get("metadata") or {}
-        return payload.get("verdict") == "approved" and bool(
-            metadata.get("merge_proof") and metadata.get("live_proof")
-        )
+        return payload.get("verdict") == "approved"
     except (TypeError, json.JSONDecodeError):
         return False
 
@@ -4326,8 +4382,9 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     current = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    if current and current["status"] == "review_approved" and not _review_approval_proven(conn, task_id):
-        return False
+    if current and current["status"] == "review_approved":
+        if not _review_approval_proven(conn, task_id) or not _valid_completion_proof(metadata):
+            return False
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -4362,10 +4419,18 @@ def complete_task(
                    AND status IN ('running', 'ready', 'blocked', 'review_approved')
                    AND (
                        current_run_id = ?
-                       OR (status = 'review_approved' AND current_run_id IS NULL)
-                   )
-                """,
-                (result, now, task_id, int(expected_run_id)),
+                       OR (
+                           status = 'review_approved' AND current_run_id IS NULL
+                           AND ? = (
+                               SELECT run_id FROM task_events
+                                WHERE task_id = tasks.id AND kind = 'review_verdict'
+                                  AND json_extract(payload, '$.verdict') = 'approved'
+                                ORDER BY id DESC LIMIT 1
+                           )
+                       )
+                       )
+                       """,
+                       (result, now, task_id, int(expected_run_id), int(expected_run_id)),
             )
         if cur.rowcount != 1:
             return False
@@ -6833,7 +6898,7 @@ def detect_stale_running(
             )
             reclaimed.append(tid)
 
-        if _record_task_failure(
+        if recovery_status == "review" and _record_task_failure(
             conn, tid,
             error=(
                 f"no heartbeat for {int(hb_age)}s "
@@ -6843,7 +6908,7 @@ def detect_stale_running(
             failure_limit=failure_limit,
             release_claim=False,
             end_run=False,
-            event_payload_extra={"pid": int(pid) if pid else None},
+            event_payload_extra={"pid": int(pid) if pid else None, "review_origin": True},
         ):
             auto_blocked.append(tid)
 
@@ -8037,10 +8102,22 @@ def _dispatch_once_locked(
         try:
             reviewer_profile = _reviewer_profile(row["assignee"])
         except ValueError:
-            result.skipped_nonspawnable.append(row["id"])
+            if dry_run:
+                result.skipped_nonspawnable.append(row["id"])
+            else:
+                _block_unspawnable_review(
+                    conn, row["id"], "no independent reviewer profile is available",
+                )
+                result.auto_blocked.append(row["id"])
             continue
         if profile_exists is not None and not profile_exists(reviewer_profile):
-            result.skipped_nonspawnable.append(row["id"])
+            if dry_run:
+                result.skipped_nonspawnable.append(row["id"])
+            else:
+                _block_unspawnable_review(
+                    conn, row["id"], f"reviewer profile unavailable: {reviewer_profile}",
+                )
+                result.auto_blocked.append(row["id"])
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))

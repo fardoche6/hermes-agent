@@ -4215,13 +4215,8 @@ def test_detect_stale_skips_blocked_tasks(kanban_home, monkeypatch):
         assert kb.get_task(conn, t).status == "blocked"
 
 
-def test_detect_stale_ticks_failure_counter(kanban_home, monkeypatch):
-    """Stale reclaim must tick consecutive_failures.
-
-    Stale recovery is a bounded worker-failure path just like timeout/crash;
-    its audit event and failure counter must agree so repeated reviewer
-    recovery cannot loop forever.
-    """
+def test_detect_stale_does_not_tick_ordinary_worker_failure_counter(kanban_home, monkeypatch):
+    """Ordinary stale detection is dispatcher evidence, not worker failure."""
     import hermes_cli.kanban_db as _kb
 
     with kb.connect() as conn:
@@ -4251,11 +4246,11 @@ def test_detect_stale_ticks_failure_counter(kanban_home, monkeypatch):
         )
         assert t in stale, "Task should be reclaimed by stale detection"
 
-        # Critical assertion: stale recovery is counted for the breaker.
+        # Ordinary stale recovery must not consume the worker retry budget.
         row = conn.execute(
             "SELECT consecutive_failures FROM tasks WHERE id = ?", (t,)
         ).fetchone()
-        assert row["consecutive_failures"] == 1
+        assert row["consecutive_failures"] == 0
 
         # And the audit trail still records the stale event so operators
         # can see what happened.

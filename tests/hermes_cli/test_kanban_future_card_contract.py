@@ -127,7 +127,10 @@ def test_review_submit_verdict_and_completion_keep_one_card_identity(kanban_home
         assert reviewed.status == "running"
         assert kb.review_verdict(
             conn, task_id, verdict="approved", summary="review passed",
-            metadata={"merge_proof": {"commit": "synthetic"}, "live_proof": {"checks": ["synthetic"]}},
+            metadata={
+                "merge_proof": {"commit": "synthetic", "checks": ["synthetic"]},
+                "live_proof": {"checks": ["synthetic"]},
+            },
             expected_run_id=reviewed.current_run_id, claimer="reviewer:test",
         )
         assert kb.get_task(conn, task_id).status == "review_approved"
@@ -136,7 +139,11 @@ def test_review_submit_verdict_and_completion_keep_one_card_identity(kanban_home
             conn,
             task_id,
             summary="review proof recorded on original card",
-            metadata={"review_status": "approved", "tests_run": ["synthetic"]},
+            metadata={
+                "review_status": "approved",
+                "tests_run": ["synthetic"],
+                "merge_proof": {"commit": "synthetic", "checks": ["synthetic"]},
+            },
         )
         final = kb.get_task(conn, task_id)
         tasks = kb.list_tasks(conn, include_archived=True)
