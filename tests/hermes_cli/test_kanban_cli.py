@@ -73,6 +73,18 @@ def test_parse_branch_flag_rejects_empty_and_option_like():
         kc._parse_branch_flag("bad branch")
 
 
+def test_claim_parser_uses_two_hour_default_and_preserves_explicit_ttl():
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+
+    default_args = parser.parse_args(["kanban", "claim", "t_abc"])
+    explicit_args = parser.parse_args(["kanban", "claim", "t_abc", "--ttl", "17"])
+
+    assert default_args.ttl == 2 * 60 * 60
+    assert explicit_args.ttl == 17
+
+
 # ---------------------------------------------------------------------------
 # run_slash smoke tests (end-to-end via the same entry both CLI and gateway use)
 # ---------------------------------------------------------------------------

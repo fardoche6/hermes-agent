@@ -387,6 +387,36 @@ def test_claim_uses_env_default_ttl(kanban_home, monkeypatch):
     assert expires > int(time.time()) + 3000
 
 
+def test_claim_uses_two_hour_builtin_default_ttl(kanban_home, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_CLAIM_TTL_SECONDS", raising=False)
+    before = int(time.time())
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        claimed = kb.claim_task(conn, t, claimer="host:1")
+        assert claimed is not None
+        task = kb.get_task(conn, t)
+        assert task is not None
+        expires = task.claim_expires
+    after = int(time.time())
+    assert expires is not None
+    assert before + 2 * 60 * 60 <= expires <= after + 2 * 60 * 60
+
+
+def test_claim_explicit_ttl_overrides_builtin_default(kanban_home, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_CLAIM_TTL_SECONDS", raising=False)
+    before = int(time.time())
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        claimed = kb.claim_task(conn, t, ttl_seconds=17, claimer="host:1")
+        assert claimed is not None
+        task = kb.get_task(conn, t)
+        assert task is not None
+        expires = task.claim_expires
+    after = int(time.time())
+    assert expires is not None
+    assert before + 17 <= expires <= after + 17
+
+
 def test_claim_fails_on_non_ready(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x")
