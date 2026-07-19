@@ -151,6 +151,25 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
+def _require_review_identity(task_id: str) -> tuple[Optional[int], Optional[str], Optional[str]]:
+    """Require exact dispatcher run and claim tokens for review transitions."""
+    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+        return None, None, tool_error("review tools require HERMES_KANBAN_TASK for the active task")
+    raw_run = os.environ.get("HERMES_KANBAN_RUN_ID", "").strip()
+    claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK", "").strip()
+    if not raw_run or not claim_lock:
+        return None, None, tool_error(
+            "review tools require non-empty HERMES_KANBAN_RUN_ID and HERMES_KANBAN_CLAIM_LOCK"
+        )
+    try:
+        run_id = int(raw_run)
+    except ValueError:
+        return None, None, tool_error("HERMES_KANBAN_RUN_ID must be an exact integer")
+    if run_id <= 0:
+        return None, None, tool_error("HERMES_KANBAN_RUN_ID must be positive")
+    return run_id, claim_lock, None
+
+
 def _stamp_worker_session_metadata(
     task_id: str, metadata: Optional[dict]
 ) -> Optional[dict]:
@@ -671,7 +690,14 @@ def _handle_complete(args: dict, **kw) -> str:
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
-                    expected_run_id=_worker_run_id(tid),
+                    expected_run_id=(
+                        int(args["run_id"]) if args.get("run_id") is not None
+                        else _worker_run_id(tid)
+                    ),
+                    claimer=(
+                        str(args["claim_lock"]) if args.get("claim_lock")
+                        else os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+                    ),
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -713,6 +739,69 @@ def _handle_complete(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_complete failed")
         return tool_error(f"kanban_complete: {e}")
+
+
+def _handle_submit_review(args: dict, **kw) -> str:
+    """Move the implementation run to same-card review."""
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    run_id, claim_lock, identity_err = _require_review_identity(tid)
+    if identity_err:
+        return identity_err
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            ok = kb.submit_review(
+                conn, tid, summary=args.get("summary"), metadata=args.get("metadata"),
+                expected_run_id=run_id, claimer=claim_lock,
+            )
+            if not ok:
+                return tool_error(f"could not submit {tid} for review (not the active implementation run)")
+            return _ok(task_id=tid, status="review")
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.exception("kanban_submit_review failed")
+        return tool_error(f"kanban_submit_review: {e}")
+
+
+def _handle_review_verdict(args: dict, **kw) -> str:
+    """Record an approved/changes-requested verdict on the same card."""
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    run_id, claim_lock, identity_err = _require_review_identity(tid)
+    if identity_err:
+        return identity_err
+    verdict = args.get("verdict")
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            ok = kb.review_verdict(
+                conn, tid, verdict=verdict, summary=args.get("summary"),
+                metadata=args.get("metadata"), expected_run_id=run_id,
+                claimer=claim_lock,
+            )
+            if not ok:
+                return tool_error(f"could not record verdict for {tid} (not an active review run)")
+            final_task = kb.get_task(conn, tid)
+            return _ok(task_id=tid, status="review_approved" if verdict == "approved" else "ready", verdict=verdict,
+                       finalization_run_id=(final_task.current_run_id if final_task and verdict == "approved" else None),
+                       finalization_claim_lock=(final_task.claim_lock if final_task and verdict == "approved" else None))
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_review_verdict: {e}")
+    except Exception as e:
+        logger.exception("kanban_review_verdict failed")
+        return tool_error(f"kanban_review_verdict: {e}")
 
 
 def _handle_block(args: dict, **kw) -> str:
@@ -1621,9 +1710,42 @@ KANBAN_COMPLETE_SCHEMA = {
                     "task in-flight so you can fix the path and retry."
                 ),
             },
+            "run_id": {"type": "integer", "description": "Dedicated finalization run id."},
+            "claim_lock": {"type": "string", "description": "Exact dedicated finalization claim lock."},
             "board": _board_schema_prop(),
         },
         "required": [],
+    },
+}
+
+KANBAN_SUBMIT_REVIEW_SCHEMA = {
+    "name": "kanban_submit_review",
+    "description": "Submit this same card for independent review; never create a reviewer child card.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "summary": {"type": "string", "description": "Implementation handoff for the reviewer."},
+            "metadata": {"type": "object", "description": "Changed files, checks, limitations, and proof."},
+            "board": _board_schema_prop(),
+        },
+        "required": ["summary"],
+    },
+}
+
+KANBAN_REVIEW_VERDICT_SCHEMA = {
+    "name": "kanban_review_verdict",
+    "description": "Record an approved or changes-requested verdict on this same card; approval is not completion.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+            "verdict": {"type": "string", "enum": ["approved", "request_changes"]},
+            "summary": {"type": "string", "description": "Review findings."},
+            "metadata": {"type": "object", "description": "Review proof and checks."},
+            "board": _board_schema_prop(),
+        },
+        "required": ["verdict", "summary"],
     },
 }
 
@@ -2072,6 +2194,24 @@ registry.register(
     handler=_handle_complete,
     check_fn=_check_kanban_mode,
     emoji="✔",
+)
+
+registry.register(
+    name="kanban_submit_review",
+    toolset="kanban",
+    schema=KANBAN_SUBMIT_REVIEW_SCHEMA,
+    handler=_handle_submit_review,
+    check_fn=_check_kanban_mode,
+    emoji="🔎",
+)
+
+registry.register(
+    name="kanban_review_verdict",
+    toolset="kanban",
+    schema=KANBAN_REVIEW_VERDICT_SCHEMA,
+    handler=_handle_review_verdict,
+    check_fn=_check_kanban_mode,
+    emoji="✅",
 )
 
 registry.register(

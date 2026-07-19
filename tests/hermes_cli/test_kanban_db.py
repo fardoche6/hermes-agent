@@ -3946,7 +3946,10 @@ def test_dispatch_review_spawns_with_correct_skills(
         res = kb.dispatch_once(conn, spawn_fn=capture_spawn)
     assert len(res.spawned) == 1
     assert len(spawned_tasks) == 1
-    assert spawned_tasks[0].skills == ["sdlc-review"]
+    # Fresh reviewer processes must not receive a hard-coded skill that may
+    # be absent from the selected profile; configured skills are resolved by
+    # the profile itself.
+    assert spawned_tasks[0].skills == []
 
 
 def test_dispatch_review_skips_unassigned(kanban_home):
