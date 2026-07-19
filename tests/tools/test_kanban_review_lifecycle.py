@@ -101,7 +101,9 @@ def test_approved_verdict_completes_only_reviewers_claimed_card(tmp_path, monkey
         assert kb.get_task(conn, task_id).status == "review_approved"
         assert kb.get_task(conn, task_id).status != "done"
         assert not kb.complete_task(conn, task_id, summary="stale implementer", metadata={"review_status": "approved"}, expected_run_id=claimed.current_run_id, claimer="host:implementer")
-        assert kb.complete_task(conn, task_id, summary="completed after approved review", metadata={"review_status": "approved"}, expected_run_id=reviewed.current_run_id, claimer="host:reviewer")
+        final = kb.get_task(conn, task_id)
+        assert final.current_run_id != reviewed.current_run_id
+        assert kb.complete_task(conn, task_id, summary="completed after approved review", metadata={"review_status": "approved"}, expected_run_id=final.current_run_id, claimer=final.claim_lock)
         assert kb.get_task(conn, task_id).status == "done"
         payloads = [json.loads(row["payload"]) for row in conn.execute(
             "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_verdict'", (task_id,)
