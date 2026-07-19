@@ -1177,6 +1177,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0
+    , review_required    INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1971,6 +1972,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "session_id", "session_id TEXT"
         )
 
+    if "review_required" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "review_required", "review_required INTEGER NOT NULL DEFAULT 0"
+        )
+
     if "block_kind" not in cols:
         # Typed block reason (VALID_BLOCK_KINDS) or NULL for legacy/un-typed
         # blocks. Existing blocked rows get NULL, which is treated as a
@@ -2408,6 +2414,7 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    review_required: Optional[bool] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2444,6 +2451,8 @@ def create_task(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
             f"got {workspace_kind!r}"
         )
+    if review_required is None:
+        review_required = workspace_kind == "worktree"
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
@@ -2636,8 +2645,9 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        review_required
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2660,6 +2670,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        1 if review_required else 0,
                     ),
                 )
                 for pid in parents:
@@ -3799,7 +3810,7 @@ def review_verdict(
     lock = claimer
     if verdict == "approved":
         proof = metadata if isinstance(metadata, dict) else {}
-        if not _valid_review_proof(proof):
+        if not _valid_review_proof(proof, conn=conn, task_id=task_id):
             return False
     with write_txn(conn):
         row = conn.execute(
@@ -3921,7 +3932,7 @@ def release_stale_claims(
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
         "FROM tasks "
-        "WHERE status = 'running' AND claim_expires IS NOT NULL "
+        "WHERE status IN ('running', 'review_approved') AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?",
         (now,),
     ).fetchall()
@@ -3947,7 +3958,7 @@ def release_stale_claims(
             with write_txn(conn):
                 cur = conn.execute(
                     "UPDATE tasks SET claim_expires = ? "
-                    "WHERE id = ? AND status = 'running' "
+                    "WHERE id = ? AND status IN ('running', 'review_approved') "
                     "  AND claim_lock IS ? "
                     "  AND claim_expires IS NOT NULL "
                     "  AND claim_expires < ?",
@@ -4035,14 +4046,14 @@ def reclaim_task(
     ).fetchone()
     if not row:
         return False
-    if row["status"] != "running" and row["claim_lock"] is None:
+    if row["status"] not in {"running", "review_approved"} and row["claim_lock"] is None:
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
-    if row["status"] != "running":
+    if row["status"] not in {"running", "review_approved"}:
         return False
     error = (
         f"manual_reclaim: {reason}" if reason
@@ -4225,7 +4236,55 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
-def _valid_review_proof(metadata: object) -> bool:
+def _remote_merge_proof_is_real(
+    conn: sqlite3.Connection, task_id: str, commit: str, merge: dict,
+) -> bool:
+    """Verify merge ancestry against the configured remote, not local refs."""
+    task = conn.execute(
+        "SELECT workspace_path FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    repo = str(task["workspace_path"] or "").strip() if task else ""
+    if not repo or not Path(repo).is_dir():
+        return False
+    remote = str(merge.get("remote") or "origin").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_./:@-]+", remote):
+        return False
+    try:
+        remote_url = subprocess.run(
+            ["git", "-C", repo, "remote", "get-url", remote],
+            capture_output=True, text=True, timeout=10, check=True,
+        ).stdout.strip()
+        if not remote_url:
+            return False
+        symref = subprocess.run(
+            ["git", "-C", repo, "ls-remote", "--symref", remote, "HEAD"],
+            capture_output=True, text=True, timeout=20, check=True,
+        ).stdout
+        default_branch = merge.get("default_branch")
+        if not isinstance(default_branch, str) or not default_branch.strip():
+            match = re.search(r"ref: refs/heads/([^\s]+)\s+HEAD", symref)
+            default_branch = match.group(1) if match else "main"
+        if not re.fullmatch(r"[A-Za-z0-9._/-]+", default_branch):
+            return False
+        advertised = subprocess.run(
+            ["git", "-C", repo, "ls-remote", remote, f"refs/heads/{default_branch}"],
+            capture_output=True, text=True, timeout=20, check=True,
+        ).stdout.strip().split()
+        if not advertised:
+            return False
+        remote_sha = advertised[0]
+        ancestry = subprocess.run(
+            ["git", "-C", repo, "merge-base", "--is-ancestor", commit, remote_sha],
+            capture_output=True, text=True, timeout=10,
+        )
+        return ancestry.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _valid_review_proof(
+    metadata: object, *, conn: Optional[sqlite3.Connection] = None, task_id: Optional[str] = None,
+) -> bool:
     """Validate the concrete proof contract used by approved reviews."""
     if not isinstance(metadata, dict):
         return False
@@ -4239,6 +4298,7 @@ def _valid_review_proof(metadata: object) -> bool:
     live_checks = live.get("checks")
     if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", commit.strip()):
         return False
+    commit = commit.strip()
     if not isinstance(state, str) or state.strip().lower() != "merged":
         return False
     if not isinstance(merge_checks, dict) or not merge_checks:
@@ -4269,7 +4329,9 @@ def _valid_review_proof(metadata: object) -> bool:
         "verified", "readback_verified",
     }:
         return False
-    return True
+    return conn is not None and task_id is not None and _remote_merge_proof_is_real(
+        conn, task_id, commit, merge,
+    )
 
 
 def _review_approval_proven(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -4283,7 +4345,9 @@ def _review_approval_proven(conn: sqlite3.Connection, task_id: str) -> bool:
     try:
         payload = json.loads(event["payload"])
         metadata = payload.get("metadata") or {}
-        return payload.get("verdict") == "approved" and _valid_review_proof(metadata)
+        return payload.get("verdict") == "approved" and _valid_review_proof(
+            metadata, conn=conn, task_id=task_id,
+        )
     except (TypeError, json.JSONDecodeError):
         return False
 
@@ -4360,8 +4424,10 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     current = conn.execute(
-        "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, current_run_id, claim_lock, review_required FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
+    if current and current["review_required"] and current["status"] != "review_approved":
+        return False
     if current and current["status"] == "review_approved" and not _review_approval_proven(conn, task_id):
         return False
     if current and current["status"] == "review_approved":
@@ -6658,7 +6724,7 @@ def enforce_max_runtime(
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
+        "WHERE t.status IN ('running', 'review_approved') AND t.max_runtime_seconds IS NOT NULL "
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
         "  AND t.worker_pid IS NOT NULL"
     ).fetchall()
@@ -6779,7 +6845,7 @@ def detect_stale_running(
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running'"
+        "WHERE t.status IN ('running', 'review_approved')"
     ).fetchall()
 
     for row in rows:
@@ -6966,7 +7032,7 @@ def detect_crashed_workers(
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
+            "WHERE status IN ('running', 'review_approved') AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
@@ -7053,7 +7119,7 @@ def detect_crashed_workers(
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND status = 'running' "
+                "WHERE id = ? AND status IN ('running', 'review_approved') "
                 "  AND worker_pid = ? AND claim_lock IS ?",
                 (recovery_status, row["id"], pid, row["claim_lock"]),
             )
@@ -7284,7 +7350,7 @@ def _record_task_failure(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('running', 'ready', 'review')",
+                    "WHERE id = ? AND status IN ('running', 'ready', 'review', 'review_approved')",
                     (failures, error[:500], task_id),
                 )
             else:
@@ -7294,7 +7360,7 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('ready', 'running', 'review')",
+                    "WHERE id = ? AND status IN ('ready', 'running', 'review', 'review_approved')",
                     (failures, error[:500], task_id),
                 )
             run_id = None
@@ -7338,7 +7404,7 @@ def _record_task_failure(
                     "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status = 'running'",
+                    "WHERE id = ? AND status IN ('running', 'review_approved')",
                     (recovery_status, failures, error[:500], task_id),
                 )
             else:

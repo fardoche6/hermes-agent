@@ -69,6 +69,14 @@ the reviewer. The reviewer calls `kanban_review_verdict` on that same card:
 3. Approval is deliberately not completion. A separate `kanban_complete` call
    is required from `review_approved`, after the required proof is present.
 
+For coding cards, admission marks `worktree` tasks as review-required, so a
+direct `kanban_complete` from an implementation run fails closed. Merge proof
+is verified server-side against the configured repository's advertised remote
+default branch with `git ls-remote`; local `refs/remotes/*` and caller-supplied
+readback strings are not authoritative. If a reviewer dies after approval but
+before finalization, the same-card recovery paths revoke the approval, close
+the run, and return the card to `review`.
+
 The state machine and both verdict paths are covered by the synthetic tests.
 `blocked` remains a typed blocker and is never used as a review substitute.
 
@@ -101,7 +109,8 @@ hash-identical copies. If that cannot be proven, stop before claiming done.
 
 ## Synthetic proof
 
-`tests/hermes_cli/test_kanban_future_card_contract.py` exercises this contract
+`tests/hermes_cli/test_kanban_future_card_contract.py` and
+`tests/tools/test_kanban_review_regressions.py` exercise this contract
 against an isolated temporary Kanban database. It proves idempotent admission,
 ready-versus-triage selection, explicit workspace readback, same-card recovery,
 same-card review submission/claim/verdict/completion, and changes-requested

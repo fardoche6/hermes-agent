@@ -8,10 +8,35 @@ a live board.
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 
 import pytest
 
 from hermes_cli import kanban_db as kb
+
+
+def _remote_workspace(tmp_path):
+    repo = tmp_path / "repo"
+    bare = tmp_path / "remote.git"
+    repo.mkdir()
+    subprocess.run(["git", "init", "--initial-branch=main", str(repo)], check=True, capture_output=True)
+    subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+    subprocess.run(["git", "--git-dir", str(bare), "symbolic-ref", "HEAD", "refs/heads/main"], check=True)
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(bare)], check=True)
+    (repo / "proof.txt").write_text("proof\n")
+    for command in (
+        ["git", "-C", str(repo), "config", "user.email", "test@example.com"],
+        ["git", "-C", str(repo), "config", "user.name", "Test"],
+        ["git", "-C", str(repo), "add", "proof.txt"],
+        ["git", "-C", str(repo), "commit", "-m", "proof"],
+        ["git", "-C", str(repo), "push", "-u", "origin", "main"],
+    ):
+        subprocess.run(command, check=True, capture_output=True)
+    commit = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    return repo, commit
 
 
 @pytest.fixture
@@ -110,8 +135,12 @@ def test_recovery_returns_to_same_card_without_duplicate(kanban_home):
 def test_review_submit_verdict_and_completion_keep_one_card_identity(kanban_home):
     """Implementation handoff, reviewer claim, verdict, and completion stay
     on one task id, with approval distinct from completion."""
+    repo, commit = _remote_workspace(kanban_home.parent)
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="same-card review", assignee="alice")
+        task_id = kb.create_task(
+            conn, title="same-card review", assignee="alice",
+            workspace_kind="worktree", workspace_path=str(repo),
+        )
         implementation = kb.claim_task(conn, task_id)
         assert implementation is not None
         assert kb.submit_review(
@@ -128,7 +157,7 @@ def test_review_submit_verdict_and_completion_keep_one_card_identity(kanban_home
         assert kb.review_verdict(
             conn, task_id, verdict="approved", summary="review passed",
             metadata={
-                "merge_proof": {"commit": "0123456789abcdef0123456789abcdef01234567", "state": "merged", "checks": {"pytest": {"status": "passed"}}, "review_threads": {"resolved": 1, "total": 1}, "readback": {"status": "verified"}},
+                "merge_proof": {"commit": commit, "state": "merged", "checks": {"pytest": {"status": "passed"}}, "review_threads": {"resolved": 1, "total": 1}, "readback": {"status": "verified"}},
                 "live_proof": {"checks": {"health": {"status": "healthy"}}},
             },
             expected_run_id=reviewed.current_run_id, claimer="reviewer:test",

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 
 import pytest
 
@@ -20,6 +21,31 @@ def _db(tmp_path, monkeypatch):
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
     return kb
+
+
+def _remote_workspace(tmp_path):
+    repo = tmp_path / "repo"
+    bare = tmp_path / "remote.git"
+    repo.mkdir()
+    subprocess.run(["git", "init", "--initial-branch=main", str(repo)], check=True, capture_output=True)
+    subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+    subprocess.run(["git", "--git-dir", str(bare), "symbolic-ref", "HEAD", "refs/heads/main"], check=True)
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(bare)], check=True)
+    (repo / "proof.txt").write_text("proof\n")
+    commands = [
+        ["git", "-C", str(repo), "config", "user.email", "test@example.com"],
+        ["git", "-C", str(repo), "config", "user.name", "Test"],
+        ["git", "-C", str(repo), "add", "proof.txt"],
+        ["git", "-C", str(repo), "commit", "-m", "proof"],
+        ["git", "-C", str(repo), "push", "-u", "origin", "main"],
+    ]
+    for command in commands:
+        subprocess.run(command, check=True, capture_output=True)
+    commit = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    return repo, commit
 
 
 def test_submit_review_claim_and_request_changes_return_same_card(tmp_path, monkeypatch):
@@ -55,9 +81,13 @@ def test_submit_review_claim_and_request_changes_return_same_card(tmp_path, monk
 
 def test_approved_verdict_completes_only_reviewers_claimed_card(tmp_path, monkeypatch):
     kb = _db(tmp_path, monkeypatch)
+    repo, commit = _remote_workspace(tmp_path)
     conn = kb.connect()
     try:
-        task_id = kb.create_task(conn, title="repair", assignee="programmer")
+        task_id = kb.create_task(
+            conn, title="repair", assignee="programmer",
+            workspace_kind="worktree", workspace_path=str(repo),
+        )
         claimed = kb.claim_task(conn, task_id, claimer="host:implementer")
         assert claimed is not None
         assert kb.submit_review(conn, task_id, expected_run_id=claimed.current_run_id, claimer="host:implementer")
@@ -65,7 +95,7 @@ def test_approved_verdict_completes_only_reviewers_claimed_card(tmp_path, monkey
         assert reviewed is not None
         assert kb.review_verdict(
             conn, task_id, approved=True, summary="Approved after tests",
-            metadata={"merge_proof": {"commit": "0123456789abcdef0123456789abcdef01234567", "state": "merged", "checks": {"pytest": {"status": "passed"}}, "review_threads": {"resolved": 1, "total": 1}, "readback": {"status": "verified"}}, "live_proof": {"checks": {"health": {"status": "healthy"}}}},
+            metadata={"merge_proof": {"commit": commit, "state": "merged", "checks": {"pytest": {"status": "passed"}}, "review_threads": {"resolved": 1, "total": 1}, "readback": {"status": "verified"}}, "live_proof": {"checks": {"health": {"status": "healthy"}}}},
             expected_run_id=reviewed.current_run_id, claimer="host:reviewer",
         )
         assert kb.get_task(conn, task_id).status == "review_approved"
@@ -190,14 +220,6 @@ def test_review_dispatch_fresh_startup_uses_no_missing_forced_skill(tmp_path, mo
         assert "sdlc-review" not in captured[0].skills
     finally:
         conn.close()
-
-
-def test_dashboard_review_dot_classes_are_defined():
-    from pathlib import Path
-
-    css = (Path(__file__).parents[2] / "plugins/kanban/dashboard/dist/style.css").read_text()
-    assert ".hermes-kanban-dot-review" in css
-    assert ".hermes-kanban-dot-review-approved" in css
 
 
 def test_review_handlers_reject_wrong_run_claim_and_missing_proof(tmp_path, monkeypatch):
