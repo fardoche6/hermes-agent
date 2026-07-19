@@ -3301,6 +3301,28 @@ def _end_run(
     return run_id
 
 
+def _end_run_id(
+    conn: sqlite3.Connection,
+    run_id: int,
+    *,
+    outcome: str,
+    summary: Optional[str] = None,
+    error: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    status: Optional[str] = None,
+) -> bool:
+    """Close one explicitly identified active run inside the caller txn."""
+    cur = conn.execute(
+        """UPDATE task_runs SET status = ?, outcome = ?, summary = ?, error = ?,
+           metadata = ?, ended_at = ?, claim_lock = NULL, claim_expires = NULL,
+           worker_pid = NULL WHERE id = ? AND ended_at IS NULL""",
+        (status or outcome, outcome, summary, error,
+         json.dumps(metadata, ensure_ascii=False) if metadata else None,
+         int(time.time()), int(run_id)),
+    )
+    return cur.rowcount == 1
+
+
 def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
     row = conn.execute(
         "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
@@ -3641,6 +3663,38 @@ def _review_recovery_status(conn: sqlite3.Connection, task_id: str) -> str:
         return "ready"
 
 
+def _recover_finalization_claim(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    outcome: str,
+    payload: Optional[dict] = None,
+) -> bool:
+    """Close a failed finalization attempt without revoking approval."""
+    row = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not row or row["status"] != "review_approved" or row["current_run_id"] is None:
+        return False
+    run_id = int(row["current_run_id"])
+    source = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind = 'finalization_claimed' LIMIT 1", (task_id, run_id)
+    ).fetchone()
+    if not source or not _end_run_id(conn, run_id, outcome=outcome, status=outcome, metadata=payload):
+        return False
+    cur = conn.execute(
+        "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+        "current_run_id = NULL WHERE id = ? AND status = 'review_approved' AND current_run_id = ?",
+        (task_id, run_id),
+    )
+    if cur.rowcount != 1:
+        return False
+    _append_event(conn, task_id, "finalization_recovered",
+                  {"outcome": outcome, **(payload or {})}, run_id=run_id)
+    return True
+
+
 def claim_review_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3714,6 +3768,58 @@ def claim_review_task(
              "source_status": "review"},
             run_id=run_id,
         )
+        return get_task(conn, task_id)
+
+
+def claim_finalization_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    ttl_seconds: Optional[int] = None,
+    claimer: Optional[str] = None,
+) -> Optional[Task]:
+    """Claim an approved card for finalization, never for re-review."""
+    now = int(time.time())
+    lock = claimer or _claimer_id()
+    expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row or row["status"] != "review_approved" or row["current_run_id"] is not None or row["claim_lock"] is not None:
+            return None
+        if not _review_approval_proven(conn, task_id):
+            return None
+        approval = conn.execute(
+            "SELECT run_id FROM task_events WHERE task_id = ? AND kind = 'review_verdict' "
+            "ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        approval_run = conn.execute(
+            "SELECT profile FROM task_runs WHERE id = ?", (approval["run_id"],)
+        ).fetchone() if approval and approval["run_id"] else None
+        trow = conn.execute(
+            "SELECT assignee, max_runtime_seconds, current_step_key FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        conn.execute(
+            "UPDATE tasks SET claim_lock = ?, claim_expires = ? WHERE id = ? "
+            "AND status = 'review_approved' AND current_run_id IS NULL AND claim_lock IS NULL",
+            (lock, expires, task_id),
+        )
+        run_cur = conn.execute(
+            "INSERT INTO task_runs (task_id, profile, step_key, status, claim_lock, claim_expires, max_runtime_seconds, started_at) "
+            "VALUES (?, ?, ?, 'running', ?, ?, ?, ?)",
+            (task_id, approval_run["profile"] if approval_run else (trow["assignee"] if trow else None),
+             trow["current_step_key"] if trow else None, lock, expires,
+             trow["max_runtime_seconds"] if trow else None, now),
+        )
+        run_id = int(run_cur.lastrowid)
+        conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (run_id, task_id))
+        _append_event(conn, task_id, "finalization_claimed",
+                      {"run_id": run_id, "claim_lock": lock,
+                       "source_status": "review_approved",
+                       "approval_run_id": approval["run_id"] if approval else None}, run_id=run_id)
         return get_task(conn, task_id)
 
 
@@ -3877,16 +3983,22 @@ def review_verdict(
                           {"run_id": final_run, "claim_lock": lock,
                            "source_status": "review_approved"}, run_id=final_run)
         else:
+            # Close the reviewer run while its task pointer and identity are
+            # still addressable. The task mutation follows in the same txn;
+            # any injected failure rolls both changes back together.
+            if not _end_run_id(
+                conn, run_id, outcome="review_request_changes",
+                summary=summary, metadata=metadata,
+                status="review_request_changes",
+            ):
+                return False
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
                 "worker_pid = NULL, current_run_id = NULL WHERE id = ? AND status = 'running' "
                 "AND current_run_id = ? AND claim_lock = ?",
                 (target_status, task_id, run_id, lock),
             )
-            closed_run = _end_run(
-                conn, task_id, outcome=f"review_{verdict}", summary=summary,
-                metadata=metadata, status=f"review_{verdict}",
-            )
+            closed_run = run_id
         if cur.rowcount != 1:
             return False
         _append_event(
@@ -3963,7 +4075,7 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
+        "SELECT id, status, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
         "FROM tasks "
         "WHERE status IN ('running', 'review_approved') AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?",
@@ -4043,6 +4155,11 @@ def release_stale_claims(
             "now": now, "host_local": host_local,
             "heartbeat_stale": bool(heartbeat_stale), **termination,
         }
+        if row["status"] == "review_approved":
+            with write_txn(conn):
+                if _recover_finalization_claim(conn, row["id"], outcome="reclaimed", payload=payload):
+                    reclaimed += 1
+            continue
         if _current_run_id(conn, row["id"]) is not None:
             _record_task_failure(
                 conn, row["id"], f"stale_lock={row['claim_lock']}",
@@ -4093,6 +4210,9 @@ def reclaim_task(
         else f"manual_reclaim lock={prev_lock}"
     )
     payload = {"manual": True, "reason": reason, "prev_lock": prev_lock, **termination}
+    if row["status"] == "review_approved":
+        with write_txn(conn):
+            return _recover_finalization_claim(conn, task_id, outcome="reclaimed", payload=payload)
     had_active_run = _current_run_id(conn, task_id) is not None
     recovery_status = _review_recovery_status(conn, task_id) if had_active_run else "ready"
     _record_task_failure(
@@ -6819,6 +6939,12 @@ def enforce_max_runtime(
             "sigkill": killed,
         }
         error_text = f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s"
+        task_state = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+        if task_state and task_state["status"] == "review_approved":
+            with write_txn(conn):
+                if _recover_finalization_claim(conn, tid, outcome="timed_out", payload=payload):
+                    timed_out.append(tid)
+            continue
         had_active_run = _current_run_id(conn, tid) is not None
         auto = _record_task_failure(
             conn, tid, error_text, outcome="timed_out",
@@ -6937,6 +7063,11 @@ def detect_stale_running(
             f"no heartbeat for {int(hb_age)}s " if hb_age is not None
             else "no heartbeat ever "
         ) + f"after {int(elapsed)}s running"
+        if conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()["status"] == "review_approved":
+            with write_txn(conn):
+                if _recover_finalization_claim(conn, tid, outcome="stale", payload=payload):
+                    reclaimed.append(tid)
+            continue
         had_active_run = _current_run_id(conn, tid) is not None
         # Staleness is dispatcher-side liveness recovery, not a worker
         # failure. Release the claim and close the attempt without touching
@@ -7172,6 +7303,10 @@ def detect_crashed_workers(
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
+            if conn.execute("SELECT status FROM tasks WHERE id = ?", (row["id"],)).fetchone()["status"] == "review_approved":
+                if _recover_finalization_claim(conn, row["id"], outcome="crashed", payload=event_payload):
+                    crashed.append(row["id"])
+                continue
             recovery_status = _review_recovery_status(conn, row["id"])
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -8225,6 +8360,56 @@ def _dispatch_once_locked(
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
+    # Approved cards have a durable proof record and must only enter the
+    # dedicated finalization lane. Recovery never changes them to ready/review.
+    finalization_rows = conn.execute(
+        "SELECT id FROM tasks WHERE status = 'review_approved' AND claim_lock IS NULL "
+        "AND current_run_id IS NULL ORDER BY priority DESC, created_at ASC"
+    ).fetchall()
+    for row in finalization_rows:
+        if max_spawn is not None and running_count + spawned >= max_spawn:
+            break
+        if dry_run:
+            result.spawned.append((row["id"], "finalization", ""))
+            continue
+        claimed = claim_finalization_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        if claimed is None:
+            continue
+        final_run = conn.execute(
+            "SELECT profile FROM task_runs WHERE id = ?", (claimed.current_run_id,)
+        ).fetchone()
+        if final_run and final_run["profile"]:
+            # Preserve task ownership in the DB; only the spawned process uses
+            # the reviewer profile bound to the durable approval proof.
+            claimed.assignee = final_run["profile"]
+        try:
+            resolved_branch_name = None
+            if claimed.workspace_kind == "worktree":
+                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+            else:
+                workspace = resolve_workspace(claimed, board=board)
+            set_workspace_path(conn, claimed.id, str(workspace))
+            if claimed.workspace_kind == "worktree":
+                set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+        except Exception as exc:
+            with write_txn(conn):
+                _recover_finalization_claim(conn, claimed.id, outcome="spawn_failed", payload={"error": str(exc)})
+            continue
+        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+        try:
+            import inspect
+            sig = inspect.signature(_spawn)
+            if "board" in sig.parameters:
+                pid = _spawn(claimed, str(workspace), board=board)
+            else:
+                pid = _spawn(claimed, str(workspace))
+            if pid:
+                _set_worker_pid(conn, claimed.id, int(pid))
+            result.spawned.append((claimed.id, "finalization", str(workspace)))
+            spawned += 1
+        except Exception as exc:
+            with write_txn(conn):
+                _recover_finalization_claim(conn, claimed.id, outcome="spawn_failed", payload={"error": str(exc)})
     return result
 
 

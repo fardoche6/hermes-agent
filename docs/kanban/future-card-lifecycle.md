@@ -63,19 +63,28 @@ implementation calls `kanban_submit_review` to close its run and enter
 `review`; the dispatcher uses `claim_review_task()` to claim that same card for
 the reviewer. The reviewer calls `kanban_review_verdict` on that same card:
 
-1. `request_changes` closes the review run and returns the card to `ready`.
-2. `approved` records concrete proof and enters `review_approved` while preserving
-   the reviewer's exact run+claim as the finalization authorization.
-3. Approval is deliberately not completion. A separate `kanban_complete` call
-   is required from `review_approved`, after the required proof is present.
+1. `request_changes` atomically closes the active reviewer run with
+   `review_request_changes`, clears its claim/current-run pointer, and returns
+   the original card to `ready` for the programmer.
+2. `approved` atomically closes the reviewer run, records concrete proof, and
+   enters `review_approved` with a distinct dedicated finalization run/claim.
+   The reviewer run credentials are closed and can never finalize the card.
+3. Approval is deliberately not completion. The finalization worker must call
+   `kanban_complete` using the dedicated finalization run id and claim lock.
+4. If finalization is stale, times out, crashes, or is manually reclaimed, the
+   finalization run is closed and only its claim/current-run pointer is cleared.
+   The durable approval remains; the dispatcher reclaims the card through the
+   explicit finalization path (`claim_finalization_task`) rather than routing it
+   to `ready` or starting a second review.
 
 For coding cards, admission marks `worktree` tasks as review-required, so a
 direct `kanban_complete` from an implementation run fails closed. Merge proof
 is verified server-side against the configured repository's advertised remote
 default branch with `git ls-remote`; local `refs/remotes/*` and caller-supplied
-readback strings are not authoritative. If a reviewer dies after approval but
-before finalization, the same-card recovery paths revoke the approval, close
-the run, and return the card to `review`.
+readback strings are not authoritative. If finalization dies after approval,
+recovery closes only the finalization attempt, preserves the approval proof, and
+dispatches a fresh finalization claim; it never starts an unreviewed re-review.
+Stale reviewer-run tokens cannot complete.
 
 The state machine and both verdict paths are covered by the synthetic tests.
 `blocked` remains a typed blocker and is never used as a review substitute.
