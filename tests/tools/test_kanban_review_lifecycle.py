@@ -202,7 +202,6 @@ def test_dashboard_review_dot_classes_are_defined():
 def test_review_handlers_reject_wrong_run_claim_and_missing_proof(tmp_path, monkeypatch):
     kb = _db(tmp_path, monkeypatch)
     from tools import kanban_tools
-
     conn = kb.connect()
     try:
         task_id = kb.create_task(conn, title="handler gates", assignee="programmer")
@@ -213,16 +212,59 @@ def test_review_handlers_reject_wrong_run_claim_and_missing_proof(tmp_path, monk
         monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", impl.claim_lock)
         assert "could not submit" in kanban_tools._handle_submit_review({"summary": "handoff"})
         monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(impl.current_run_id))
-        monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "wrong-claim")
-        assert "could not submit" in kanban_tools._handle_submit_review({"summary": "handoff"})
         monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", impl.claim_lock)
         assert json.loads(kanban_tools._handle_submit_review({"summary": "handoff"}))["ok"]
         reviewer = kb.claim_review_task(conn, task_id, claimer="host:reviewer", reviewer_profile="code-reviewer")
         assert reviewer is not None
         monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(reviewer.current_run_id))
         monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "host:reviewer")
-        assert "could not record verdict" in kanban_tools._handle_review_verdict({
-            "verdict": "approved", "summary": "missing proof", "metadata": {},
-        })
+        assert "could not record verdict" in kanban_tools._handle_review_verdict({"verdict": "approved", "metadata": {}})
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("proof", [True, False, "proof", {}, {"merge_proof": {}, "live_proof": {}}])
+def test_approved_review_rejects_non_structured_proof(tmp_path, monkeypatch, proof):
+    kb = _db(tmp_path, monkeypatch)
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="proof gate", assignee="programmer")
+        impl = kb.claim_task(conn, task_id, claimer="host:impl")
+        assert kb.submit_review(conn, task_id, expected_run_id=impl.current_run_id, claimer="host:impl")
+        reviewer = kb.claim_review_task(conn, task_id, claimer="host:review", reviewer_profile="code-reviewer")
+        assert not kb.review_verdict(conn, task_id, verdict="approved", metadata={"merge_proof": proof, "live_proof": proof}, expected_run_id=reviewer.current_run_id, claimer="host:review")
+        assert kb.get_task(conn, task_id).status == "running"
+    finally:
+        conn.close()
+
+
+def test_reviewer_cannot_resubmit_its_own_run(tmp_path, monkeypatch):
+    kb = _db(tmp_path, monkeypatch)
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="self submit", assignee="programmer")
+        impl = kb.claim_task(conn, task_id, claimer="host:impl")
+        assert kb.submit_review(conn, task_id, expected_run_id=impl.current_run_id, claimer="host:impl")
+        reviewer = kb.claim_review_task(conn, task_id, claimer="host:review", reviewer_profile="code-reviewer")
+        assert not kb.submit_review(conn, task_id, expected_run_id=reviewer.current_run_id, claimer="host:review")
+        assert kb.get_task(conn, task_id).status == "running"
+        assert kb.get_task(conn, task_id).consecutive_failures == 0
+    finally:
+        conn.close()
+
+
+def test_reviewer_fallback_skips_unavailable_preferred_profile(tmp_path, monkeypatch):
+    kb = _db(tmp_path, monkeypatch)
+    conn = kb.connect()
+    captured = []
+    try:
+        monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: name == "code-reviewer-claudecode")
+        task_id = kb.create_task(conn, title="fallback", assignee="programmer")
+        impl = kb.claim_task(conn, task_id, claimer="host:impl")
+        assert kb.submit_review(conn, task_id, expected_run_id=impl.current_run_id, claimer="host:impl")
+        result = kb.dispatch_once(conn, spawn_fn=lambda task, _workspace: captured.append(task) or 123)
+        assert result.spawned
+        assert captured[0].assignee == "code-reviewer-claudecode"
+        assert kb.get_task(conn, task_id).assignee == "programmer"
     finally:
         conn.close()

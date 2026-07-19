@@ -3589,7 +3589,8 @@ def claim_task(
         )
         _append_event(
             conn, task_id, "claimed",
-            {"lock": lock, "expires": expires, "run_id": run_id},
+            {"lock": lock, "expires": expires, "run_id": run_id,
+             "source_status": "implementation"},
             run_id=run_id,
         )
         claimed = get_task(conn, task_id)
@@ -3708,9 +3709,15 @@ def _reviewer_profile(implementer: Optional[str]) -> str:
     except Exception:
         configured = None
     candidates = [configured, "code-reviewer", "code-reviewer-claudecode"]
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        profile_exists = None
     for candidate in candidates:
         profile = str(candidate or "").strip()
-        if profile and profile != implementer:
+        if profile and profile != implementer and (
+            profile_exists is None or profile_exists(profile)
+        ):
             return profile
     raise ValueError("no independent reviewer profile is configured")
 
@@ -3738,6 +3745,16 @@ def submit_review(
             return False
         run_id = row["current_run_id"]
         if expected_run_id is not None and run_id != int(expected_run_id):
+            return False
+        source = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'claimed' ORDER BY id DESC LIMIT 1", (task_id, run_id)
+        ).fetchone()
+        try:
+            source_payload = json.loads(source["payload"]) if source and source["payload"] else {}
+        except (TypeError, json.JSONDecodeError):
+            source_payload = {}
+        if source_payload.get("source_status") != "implementation":
             return False
         cur = conn.execute(
             "UPDATE tasks SET status = 'review', claim_lock = NULL, claim_expires = NULL, "
@@ -3782,7 +3799,7 @@ def review_verdict(
     lock = claimer
     if verdict == "approved":
         proof = metadata if isinstance(metadata, dict) else {}
-        if not proof.get("merge_proof") or not proof.get("live_proof"):
+        if not _valid_review_proof(proof):
             return False
     with write_txn(conn):
         row = conn.execute(
@@ -3801,10 +3818,10 @@ def review_verdict(
             "AND kind = 'claimed' ORDER BY id DESC LIMIT 1", (task_id, run_id)
         ).fetchone()
         try:
-            payload = json.loads(source["payload"]) if source and source["payload"] else {}
+            source_payload = json.loads(source["payload"]) if source and source["payload"] else {}
         except (TypeError, json.JSONDecodeError):
-            payload = {}
-        if payload.get("source_status") != "review":
+            source_payload = {}
+        if source_payload.get("source_status") != "review":
             return False
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
@@ -3962,43 +3979,20 @@ def release_stale_claims(
                 reason="ttl_expired_worker_alive",
             )
             continue
-        with write_txn(conn):
-            recovery_status = _review_recovery_status(conn, row["id"])
-            cur = conn.execute(
-                "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
-                "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (recovery_status, row["id"], row["claim_lock"], now),
-            )
-            if cur.rowcount != 1:
-                continue
-            run_id = _end_run(
-                conn, row["id"],
-                outcome="reclaimed", status="reclaimed",
-                error=f"stale_lock={row['claim_lock']}",
-                metadata=termination,
-            )
-            payload = {
-                "stale_lock": row["claim_lock"],
-                "worker_pid": (
-                    int(row["worker_pid"])
-                    if row["worker_pid"] is not None else None
-                ),
-                "claim_expires": int(row["claim_expires"]),
-                "last_heartbeat_at": (
-                    int(row["last_heartbeat_at"])
-                    if row["last_heartbeat_at"] is not None else None
-                ),
-                "now": now,
-                "host_local": host_local,
-                "heartbeat_stale": bool(heartbeat_stale),
-            }
-            payload.update(termination)
-            _append_event(
-                conn, row["id"], "reclaimed",
-                payload,
-                run_id=run_id,
+        payload = {
+            "stale_lock": row["claim_lock"],
+            "worker_pid": int(row["worker_pid"]) if row["worker_pid"] is not None else None,
+            "claim_expires": int(row["claim_expires"]),
+            "last_heartbeat_at": int(row["last_heartbeat_at"])
+            if row["last_heartbeat_at"] is not None else None,
+            "now": now, "host_local": host_local,
+            "heartbeat_stale": bool(heartbeat_stale), **termination,
+        }
+        if _current_run_id(conn, row["id"]) is not None:
+            _record_task_failure(
+                conn, row["id"], f"stale_lock={row['claim_lock']}",
+                outcome="reclaimed", release_claim=True, end_run=True,
+                event_payload_extra=payload,
             )
             reclaimed += 1
     return reclaimed
@@ -4035,39 +4029,19 @@ def reclaim_task(
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
-    with write_txn(conn):
-        recovery_status = _review_recovery_status(conn, task_id)
-        cur = conn.execute(
-            "UPDATE tasks SET status = ?, claim_lock = NULL, "
-            "claim_expires = NULL, worker_pid = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
-            "WHERE id = ? AND status IN ('running', 'ready', 'blocked', 'review') "
-            "AND claim_lock IS ?",
-            (recovery_status, task_id, prev_lock),
-        )
-        if cur.rowcount != 1:
-            return False
-        run_id = _end_run(
-            conn, task_id,
-            outcome="reclaimed", status="reclaimed",
-            error=(
-                f"manual_reclaim: {reason}" if reason
-                else f"manual_reclaim lock={prev_lock}"
-            ),
-            metadata=termination,
-        )
-        payload = {
-            "manual": True,
-            "reason": reason,
-            "prev_lock": prev_lock,
-        }
-        payload.update(termination)
-        _append_event(
-            conn, task_id, "reclaimed",
-            payload,
-            run_id=run_id,
-        )
-    return True
+    if row["status"] != "running":
+        return False
+    error = (
+        f"manual_reclaim: {reason}" if reason
+        else f"manual_reclaim lock={prev_lock}"
+    )
+    payload = {"manual": True, "reason": reason, "prev_lock": prev_lock, **termination}
+    had_active_run = _current_run_id(conn, task_id) is not None
+    _record_task_failure(
+        conn, task_id, error, outcome="reclaimed",
+        release_claim=True, end_run=True, event_payload_extra=payload,
+    )
+    return had_active_run
 
 
 def reassign_task(
@@ -4237,6 +4211,29 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _valid_review_proof(metadata: object) -> bool:
+    """Validate the concrete proof contract used by approved reviews."""
+    if not isinstance(metadata, dict):
+        return False
+    merge = metadata.get("merge_proof")
+    live = metadata.get("live_proof")
+    if not isinstance(merge, dict) or not isinstance(live, dict):
+        return False
+    commit = merge.get("commit")
+    merge_checks = merge.get("checks")
+    live_checks = live.get("checks")
+    if not isinstance(commit, str) or not commit.strip():
+        return False
+    if not isinstance(merge_checks, (list, tuple)) or not merge_checks:
+        return False
+    if not isinstance(live_checks, (list, tuple)) or not live_checks:
+        return False
+    return all(
+        isinstance(item, str) and item.strip()
+        for item in list(merge_checks) + list(live_checks)
+    )
+
+
 def _review_approval_proven(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return true only when the approved verdict recorded both proof gates."""
     event = conn.execute(
@@ -4248,9 +4245,7 @@ def _review_approval_proven(conn: sqlite3.Connection, task_id: str) -> bool:
     try:
         payload = json.loads(event["payload"])
         metadata = payload.get("metadata") or {}
-        return payload.get("verdict") == "approved" and bool(
-            metadata.get("merge_proof") and metadata.get("live_proof")
-        )
+        return payload.get("verdict") == "approved" and _valid_review_proof(metadata)
     except (TypeError, json.JSONDecodeError):
         return False
 
@@ -6660,48 +6655,29 @@ def enforce_max_runtime(
                 except (ProcessLookupError, OSError):
                     pass
 
-        with write_txn(conn):
-            recovery_status = _review_recovery_status(conn, tid)
-            cur = conn.execute(
-                "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, "
-                "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (recovery_status, tid, pid, row["claim_lock"]),
-            )
-            if cur.rowcount == 1:
-                payload = {
-                    "pid": pid,
-                    "elapsed_seconds": int(elapsed),
-                    "limit_seconds": int(row["max_runtime_seconds"]),
-                    "sigkill": killed,
-                }
-                run_id = _end_run(
-                    conn, tid,
-                    outcome="timed_out", status="timed_out",
-                    error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
-                    metadata=payload,
-                )
-                _append_event(
-                    conn, tid, "timed_out", payload, run_id=run_id,
-                )
-                timed_out.append(tid)
+        payload = {
+            "pid": pid,
+            "elapsed_seconds": int(elapsed),
+            "limit_seconds": int(row["max_runtime_seconds"]),
+            "sigkill": killed,
+        }
+        error_text = f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s"
+        had_active_run = _current_run_id(conn, tid) is not None
+        auto = _record_task_failure(
+            conn, tid, error_text, outcome="timed_out",
+            failure_limit=failure_limit, release_claim=True, end_run=True,
+            event_payload_extra=payload,
+        )
+        if had_active_run:
+            timed_out.append(tid)
         # Increment the unified failure counter. Outside the write_txn
         # above because ``_record_task_failure`` opens its own. If the
         # breaker trips, this flips the task ``ready → blocked`` and
         # emits a ``gave_up`` event on top of the ``timed_out`` we
         # already emitted.
-        if cur.rowcount == 1:
-            if _record_task_failure(
-                conn, tid,
-                error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
-                outcome="timed_out",
-                failure_limit=failure_limit,
-                release_claim=False,
-                end_run=False,
-                event_payload_extra={"pid": pid, "sigkill": killed},
-            ):
+        if had_active_run:
+            task_now = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+            if task_now and task_now["status"] == "blocked":
                 auto_blocked.append(tid)
     enforce_max_runtime._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     return timed_out
@@ -6792,59 +6768,27 @@ def detect_stale_running(
             )
             continue
 
-        with write_txn(conn):
-            recovery_status = _review_recovery_status(conn, tid)
-            cur = conn.execute(
-                "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, "
-                "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND claim_lock IS ?",
-                (recovery_status, tid, row["claim_lock"]),
-            )
-            if cur.rowcount != 1:
-                continue
-
-            payload = {
-                "elapsed_seconds": int(elapsed),
-                "last_heartbeat_at": (
-                    int(last_hb) if last_hb is not None else None
-                ),
-                "heartbeat_age_seconds": (
-                    int(hb_age) if hb_age is not None else None
-                ),
-                "timeout_seconds": stale_timeout_seconds,
-                "pid": int(pid) if pid else None,
-            }
-            payload.update(termination)
-
-            run_id = _end_run(
-                conn, tid,
-                outcome="stale", status="stale",
-                error=(
-                    f"no heartbeat for {int(hb_age)}s "
-                    if hb_age is not None
-                    else "no heartbeat ever"
-                ) + f" after {int(elapsed)}s running",
-                metadata=payload,
-            )
-            _append_event(
-                conn, tid, "stale", payload, run_id=run_id,
-            )
-            reclaimed.append(tid)
-
-        if _record_task_failure(
+        payload = {
+            "elapsed_seconds": int(elapsed),
+            "last_heartbeat_at": int(last_hb) if last_hb is not None else None,
+            "heartbeat_age_seconds": int(hb_age) if hb_age is not None else None,
+            "timeout_seconds": stale_timeout_seconds,
+            "pid": int(pid) if pid else None,
+            **termination,
+        }
+        error_text = (
+            f"no heartbeat for {int(hb_age)}s " if hb_age is not None
+            else "no heartbeat ever "
+        ) + f"after {int(elapsed)}s running"
+        had_active_run = _current_run_id(conn, tid) is not None
+        auto = _record_task_failure(
             conn, tid,
-            error=(
-                f"no heartbeat for {int(hb_age)}s "
-                if hb_age is not None else "no heartbeat ever "
-            ) + f"after {int(elapsed)}s running",
-            outcome="stale",
-            failure_limit=failure_limit,
-            release_claim=False,
-            end_run=False,
-            event_payload_extra={"pid": int(pid) if pid else None},
-        ):
+            error=error_text, outcome="stale", failure_limit=failure_limit,
+            release_claim=True, end_run=True, event_payload_extra=payload,
+        )
+        if had_active_run:
+            reclaimed.append(tid)
+        if auto:
             auto_blocked.append(tid)
 
     detect_stale_running._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
@@ -7310,7 +7254,7 @@ def _record_task_failure(
                 # Only the spawn path has an open run to close.
                 run_id = _end_run(
                     conn, task_id,
-                    outcome="gave_up", status="gave_up",
+                    outcome=outcome, status=outcome,
                     error=error[:500],
                     metadata={
                         "failures": failures,
@@ -7318,6 +7262,11 @@ def _record_task_failure(
                         "effective_limit": effective_limit,
                         "limit_source": limit_source,
                     },
+                )
+                _append_event(
+                    conn, task_id, outcome,
+                    {"error": error[:500], "failures": failures,
+                     **(event_payload_extra or {})}, run_id=run_id,
                 )
             payload = {
                 "failures": failures,
@@ -7362,7 +7311,8 @@ def _record_task_failure(
                 )
                 _append_event(
                     conn, task_id, outcome,
-                    {"error": error[:500], "failures": failures},
+                    {"error": error[:500], "failures": failures,
+                     **(event_payload_extra or {})},
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
