@@ -4061,11 +4061,20 @@ def reclaim_task(
     )
     payload = {"manual": True, "reason": reason, "prev_lock": prev_lock, **termination}
     had_active_run = _current_run_id(conn, task_id) is not None
+    recovery_status = _review_recovery_status(conn, task_id) if had_active_run else "ready"
     _record_task_failure(
         conn, task_id, error, outcome="reclaimed",
         failure_limit=failure_limit,
         release_claim=True, end_run=True, event_payload_extra=payload,
     )
+    if had_active_run and recovery_status == "ready":
+        _clear_failure_counter(conn, task_id)
+        with write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'ready' "
+                "WHERE id = ? AND status = 'blocked' AND claim_lock IS NULL",
+                (task_id,),
+            )
     return had_active_run
 
 
@@ -6893,11 +6902,23 @@ def detect_stale_running(
             else "no heartbeat ever "
         ) + f"after {int(elapsed)}s running"
         had_active_run = _current_run_id(conn, tid) is not None
-        auto = _record_task_failure(
-            conn, tid,
-            error=error_text, outcome="stale", failure_limit=failure_limit,
-            release_claim=True, end_run=True, event_payload_extra=payload,
-        )
+        # Staleness is dispatcher-side liveness recovery, not a worker
+        # failure. Release the claim and close the attempt without touching
+        # the failure budget; otherwise an old heartbeat can trip the same
+        # breaker used for real crashes and spawn failures.
+        auto = False
+        with write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status IN ('running', 'review_approved')",
+                (tid,),
+            )
+            run_id = _end_run(
+                conn, tid, outcome="stale", status="stale",
+                error=error_text, metadata=payload,
+            )
+            _append_event(conn, tid, "stale", payload, run_id=run_id)
         if had_active_run:
             reclaimed.append(tid)
         if auto:
@@ -7327,7 +7348,10 @@ def _record_task_failure(
         ).fetchone()
         if row is None:
             return False
-        failures = int(row["consecutive_failures"]) + 1
+        # Stale-worker detection is dispatcher housekeeping, not a worker
+        # failure. Requeue it without consuming the circuit-breaker budget.
+        neutral_recovery = outcome == "stale"
+        failures = int(row["consecutive_failures"]) + (0 if neutral_recovery else 1)
         cur_status = row["status"]
 
         # Per-task override wins over both caller-supplied and default
@@ -7342,7 +7366,7 @@ def _record_task_failure(
             effective_limit = int(failure_limit)
             limit_source = "dispatcher"
 
-        if force_trip or failures >= effective_limit:
+        if force_trip or (not neutral_recovery and failures >= effective_limit):
             # Trip the breaker.
             if release_claim:
                 # Spawn path: still running, also clear claim state.
@@ -7368,7 +7392,7 @@ def _record_task_failure(
                 # Only the spawn path has an open run to close.
                 run_id = _end_run(
                     conn, task_id,
-                    outcome=outcome, status=outcome,
+                    outcome="gave_up", status="gave_up",
                     error=error[:500],
                     metadata={
                         "failures": failures,
@@ -8134,15 +8158,14 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        # Do not force-load a profile-local skill here.  Reviewer profiles
-        # already receive the built-in Kanban lifecycle guidance, while a
-        # stale hard-coded skill name makes a fresh reviewer process fail
-        # before it can claim/close the card.  An empty list is the safe
-        # fallback; a profile may still opt into its own configured skills.
+        # Review workers need the narrow review skill in addition to the
+        # profile's normal skill set.  Keep this explicit so a reviewer
+        # launched from a programmer-owned card receives the same-card
+        # verdict contract before it can claim/close the card.
         # Task.assignee remains the implementer in the DB; only the spawned
         # process uses the independent reviewer profile.
         claimed.assignee = reviewer_profile
-        claimed.skills = []
+        claimed.skills = ["sdlc-review"]
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
