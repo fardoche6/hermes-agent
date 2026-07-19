@@ -134,6 +134,8 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     # making it hang until timeout. Stateless dispatch — they just read
     # the env var and write to ~/.hermes/kanban.db.
     "kanban_complete",
+    "kanban_submit_review",
+    "kanban_review_verdict",
     "kanban_block",
     "kanban_comment",
     "kanban_heartbeat",

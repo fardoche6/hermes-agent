@@ -1521,6 +1521,7 @@ DEFAULT_CONFIG = {
     # implementations. Per-platform notification opt-out is handled by the
     # kanban dashboard (see ``hermes dashboard`` -> Notifications).
     "kanban": {
+        "reviewer_profile": "code-reviewer",
         # Auto-subscribe the originating gateway/TUI session to task
         # completion + block events when ``kanban_create`` is called from
         # inside a session that has a persistent delivery channel. The

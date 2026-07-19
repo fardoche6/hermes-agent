@@ -99,7 +99,7 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "review_approved", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
@@ -3603,12 +3603,33 @@ def claim_task(
     return claimed
 
 
+def _review_recovery_status(conn: sqlite3.Connection, task_id: str) -> str:
+    """Preserve the source phase when a claimed worker is reclaimed."""
+    row = conn.execute(
+        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if not row or row["current_run_id"] is None:
+        return "ready"
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind = 'claimed' ORDER BY id DESC LIMIT 1",
+        (task_id, int(row["current_run_id"])),
+    ).fetchone()
+    if not event or not event["payload"]:
+        return "ready"
+    try:
+        return "review" if json.loads(event["payload"]).get("source_status") == "review" else "ready"
+    except (TypeError, json.JSONDecodeError):
+        return "ready"
+
+
 def claim_review_task(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    reviewer_profile: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
 
@@ -3656,7 +3677,7 @@ def claim_review_task(
             """,
             (
                 task_id,
-                trow["assignee"] if trow else None,
+                reviewer_profile or (trow["assignee"] if trow else None),
                 trow["current_step_key"] if trow else None,
                 lock,
                 expires,
@@ -3676,6 +3697,133 @@ def claim_review_task(
             run_id=run_id,
         )
         return get_task(conn, task_id)
+
+
+def _reviewer_profile(implementer: Optional[str]) -> str:
+    """Resolve an independent reviewer profile without changing ownership."""
+    try:
+        from hermes_cli.config import load_config
+
+        configured = (load_config().get("kanban") or {}).get("reviewer_profile")
+    except Exception:
+        configured = None
+    candidates = [configured, "code-reviewer", "code-reviewer-claudecode"]
+    for candidate in candidates:
+        profile = str(candidate or "").strip()
+        if profile and profile != implementer:
+            return profile
+    raise ValueError("no independent reviewer profile is configured")
+
+
+def submit_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
+    claimer: Optional[str] = None,
+) -> bool:
+    """Hand the implementer's claimed run to review on the same card."""
+    if expected_run_id is None or not claimer:
+        return False
+    lock = claimer
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ? AND claim_lock = ? "
+            "AND current_run_id = ?",
+            (task_id, lock, int(expected_run_id)),
+        ).fetchone()
+        if not row or row["status"] != "running":
+            return False
+        run_id = row["current_run_id"]
+        if expected_run_id is not None and run_id != int(expected_run_id):
+            return False
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'review', claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL WHERE id = ? AND status = 'running' AND claim_lock = ? "
+            "AND current_run_id = ?",
+            (task_id, lock, run_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        closed_run = _end_run(
+            conn, task_id, outcome="review_submitted", summary=summary,
+            metadata=metadata, status="review_submitted",
+        )
+        _append_event(
+            conn, task_id, "review_submitted",
+            {"summary": summary, "metadata": metadata}, run_id=closed_run,
+        )
+    return True
+
+
+def review_verdict(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    verdict: Optional[str] = None,
+    approved: Optional[bool] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
+    claimer: Optional[str] = None,
+) -> bool:
+    """Record a same-card reviewer verdict without creating a child card."""
+    if verdict is None and approved is not None:
+        verdict = "approved" if approved else "request_changes"
+    if verdict == "changes_requested":
+        verdict = "request_changes"
+    if verdict not in {"approved", "request_changes"}:
+        raise ValueError("verdict must be 'approved' or 'request_changes'")
+    target_status = "review_approved" if verdict == "approved" else "ready"
+    if expected_run_id is None or not claimer:
+        return False
+    lock = claimer
+    if verdict == "approved":
+        proof = metadata if isinstance(metadata, dict) else {}
+        if not proof.get("merge_proof") or not proof.get("live_proof"):
+            return False
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row or row["status"] != "running" or not row["current_run_id"]:
+            return False
+        if row["claim_lock"] != lock:
+            return False
+        run_id = int(row["current_run_id"])
+        if run_id != int(expected_run_id):
+            return False
+        source = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'claimed' ORDER BY id DESC LIMIT 1", (task_id, run_id)
+        ).fetchone()
+        try:
+            payload = json.loads(source["payload"]) if source and source["payload"] else {}
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        if payload.get("source_status") != "review":
+            return False
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL WHERE id = ? AND status = 'running' "
+            "AND current_run_id = ? AND claim_lock = ?",
+            (target_status, task_id, run_id, lock),
+        )
+        if cur.rowcount != 1:
+            return False
+        closed_run = _end_run(
+            conn, task_id, outcome=f"review_{verdict}", summary=summary,
+            metadata=metadata, status=f"review_{verdict}",
+        )
+        _append_event(
+            conn, task_id, "review_verdict",
+            {"verdict": verdict, "summary": summary, "metadata": metadata},
+            run_id=closed_run,
+        )
+    return True
 
 
 def heartbeat_claim(
@@ -3815,12 +3963,13 @@ def release_stale_claims(
             )
             continue
         with write_txn(conn):
+            recovery_status = _review_recovery_status(conn, row["id"])
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (row["id"], row["claim_lock"], now),
+                (recovery_status, row["id"], row["claim_lock"], now),
             )
             if cur.rowcount != 1:
                 continue
@@ -3887,12 +4036,13 @@ def reclaim_task(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
     with write_txn(conn):
+        recovery_status = _review_recovery_status(conn, task_id)
         cur = conn.execute(
-            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
+            "WHERE id = ? AND status IN ('running', 'ready', 'blocked', 'review') "
             "AND claim_lock IS ?",
-            (task_id, prev_lock),
+            (recovery_status, task_id, prev_lock),
         )
         if cur.rowcount != 1:
             return False
@@ -4091,6 +4241,24 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _review_approval_proven(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return true only when the approved verdict recorded both proof gates."""
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_verdict' "
+        "ORDER BY id DESC LIMIT 1", (task_id,)
+    ).fetchone()
+    if not event or not event["payload"]:
+        return False
+    try:
+        payload = json.loads(event["payload"])
+        metadata = payload.get("metadata") or {}
+        return payload.get("verdict") == "approved" and bool(
+            metadata.get("merge_proof") and metadata.get("live_proof")
+        )
+    except (TypeError, json.JSONDecodeError):
+        return False
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4161,6 +4329,9 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
+    current = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if current and current["status"] == "review_approved" and not _review_approval_proven(conn, task_id):
+        return False
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -4175,7 +4346,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked', 'review_approved')
                 """,
                 (result, now, task_id),
             )
@@ -4192,8 +4363,11 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
-                   AND current_run_id = ?
+                   AND status IN ('running', 'ready', 'blocked', 'review_approved')
+                   AND (
+                       current_run_id = ?
+                       OR (status = 'review_approved' AND current_run_id IS NULL)
+                   )
                 """,
                 (result, now, task_id, int(expected_run_id)),
             )
@@ -6489,13 +6663,14 @@ def enforce_max_runtime(
                     pass
 
         with write_txn(conn):
+            recovery_status = _review_recovery_status(conn, tid)
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (tid, pid, row["claim_lock"]),
+                (recovery_status, tid, pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 payload = {
@@ -6615,13 +6790,14 @@ def detect_stale_running(
             continue
 
         with write_txn(conn):
+            recovery_status = _review_recovery_status(conn, tid)
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ?",
-                (tid, row["claim_lock"]),
+                (recovery_status, tid, row["claim_lock"]),
             )
             if cur.rowcount != 1:
                 continue
@@ -6873,12 +7049,13 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
+            recovery_status = _review_recovery_status(conn, row["id"])
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (row["id"], pid, row["claim_lock"]),
+                (recovery_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
@@ -7151,12 +7328,13 @@ def _record_task_failure(
             # Below threshold.
             if release_claim:
                 # Spawn path: transition running → ready + clear claim.
+                recovery_status = _review_recovery_status(conn, task_id)
                 conn.execute(
-                    "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status = 'running'",
-                    (failures, error[:500], task_id),
+                    (recovery_status, failures, error[:500], task_id),
                 )
             else:
                 # Timeout/crash path: task is already at ``ready`` via
@@ -7845,13 +8023,21 @@ def _dispatch_once_locked(
             from hermes_cli.profiles import profile_exists
         except Exception:
             profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        try:
+            reviewer_profile = _reviewer_profile(row["assignee"])
+        except ValueError:
+            result.skipped_nonspawnable.append(row["id"])
+            continue
+        if profile_exists is not None and not profile_exists(reviewer_profile):
             result.skipped_nonspawnable.append(row["id"])
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_review_task(
+            conn, row["id"], ttl_seconds=ttl_seconds,
+            reviewer_profile=reviewer_profile,
+        )
         if claimed is None:
             continue
         try:
@@ -7878,7 +8064,13 @@ def _dispatch_once_locked(
         # kanban lifecycle is already injected into every worker's system
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
+        # Keep the task assignee as the implementer for request-changes
+        # routing, but spawn the independent reviewer profile.
+        claimed.assignee = reviewer_profile
         claimed.skills = ["sdlc-review"]
+        # Task.assignee remains the original implementer in the DB; only the
+        # spawned review process uses the independent reviewer profile.
+        claimed.assignee = _reviewer_profile(row["assignee"])
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
