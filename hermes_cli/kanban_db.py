@@ -2316,12 +2316,25 @@ def write_txn(conn: sqlite3.Connection):
     a SQLite auto-rollback (which leaves no active transaction) does not
     shadow the original exception with a spurious rollback error.
     """
-    _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
+    # Recovery code may call helpers which also use write_txn.  A nested
+    # BEGIN would commit the outer recovery half-way through (or fail with
+    # ``cannot start a transaction within a transaction``).  Use a savepoint
+    # for nested callers so interruption rolls back the complete outer unit.
+    nested = conn.in_transaction
+    savepoint = f"hermes_nested_{id(conn):x}_{time.monotonic_ns()}" if nested else None
+    if nested:
+        conn.execute(f"SAVEPOINT {savepoint}")
+    else:
+        _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
         yield conn
     except Exception:
         try:
-            conn.execute("ROLLBACK")
+            if nested:
+                conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            else:
+                conn.execute("ROLLBACK")
         except sqlite3.OperationalError:
             # SQLite has already auto-rolled-back the transaction (typical
             # under EIO, lock contention, or corruption). Nothing to undo;
@@ -2330,18 +2343,26 @@ def write_txn(conn: sqlite3.Connection):
         raise
     else:
         try:
-            _execute_boundary_with_retry(conn, "COMMIT")
+            if nested:
+                conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            else:
+                _execute_boundary_with_retry(conn, "COMMIT")
         except Exception:
             # COMMIT exhausted retries with the txn still open; roll back so the
             # connection isn't poisoned for the next BEGIN IMMEDIATE.
             try:
-                conn.execute("ROLLBACK")
+                if nested:
+                    conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                else:
+                    conn.execute("ROLLBACK")
             except sqlite3.OperationalError:
                 pass
             raise
-        # Post-commit file-length check: header page_count must match actual file pages.
+        # Post-commit file-length check only belongs to a real commit.
         # A discrepancy means a torn-extend — raise now rather than silently corrupt.
-        _check_file_length_invariant(conn)
+        if not nested:
+            _check_file_length_invariant(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -4226,50 +4247,64 @@ class ArtifactPreservationError(RuntimeError):
 
 
 def _valid_review_proof(metadata: object) -> bool:
-    """Validate the concrete proof contract used by approved reviews."""
+    """Validate approved-review evidence, rejecting fabricated placeholders."""
     if not isinstance(metadata, dict):
         return False
-    merge = metadata.get("merge_proof")
-    live = metadata.get("live_proof")
+    merge, live = metadata.get("merge_proof"), metadata.get("live_proof")
     if not isinstance(merge, dict) or not isinstance(live, dict):
         return False
     commit = merge.get("merged_commit", merge.get("commit"))
-    state = merge.get("merged_state", merge.get("state"))
-    merge_checks = merge.get("checks")
-    live_checks = live.get("checks")
     if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", commit.strip()):
         return False
-    if not isinstance(state, str) or state.strip().lower() != "merged":
+    commit = commit.strip().lower()
+    if commit == "0" * 40 or commit in {"0123456789abcdef0123456789abcdef01234567", "deadbeef" * 5}:
         return False
-    if not isinstance(merge_checks, dict) or not merge_checks:
+    try:
+        subprocess.run(["git", "cat-file", "-e", f"{commit}^{{commit}}"], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+    except (OSError, subprocess.SubprocessError):
         return False
-    if not isinstance(live_checks, dict) or not live_checks:
+    if str(merge.get("merged_state", merge.get("state", ""))).strip().lower() != "merged":
         return False
-    def concrete_mapping(value: dict) -> bool:
-        for key, item in value.items():
+    forbidden = {"", "synthetic", "placeholder", "fake", "fabricated", "dummy", "example", "unknown", "n/a", "none", "null", "true", "false", "readback", "observed", "value"}
+    def concrete(value: object) -> bool:
+        if isinstance(value, bool) or value is None:
+            return False
+        if isinstance(value, (int, float)):
+            return True
+        if isinstance(value, str):
+            text = value.strip().lower()
+            return bool(text) and text not in forbidden and "placeholder" not in text and "synthetic" not in text
+        return isinstance(value, (dict, list, tuple)) and bool(value)
+    def checks_ok(checks: object) -> bool:
+        if not isinstance(checks, dict) or not checks:
+            return False
+        for key, item in checks.items():
             if not isinstance(key, str) or not key.strip() or not isinstance(item, dict):
                 return False
-            status = item.get("status", item.get("result"))
-            if not isinstance(status, str) or status.strip().lower() in {
-                "", "synthetic", "true", "false", "placeholder", "fake",
-            }:
+            status = str(item.get("status", item.get("result", ""))).strip().lower()
+            if status not in {"passed", "pass", "ok", "healthy", "verified", "resolved"}:
                 return False
-            if status.strip().lower() not in {
-                "passed", "pass", "ok", "healthy", "verified", "resolved",
-            }:
+            if not any(concrete(item.get(field)) for field in ("command", "output", "url", "readback", "observed", "value")):
                 return False
         return True
-    if not concrete_mapping(merge_checks) or not concrete_mapping(live_checks):
+    if not checks_ok(merge.get("checks")) or not checks_ok(live.get("checks")):
         return False
     threads = merge.get("review_threads", merge.get("threads"))
-    readback = merge.get("readback")
     if not isinstance(threads, dict) or threads.get("resolved") != threads.get("total"):
         return False
-    if not isinstance(readback, dict) or str(readback.get("status", "")).lower() not in {
-        "verified", "readback_verified",
-    }:
+    items = threads.get("items", threads.get("threads"))
+    if not isinstance(items, (list, tuple)) or not items:
         return False
-    return True
+    for item in items:
+        if not isinstance(item, dict) or not concrete(item.get("id", item.get("thread_id", item.get("url")))):
+            return False
+        if not any(concrete(item.get(field)) for field in ("readback", "output", "url", "observed")):
+            return False
+    readback = merge.get("readback")
+    if not isinstance(readback, dict) or str(readback.get("status", "")).lower() not in {"verified", "readback_verified"}:
+        return False
+    return any(concrete(readback.get(field)) for field in ("command", "output", "url", "ref", "value", "observed"))
 
 
 def _review_approval_proven(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -6923,7 +6958,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
-def detect_crashed_workers(
+def _detect_crashed_workers(
     conn: sqlite3.Connection, *, failure_limit: Optional[int] = None,
 ) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
@@ -7194,6 +7229,20 @@ def detect_crashed_workers(
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
     return crashed
+
+
+def detect_crashed_workers(
+    conn: sqlite3.Connection, *, failure_limit: Optional[int] = None,
+) -> list[str]:
+    """Atomically detect, account, and recover crashed workers.
+
+    The implementation uses nested savepoints for its helper transactions;
+    this outer transaction is intentional.  If crash accounting is
+    interrupted after claim cleanup, SQLite rolls back the cleanup, run
+    outcome, failure counter, breaker decision, and audit events together.
+    """
+    with write_txn(conn):
+        return _detect_crashed_workers(conn, failure_limit=failure_limit)
 
 
 def _record_task_failure(

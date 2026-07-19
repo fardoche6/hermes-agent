@@ -128,8 +128,8 @@ def test_review_submit_verdict_and_completion_keep_one_card_identity(kanban_home
         assert kb.review_verdict(
             conn, task_id, verdict="approved", summary="review passed",
             metadata={
-                "merge_proof": {"commit": "0123456789abcdef0123456789abcdef01234567", "state": "merged", "checks": {"pytest": {"status": "passed"}}, "review_threads": {"resolved": 1, "total": 1}, "readback": {"status": "verified"}},
-                "live_proof": {"checks": {"health": {"status": "healthy"}}},
+                "merge_proof": {"commit": "045ecf9209df29b464fadb7c0772f8707f3b8059", "state": "merged", "checks": {"pytest": {"status": "passed", "command": "pytest", "output": "passed"}}, "review_threads": {"resolved": 1, "total": 1, "items": [{"id": "thread-1", "readback": "resolved"}]}, "readback": {"status": "verified", "command": "git show", "output": "commit 045ecf9"}},
+                "live_proof": {"checks": {"health": {"status": "healthy", "url": "http://127.0.0.1/health", "observed": "200 OK"}}},
             },
             expected_run_id=reviewed.current_run_id, claimer="reviewer:test",
         )

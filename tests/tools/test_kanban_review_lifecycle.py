@@ -65,7 +65,7 @@ def test_approved_verdict_completes_only_reviewers_claimed_card(tmp_path, monkey
         assert reviewed is not None
         assert kb.review_verdict(
             conn, task_id, approved=True, summary="Approved after tests",
-            metadata={"merge_proof": {"commit": "0123456789abcdef0123456789abcdef01234567", "state": "merged", "checks": {"pytest": {"status": "passed"}}, "review_threads": {"resolved": 1, "total": 1}, "readback": {"status": "verified"}}, "live_proof": {"checks": {"health": {"status": "healthy"}}}},
+            metadata={"merge_proof": {"commit": "045ecf9209df29b464fadb7c0772f8707f3b8059", "state": "merged", "checks": {"pytest": {"status": "passed", "command": "pytest tests/tools/test_kanban_review_lifecycle.py", "output": "passed"}}, "review_threads": {"resolved": 1, "total": 1, "items": [{"id": "thread-1", "readback": "resolved"}]}, "readback": {"status": "verified", "command": "git show", "output": "commit 045ecf9"}}, "live_proof": {"checks": {"health": {"status": "healthy", "url": "http://127.0.0.1/health", "observed": "200 OK"}}}},
             expected_run_id=reviewed.current_run_id, claimer="host:reviewer",
         )
         assert kb.get_task(conn, task_id).status == "review_approved"
@@ -269,3 +269,37 @@ def test_reviewer_fallback_skips_unavailable_preferred_profile(tmp_path, monkeyp
         assert kb.get_task(conn, task_id).assignee == "programmer"
     finally:
         conn.close()
+
+
+def test_proof_gate_rejects_zero_sha_empty_threads_and_status_only_live(tmp_path, monkeypatch):
+    kb = _db(tmp_path, monkeypatch)
+    base = {"merge_proof": {"commit": "045ecf9209df29b464fadb7c0772f8707f3b8059", "state": "merged", "checks": {"ci": {"status": "passed", "output": "ok"}}, "review_threads": {"resolved": 1, "total": 1, "items": [{"id": "thread-1", "readback": "resolved"}]}, "readback": {"status": "verified", "output": "commit"}}, "live_proof": {"checks": {"health": {"status": "healthy", "output": "200"}}}}
+    for bad in (
+        {**base, "merge_proof": {**base["merge_proof"], "commit": "0" * 40}},
+        {**base, "merge_proof": {**base["merge_proof"], "review_threads": {"resolved": 1, "total": 1, "items": []}}},
+        {**base, "live_proof": {"checks": {"health": {"status": "healthy"}}}},
+    ):
+        assert not kb._valid_review_proof(bad)
+
+
+def test_crash_recovery_interruption_rolls_back_all_state(tmp_path, monkeypatch):
+    kb = _db(tmp_path, monkeypatch)
+    conn = kb.connect()
+    task_id = kb.create_task(conn, title="crash", assignee="programmer")
+    claimer = f"{kb._claimer_id().split(':', 1)[0]}:worker"
+    claimed = kb.claim_task(conn, task_id, claimer=claimer)
+    assert claimed is not None
+    kb._set_worker_pid(conn, task_id, 99999)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+    original = kb._record_task_failure
+    monkeypatch.setattr(kb, "_record_task_failure", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("injected recovery interruption")))
+    before = kb.get_task(conn, task_id)
+    with pytest.raises(RuntimeError):
+        kb.detect_crashed_workers(conn)
+    after = kb.get_task(conn, task_id)
+    assert (after.status, after.claim_lock, after.current_run_id, after.consecutive_failures) == (before.status, before.claim_lock, before.current_run_id, before.consecutive_failures)
+    monkeypatch.setattr(kb, "_record_task_failure", original)
+    assert kb.detect_crashed_workers(conn, failure_limit=1) == [task_id]
+    recovered = kb.get_task(conn, task_id)
+    assert recovered.status == "blocked" and recovered.consecutive_failures == 1 and recovered.claim_lock is None
