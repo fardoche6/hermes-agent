@@ -81,6 +81,30 @@ def test_approved_verdict_completes_only_reviewers_claimed_card(tmp_path, monkey
         conn.close()
 
 
+def test_reviewer_cannot_bypass_verdict_with_ordinary_completion(tmp_path, monkeypatch):
+    kb = _db(tmp_path, monkeypatch)
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="review completion gate", assignee="programmer")
+        impl = kb.claim_task(conn, task_id, claimer="host:implementer")
+        assert impl is not None
+        assert kb.submit_review(conn, task_id, expected_run_id=impl.current_run_id, claimer="host:implementer")
+        reviewer = kb.claim_review_task(conn, task_id, claimer="host:reviewer")
+        assert reviewer is not None
+        assert not kb.complete_task(
+            conn,
+            task_id,
+            summary="bypass attempt",
+            expected_run_id=reviewer.current_run_id,
+            claimer="host:reviewer",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+    finally:
+        conn.close()
+
+
 def test_review_handlers_fail_closed_without_exact_worker_tokens(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_missing")

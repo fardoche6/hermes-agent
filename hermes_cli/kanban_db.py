@@ -4323,6 +4323,21 @@ def _review_approval_proven(conn: sqlite3.Connection, task_id: str) -> bool:
         return False
 
 
+def _is_review_run(conn: sqlite3.Connection, task_id: str, run_id: int) -> bool:
+    """Return whether ``run_id`` was claimed from the review phase."""
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind = 'claimed' ORDER BY id DESC LIMIT 1",
+        (task_id, int(run_id)),
+    ).fetchone()
+    if not event or not event["payload"]:
+        return False
+    try:
+        return json.loads(event["payload"]).get("source_status") == "review"
+    except (TypeError, json.JSONDecodeError):
+        return False
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4397,6 +4412,16 @@ def complete_task(
     current = conn.execute(
         "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
+    # A reviewer is still in generic ``running`` while it evaluates the
+    # implementation.  Do not let that run bypass ``review_verdict`` by
+    # calling the ordinary completion path directly.
+    if (
+        current
+        and current["current_run_id"] is not None
+        and _is_review_run(conn, task_id, int(current["current_run_id"]))
+        and current["status"] != "review_approved"
+    ):
+        return False
     if current and current["status"] == "review_approved" and not _review_approval_proven(conn, task_id):
         return False
     if current and current["status"] == "review_approved":
