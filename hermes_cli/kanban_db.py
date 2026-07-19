@@ -4039,7 +4039,8 @@ def reclaim_task(
         recovery_status = _review_recovery_status(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
-            "claim_expires = NULL, worker_pid = NULL "
+            "claim_expires = NULL, worker_pid = NULL, "
+            "consecutive_failures = 0, last_failure_error = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked', 'review') "
             "AND claim_lock IS ?",
             (recovery_status, task_id, prev_lock),
@@ -4066,11 +4067,6 @@ def reclaim_task(
             payload,
             run_id=run_id,
         )
-    # Operator intervention — they've looked at the task, so the
-    # consecutive-failures counter is now stale. Give the next retry
-    # a fresh budget. (_clear_failure_counter opens its own write_txn,
-    # so it runs after the enclosing one commits.)
-    _clear_failure_counter(conn, task_id)
     return True
 
 
@@ -6595,6 +6591,7 @@ def enforce_max_runtime(
     conn: sqlite3.Connection,
     *,
     signal_fn=None,
+    failure_limit: Optional[int] = None,
 ) -> list[str]:
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
@@ -6610,6 +6607,7 @@ def enforce_max_runtime(
     """
     import signal
     timed_out: list[str] = []
+    auto_blocked: list[str] = []
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
 
@@ -6695,14 +6693,17 @@ def enforce_max_runtime(
         # emits a ``gave_up`` event on top of the ``timed_out`` we
         # already emitted.
         if cur.rowcount == 1:
-            _record_task_failure(
+            if _record_task_failure(
                 conn, tid,
                 error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
                 outcome="timed_out",
+                failure_limit=failure_limit,
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "sigkill": killed},
-            )
+            ):
+                auto_blocked.append(tid)
+    enforce_max_runtime._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     return timed_out
 
 
@@ -6718,6 +6719,7 @@ def detect_stale_running(
     *,
     stale_timeout_seconds: int = 0,
     signal_fn=None,
+    failure_limit: Optional[int] = None,
 ) -> list[str]:
     """Reclaim ``running`` tasks that show no progress (heartbeat) within the
     staleness window.
@@ -6748,6 +6750,7 @@ def detect_stale_running(
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     reclaimed: list[str] = []
+    auto_blocked: list[str] = []
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
@@ -6830,16 +6833,21 @@ def detect_stale_running(
             )
             reclaimed.append(tid)
 
-        # Intentionally NOT calling _record_task_failure here. Stale reclaim
-        # is dispatcher-side detection of an absent heartbeat; the task is
-        # going straight back to ``ready`` for re-dispatch. Counting it as
-        # a worker failure would let two legitimately-long-running tasks
-        # (>4h without explicit heartbeat) trip the circuit breaker and
-        # auto-block, even though no worker actually failed. The 'stale'
-        # event already lives in task_events for auditability; that's the
-        # right surface for "this happened" without conflating with the
-        # spawn_failed / timed_out / crashed counters.
+        if _record_task_failure(
+            conn, tid,
+            error=(
+                f"no heartbeat for {int(hb_age)}s "
+                if hb_age is not None else "no heartbeat ever "
+            ) + f"after {int(elapsed)}s running",
+            outcome="stale",
+            failure_limit=failure_limit,
+            release_claim=False,
+            end_run=False,
+            event_payload_extra={"pid": int(pid) if pid else None},
+        ):
+            auto_blocked.append(tid)
 
+    detect_stale_running._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     return reclaimed
 
 
@@ -7202,7 +7210,7 @@ def _record_task_failure(
     error: str,
     *,
     outcome: str,
-    failure_limit: int = None,
+    failure_limit: Optional[int] = None,
     force_trip: bool = False,
     release_claim: bool = False,
     end_run: bool = False,
@@ -7284,7 +7292,7 @@ def _record_task_failure(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('running', 'ready')",
+                    "WHERE id = ? AND status IN ('running', 'ready', 'review')",
                     (failures, error[:500], task_id),
                 )
             else:
@@ -7294,7 +7302,7 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('ready', 'running')",
+                    "WHERE id = ? AND status IN ('ready', 'running', 'review')",
                     (failures, error[:500], task_id),
                 )
             run_id = None
@@ -7730,7 +7738,9 @@ def _dispatch_once_locked(
     result.reclaimed = release_stale_claims(conn)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
+        failure_limit=failure_limit,
     )
+    result.auto_blocked.extend(getattr(detect_stale_running, "_last_auto_blocked", []))
     result.crashed = detect_crashed_workers(conn)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
@@ -7748,7 +7758,8 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
-    result.timed_out = enforce_max_runtime(conn)
+    result.timed_out = enforce_max_runtime(conn, failure_limit=failure_limit)
+    result.auto_blocked.extend(getattr(enforce_max_runtime, "_last_auto_blocked", []))
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
@@ -8001,9 +8012,9 @@ def _dispatch_once_locked(
 
     # ---- review column dispatch ----
     # Review tasks are tasks that a worker moved to 'review' after
-    # creating a PR.  The dispatcher spawns a review agent (loading
-    # sdlc-review skill) that verifies the PR and either merges (→ done)
-    # or rejects (→ back to running for the worker to fix).
+    # creating a PR.  The dispatcher spawns an independent reviewer profile;
+    # the built-in Kanban lifecycle guidance is sufficient and no fragile
+    # profile-local skill name is forced at startup.
     #
     # Same concurrency model as ready dispatch: review spawns count
     # against max_spawn alongside ready tasks, so the total number of
@@ -8059,18 +8070,15 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        # Force-load the sdlc-review skill for review agents — it carries
-        # the review logic (AC verification, merge, etc.). The mandatory
-        # kanban lifecycle is already injected into every worker's system
-        # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
-        # review agent needs.
-        # Keep the task assignee as the implementer for request-changes
-        # routing, but spawn the independent reviewer profile.
+        # Do not force-load a profile-local skill here.  Reviewer profiles
+        # already receive the built-in Kanban lifecycle guidance, while a
+        # stale hard-coded skill name makes a fresh reviewer process fail
+        # before it can claim/close the card.  An empty list is the safe
+        # fallback; a profile may still opt into its own configured skills.
+        # Task.assignee remains the implementer in the DB; only the spawned
+        # process uses the independent reviewer profile.
         claimed.assignee = reviewer_profile
-        claimed.skills = ["sdlc-review"]
-        # Task.assignee remains the original implementer in the DB; only the
-        # spawned review process uses the independent reviewer profile.
-        claimed.assignee = _reviewer_profile(row["assignee"])
+        claimed.skills = []
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
