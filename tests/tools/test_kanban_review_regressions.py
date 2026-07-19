@@ -26,12 +26,16 @@ def test_approved_review_claim_is_recovered_to_review(tmp_path, monkeypatch):
         reviewer = kb.claim_review_task(conn, task_id, claimer="host:review")
         proof = {"merge_proof": {"commit": commit, "state": "merged", "checks": {"pytest": {"status": "passed"}}, "review_threads": {"resolved": 1, "total": 1}, "readback": {"status": "verified"}}, "live_proof": {"checks": {"health": {"status": "healthy"}}}}
         assert kb.review_verdict(conn, task_id, verdict="approved", metadata=proof, expected_run_id=reviewer.current_run_id, claimer="host:review")
+        final_id = conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)).fetchone()["current_run_id"]
         conn.execute("UPDATE tasks SET claim_expires = 0, worker_pid = NULL WHERE id = ?", (task_id,))
         assert kb.release_stale_claims(conn) == 1
-        assert kb.get_task(conn, task_id).status == "review"
+        assert kb.get_task(conn, task_id).status == "review_approved"
         run = conn.execute("SELECT status, outcome FROM task_runs WHERE id = ?", (reviewer.current_run_id,)).fetchone()
-        assert run["status"] == "reclaimed"
-        assert run["outcome"] == "reclaimed"
+        assert run["status"] == "review_approved"
+        assert run["outcome"] == "review_approved"
+        final_run = conn.execute("SELECT status, outcome FROM task_runs WHERE id = ?", (final_id,)).fetchone()
+        assert final_run["status"] == "reclaimed"
+        assert final_run["outcome"] == "reclaimed"
 
 
 def test_review_proof_rejects_forged_local_tracking_ref(tmp_path, monkeypatch):

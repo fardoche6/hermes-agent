@@ -3623,14 +3623,20 @@ def _review_recovery_status(conn: sqlite3.Connection, task_id: str) -> str:
     if not row or row["current_run_id"] is None:
         return "ready"
     event = conn.execute(
-        "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
-        "AND kind = 'claimed' ORDER BY id DESC LIMIT 1",
+        "SELECT payload, kind FROM task_events WHERE task_id = ? AND run_id = ? "
+        "AND kind IN ('claimed', 'finalization_claimed') ORDER BY id DESC LIMIT 1",
         (task_id, int(row["current_run_id"])),
     ).fetchone()
     if not event or not event["payload"]:
         return "ready"
     try:
-        return "review" if json.loads(event["payload"]).get("source_status") == "review" else "ready"
+        payload = json.loads(event["payload"])
+        source_status = payload.get("source_status")
+        if source_status == "review":
+            return "review"
+        if source_status == "review_approved":
+            return "review_approved"
+        return "ready"
     except (TypeError, json.JSONDecodeError):
         return "ready"
 
@@ -3834,15 +3840,42 @@ def review_verdict(
             source_payload = {}
         if source_payload.get("source_status") != "review":
             return False
-        # Approval is a proof gate, not finalization. Keep the reviewer's
-        # exact run+claim live so only that token can finalize the card.
+        # Approval closes the reviewer attempt and creates a distinct,
+        # recoverable finalization claim. The reviewer token is never
+        # authorized to complete the task after this point.
         if verdict == "approved":
-            cur = conn.execute(
-                "UPDATE tasks SET status = ? WHERE id = ? AND status = 'running' "
-                "AND current_run_id = ? AND claim_lock = ?",
-                (target_status, task_id, run_id, lock),
+            reviewer_row = conn.execute(
+                "SELECT profile FROM task_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            reviewer_profile = reviewer_row["profile"] if reviewer_row else None
+            closed_run = _end_run(
+                conn, task_id, outcome="review_approved", summary=summary,
+                metadata=metadata, status="review_approved",
             )
-            closed_run = None
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, claim_lock = ?, claim_expires = ? "
+                "WHERE id = ? AND status = 'running' AND current_run_id IS NULL",
+                (target_status, lock, int(time.time()) + _resolve_claim_ttl_seconds(), task_id),
+            )
+            if cur.rowcount != 1:
+                return False
+            trow = conn.execute(
+                "SELECT assignee, max_runtime_seconds, current_step_key FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            final_expires = int(time.time()) + _resolve_claim_ttl_seconds()
+            final_cur = conn.execute(
+                "INSERT INTO task_runs (task_id, profile, step_key, status, claim_lock, claim_expires, max_runtime_seconds, started_at) "
+                "VALUES (?, ?, ?, 'running', ?, ?, ?, ?)",
+                (task_id, reviewer_profile or (trow["assignee"] if trow else None),
+                 trow["current_step_key"] if trow else None, lock, final_expires,
+                 trow["max_runtime_seconds"] if trow else None, int(time.time())),
+            )
+            final_run = int(final_cur.lastrowid)
+            conn.execute("UPDATE tasks SET current_run_id = ? WHERE id = ?", (final_run, task_id))
+            _append_event(conn, task_id, "finalization_claimed",
+                          {"run_id": final_run, "claim_lock": lock,
+                           "source_status": "review_approved"}, run_id=final_run)
         else:
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, claim_expires = NULL, "
@@ -4255,9 +4288,9 @@ def _remote_merge_proof_is_real(
     repo = str(task["workspace_path"] or "").strip() if task else ""
     if not repo or not Path(repo).is_dir():
         return False
-    remote = str(merge.get("remote") or "origin").strip()
-    if not re.fullmatch(r"[A-Za-z0-9_./:@-]+", remote):
-        return False
+    # The repository's configured origin is authoritative; proof metadata
+    # cannot redirect verification to another remote.
+    remote = "origin"
     try:
         remote_url = subprocess.run(
             ["git", "-C", repo, "remote", "get-url", remote],
@@ -4269,10 +4302,13 @@ def _remote_merge_proof_is_real(
             ["git", "-C", repo, "ls-remote", "--symref", remote, "HEAD"],
             capture_output=True, text=True, timeout=20, check=True,
         ).stdout
-        default_branch = merge.get("default_branch")
-        if not isinstance(default_branch, str) or not default_branch.strip():
-            match = re.search(r"ref: refs/heads/([^\s]+)\s+HEAD", symref)
-            default_branch = match.group(1) if match else "main"
+        # The proof payload is evidence, not authority. Resolve the default
+        # branch from the remote's advertised HEAD every time; accepting a
+        # caller-supplied branch lets a topic branch masquerade as canonical.
+        match = re.search(r"ref: refs/heads/([^\s]+)\s+HEAD", symref)
+        if not match:
+            return False
+        default_branch = match.group(1)
         if not re.fullmatch(r"[A-Za-z0-9._/-]+", default_branch):
             return False
         advertised = subprocess.run(

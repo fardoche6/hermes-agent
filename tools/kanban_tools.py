@@ -1589,6 +1589,8 @@ KANBAN_COMPLETE_SCHEMA = {
                     "task in-flight so you can fix the path and retry."
                 ),
             },
+            "run_id": {"type": "integer", "description": "Dedicated finalization run id."},
+            "claim_lock": {"type": "string", "description": "Exact dedicated finalization claim lock."},
             "board": _board_schema_prop(),
         },
         "required": [],
