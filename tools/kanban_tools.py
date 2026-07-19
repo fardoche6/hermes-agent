@@ -647,7 +647,14 @@ def _handle_complete(args: dict, **kw) -> str:
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
-                    expected_run_id=_worker_run_id(tid),
+                    expected_run_id=(
+                        int(args["run_id"]) if args.get("run_id") is not None
+                        else _worker_run_id(tid)
+                    ),
+                    claimer=(
+                        str(args["claim_lock"]) if args.get("claim_lock")
+                        else os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+                    ),
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -741,7 +748,10 @@ def _handle_review_verdict(args: dict, **kw) -> str:
             )
             if not ok:
                 return tool_error(f"could not record verdict for {tid} (not an active review run)")
-            return _ok(task_id=tid, status="review_approved" if verdict == "approved" else "ready", verdict=verdict)
+            final_task = kb.get_task(conn, tid)
+            return _ok(task_id=tid, status="review_approved" if verdict == "approved" else "ready", verdict=verdict,
+                       finalization_run_id=(final_task.current_run_id if final_task and verdict == "approved" else None),
+                       finalization_claim_lock=(final_task.claim_lock if final_task and verdict == "approved" else None))
         finally:
             conn.close()
     except ValueError as e:
