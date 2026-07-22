@@ -5,6 +5,7 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 """
 
 import asyncio
+import datetime
 import json
 import logging
 import os
@@ -77,6 +78,7 @@ class GatewayRuntimeSnapshot:
     service_running: bool = False
     gateway_pids: tuple[int, ...] = ()
     service_scope: str | None = None
+    pending_restart: bool = False
 
     @property
     def running(self) -> bool:
@@ -958,6 +960,64 @@ def _read_systemd_unit_environment(system: bool = False) -> dict[str, str]:
     return parsed
 
 
+def _systemd_timestamp_to_epoch(value: str) -> float | None:
+    """Parse systemd's local ``ExecMainStartTimestamp`` value."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    for fmt in ("%a %Y-%m-%d %H:%M:%S %Z", "%a %Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            parsed = datetime.datetime.strptime(value, fmt)
+            return parsed.timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def _systemd_service_file_paths(properties: dict[str, str]) -> tuple[Path, ...]:
+    """Return config and environment files reported by ``systemctl show``."""
+    paths: list[Path] = []
+    for key in ("FragmentPath", "DropInPaths"):
+        for token in (properties.get(key) or "").split():
+            paths.append(Path(token))
+
+    # EnvironmentFiles appends metadata such as ``(ignore_errors=no)`` to each
+    # path.  Those metadata tokens are not paths and must not be stat'ed.
+    for token in (properties.get("EnvironmentFiles") or "").split():
+        if token.startswith("(") and token.endswith(")"):
+            continue
+        paths.append(Path(token))
+    return tuple(dict.fromkeys(paths))
+
+
+def _systemd_service_pending_restart(
+    *, system: bool = False, properties: dict[str, str] | None = None
+) -> bool:
+    """Whether a running systemd gateway has files newer than its process.
+
+    systemd exposes the unit fragment, drop-ins, environment files, and the
+    main process start timestamp through ``show``. Missing/unparseable data is
+    treated as no pending restart so status checks remain fail-safe.
+    """
+    props = properties or _read_systemd_unit_properties(
+        system=system,
+        properties=(
+            "MainPID",
+            "ExecMainStartTimestamp",
+            "FragmentPath",
+            "DropInPaths",
+            "EnvironmentFiles",
+        ),
+    )
+    start_time = _systemd_timestamp_to_epoch(props.get("ExecMainStartTimestamp", ""))
+    if start_time is None or _systemd_main_pid_from_props(props) is None:
+        return False
+    try:
+        return any(path.exists() and path.stat().st_mtime > start_time for path in _systemd_service_file_paths(props))
+    except OSError:
+        return False
+
+
 def _hermes_home_from_systemd_unit_file(system: bool = False) -> str | None:
     """Read ``HERMES_HOME`` from the on-disk unit file (not ``systemctl show``).
 
@@ -1349,12 +1409,26 @@ def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot
     if supports_systemd_services():
         selected_system, service_running = _probe_systemd_service_running(system=system)
         scope_label = _service_scope_label(selected_system)
+        service_properties = _read_systemd_unit_properties(
+            system=selected_system,
+            properties=(
+                "MainPID",
+                "ExecMainStartTimestamp",
+                "FragmentPath",
+                "DropInPaths",
+                "EnvironmentFiles",
+            ),
+        )
         return GatewayRuntimeSnapshot(
             manager=f"systemd ({scope_label})",
             service_installed=get_systemd_unit_path(system=selected_system).exists(),
             service_running=service_running,
             gateway_pids=gateway_pids,
             service_scope=scope_label,
+            pending_restart=service_running
+            and _systemd_service_pending_restart(
+                system=selected_system, properties=service_properties
+            ),
         )
 
     if is_macos():

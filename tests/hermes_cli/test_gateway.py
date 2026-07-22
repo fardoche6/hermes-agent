@@ -1,6 +1,7 @@
 """Tests for hermes_cli.gateway."""
 
 import argparse
+import datetime
 import os
 import pty
 import signal
@@ -12,6 +13,48 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 import hermes_cli.gateway as gateway
+
+
+def test_systemd_pending_restart_when_dropin_is_newer(tmp_path):
+    dropin = tmp_path / "override.conf"
+    dropin.write_text("[Service]\\n")
+    start = datetime.datetime.fromtimestamp(dropin.stat().st_mtime - 10)
+
+    assert gateway._systemd_service_pending_restart(
+        properties={
+            "MainPID": "123",
+            "ExecMainStartTimestamp": start.strftime("%a %Y-%m-%d %H:%M:%S"),
+            "DropInPaths": str(dropin),
+        }
+    ) is True
+
+
+def test_systemd_pending_restart_when_environment_file_is_newer(tmp_path):
+    env_file = tmp_path / "gateway.env"
+    env_file.write_text("TOKEN=value\\n")
+    start = datetime.datetime.fromtimestamp(env_file.stat().st_mtime - 10)
+
+    assert gateway._systemd_service_pending_restart(
+        properties={
+            "MainPID": "123",
+            "ExecMainStartTimestamp": start.strftime("%a %Y-%m-%d %H:%M:%S"),
+            "EnvironmentFiles": f"{env_file} (ignore_errors=no)",
+        }
+    ) is True
+
+
+def test_systemd_pending_restart_false_when_files_unchanged(tmp_path):
+    dropin = tmp_path / "override.conf"
+    dropin.write_text("[Service]\\n")
+    start = datetime.datetime.fromtimestamp(dropin.stat().st_mtime + 10)
+
+    assert gateway._systemd_service_pending_restart(
+        properties={
+            "MainPID": "123",
+            "ExecMainStartTimestamp": start.strftime("%a %Y-%m-%d %H:%M:%S"),
+            "DropInPaths": str(dropin),
+        }
+    ) is False
 
 
 def _install_fake_gateway_run(monkeypatch, start_gateway):
@@ -347,6 +390,35 @@ def test_run_gateway_replace_skips_existing_process_preflight(monkeypatch):
     gateway.run_gateway(replace=True)
 
     assert calls == [(True, 0)]
+
+
+def test_systemd_snapshot_includes_pending_restart_metadata(monkeypatch, tmp_path):
+    dropin = tmp_path / "override.conf"
+    dropin.write_text("[Service]\\n")
+    start = datetime.datetime.fromtimestamp(dropin.stat().st_mtime - 10)
+
+    monkeypatch.setattr(gateway, "is_termux", lambda: False)
+    monkeypatch.setattr(gateway, "is_linux", lambda: False)
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: True)
+    monkeypatch.setattr(gateway, "find_gateway_pids", lambda: [123])
+    monkeypatch.setattr(gateway, "_probe_systemd_service_running", lambda system=False: (False, True))
+    monkeypatch.setattr(gateway, "_service_scope_label", lambda system: "user")
+    monkeypatch.setattr(gateway, "get_systemd_unit_path", lambda system=False: dropin)
+    monkeypatch.setattr(
+        gateway,
+        "_read_systemd_unit_properties",
+        lambda **kwargs: {
+            "MainPID": "123",
+            "ExecMainStartTimestamp": start.strftime("%a %Y-%m-%d %H:%M:%S"),
+            "DropInPaths": str(dropin),
+        },
+    )
+
+    snapshot = gateway.get_gateway_runtime_snapshot()
+
+    assert snapshot.service_running is True
+    assert snapshot.pending_restart is True
+
 
 
 def test_s6_runtime_snapshot_reports_supervised_service(monkeypatch, tmp_path):
