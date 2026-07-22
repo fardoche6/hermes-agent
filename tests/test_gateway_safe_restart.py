@@ -42,6 +42,34 @@ def test_idle_excludes_current_task_but_not_other_work(tmp_path):
     assert [row["id"] for row in state["busy_tasks"]] == ["other"]
 
 
+def test_true_idle_window_returns_true_only_when_cards_and_gateway_children_are_absent(
+    monkeypatch, tmp_path
+):
+    board = tmp_path / "kanban.db"
+    make_board(board)
+    monkeypatch.setattr(MOD, "gateway_worker_descendants", lambda *_args: [])
+
+    assert MOD.true_idle_window([board], "restart", gateway_pids=[42]) is True
+
+
+def test_true_idle_window_blocks_on_active_card(monkeypatch, tmp_path):
+    board = tmp_path / "kanban.db"
+    make_board(board)
+    with sqlite3.connect(board) as db:
+        db.execute("INSERT INTO tasks VALUES ('other', 'running', NULL, NULL)")
+    monkeypatch.setattr(MOD, "gateway_worker_descendants", lambda *_args: [])
+
+    assert MOD.true_idle_window([board], "restart", gateway_pids=[42]) is False
+
+
+def test_true_idle_window_blocks_on_gateway_child(monkeypatch, tmp_path):
+    board = tmp_path / "kanban.db"
+    make_board(board)
+    monkeypatch.setattr(MOD, "gateway_worker_descendants", lambda *_args: [99])
+
+    assert MOD.true_idle_window([board], "restart", gateway_pids=[42]) is False
+
+
 def test_timeout_notifies_command_and_comments(tmp_path):
     board = tmp_path / "kanban.db"
     make_board(board)

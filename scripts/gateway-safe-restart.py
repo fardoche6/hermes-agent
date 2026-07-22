@@ -24,7 +24,6 @@ DEFAULT_SERVICES = (
     "hermes-gateway-secretary.service",
 )
 MAX_WAIT_SECONDS = 24 * 60 * 60
-_WORKER_MARKERS = ("hermes ", " hermes", "claude", "codex", "gemini", "spawn_agent", "tmux")
 
 
 def run(*argv: str, check: bool = True) -> str:
@@ -123,6 +122,26 @@ def _pid_alive(pid: object) -> bool:
         return False
 
 
+def true_idle_window(
+    databases: Iterable[Path],
+    task_id: str,
+    gateway_pids: Iterable[int],
+    exclude: set[int] | None = None,
+) -> bool:
+    """Return whether it is safe to restart the gateway fleet now.
+
+    The restart task itself is intentionally ignored, but every other running
+    or claimed card blocks.  The process check is independent of task state:
+    a worker can outlive its task-row update, so any live gateway descendant
+    also blocks.  This is deliberately a boolean fail-closed boundary for
+    callers that must decide whether to restart, rather than a diagnostic
+    snapshot that could be interpreted loosely.
+    """
+    state = idle_state(databases, task_id)
+    workers = gateway_worker_descendants(gateway_pids, exclude or {os.getpid()})
+    return not state["busy_tasks"] and not state["live_worker_runs"] and not workers
+
+
 def gateway_worker_descendants(gateway_pids: Iterable[int], exclude: set[int] | None = None) -> list[int]:
     excluded = exclude or set()
     children: dict[int, list[int]] = {}
@@ -141,10 +160,14 @@ def gateway_worker_descendants(gateway_pids: Iterable[int], exclude: set[int] | 
                 continue
             pending.append(pid)
             try:
-                cmdline = (Path(f"/proc/{pid}") / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").lower()
-            except OSError:
+                # Every non-zombie descendant belongs to the gateway service's
+                # process tree.  Do not rely on command-line markers: watchdogs
+                # and adapter helpers can use arbitrary executables and would
+                # otherwise create a false idle window.
+                stat = (Path(f"/proc/{pid}") / "stat").read_text().split()
+            except (OSError, ValueError, IndexError):
                 continue
-            if any(marker in cmdline for marker in _WORKER_MARKERS):
+            if len(stat) > 2 and stat[2] != "Z":
                 result.append(pid)
     return sorted(set(result))
 
@@ -180,7 +203,12 @@ def wait_for_idle(args: argparse.Namespace, services: tuple[str, ...], databases
             {os.getpid()},
         )
         snapshot = {"pending": pending, "idle": idle, "gateway_worker_children": workers}
-        if any(state["newer"] for state in pending.values()) and not idle["busy_tasks"] and not idle["live_worker_runs"] and not workers:
+        if any(state["newer"] for state in pending.values()) and true_idle_window(
+            databases,
+            args.task_id,
+            [state["pid"] for state in pending.values() if state["pid"]],
+            {os.getpid()},
+        ):
             return snapshot
         if args.once:
             print(json.dumps(snapshot, indent=2, sort_keys=True))
