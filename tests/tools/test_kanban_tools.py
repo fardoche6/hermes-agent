@@ -58,6 +58,7 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     expected = {
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
+        "kanban_unblock",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
@@ -89,13 +90,8 @@ def test_kanban_worker_env_overrides_profile_toolset_filter(monkeypatch, tmp_pat
     assert "kanban_list" not in names
 
 
-def test_worker_with_kanban_toolset_still_hides_board_routing(monkeypatch, tmp_path):
-    """Task scope wins over profile config for board-routing tools.
-
-    Even if a worker process happens to also have ``toolsets: [kanban]``
-    in its config, the HERMES_KANBAN_TASK env var means it's a focused
-    worker and must not see kanban_list / kanban_unblock.
-    """
+def test_worker_with_kanban_toolset_hides_board_listing_but_allows_scoped_unblock(monkeypatch, tmp_path):
+    """Task scope hides board listing but exposes safe review approval."""
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -110,13 +106,11 @@ def test_worker_with_kanban_toolset_still_hides_board_routing(monkeypatch, tmp_p
     schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
     names = {s["function"].get("name") for s in schema if "function" in s}
     kanban = {n for n in names if n and n.startswith("kanban_")}
-    assert {
-        "kanban_list",
-        "kanban_unblock",
-    }.isdisjoint(kanban), (
+    assert "kanban_list" not in kanban, (
         f"Board-routing tools leaked into worker schema: "
-        f"{kanban & {'kanban_list', 'kanban_unblock'}}"
+        f"{kanban & {'kanban_list'}}"
     )
+    assert "kanban_unblock" in kanban
 
 
 def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
@@ -734,6 +728,79 @@ def test_block_happy_path(worker_env):
         assert kb.get_task(conn, worker_env).status == "blocked"
     finally:
         conn.close()
+
+
+def test_review_handshake_unblocks_current_card_after_approval_comment(worker_env, monkeypatch):
+    """Block -> dispatcher route -> claimed reviewer -> exact approval -> ready."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    assert json.loads(kt._handle_block({"reason": "review-required: inspect"}))["ok"]
+    conn = kb.connect()
+    try:
+        assert kb.route_review_handoffs(conn) == [worker_env]
+        reviewer = kb.claim_task(
+            conn, worker_env, claimer="reviewer-lock"
+        )
+        reviewer_run_id = reviewer.current_run_id
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_PROFILE", "code-reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(reviewer_run_id))
+    assert json.loads(kt._handle_comment({
+        "task_id": worker_env,
+        "body": "REVIEW VERDICT: APPROVE\nEvidence: focused tests pass.",
+    }))["ok"]
+    result = json.loads(kt._handle_unblock({}))
+    assert result["ok"] is True
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task.status == "ready"
+        assert task.assignee == "test-worker"
+    finally:
+        conn.close()
+
+
+def test_review_approval_rejects_implementer_self_approval(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    assert json.loads(kt._handle_block({"reason": "review-required: inspect"}))["ok"]
+    conn = kb.connect()
+    try:
+        assert kb.route_review_handoffs(conn) == [worker_env]
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    out = kt._handle_unblock({})
+    assert "trusted current reviewer" in json.loads(out)["error"]
+
+
+def test_review_approval_rejects_forged_author_and_malformed_verdict(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    assert json.loads(kt._handle_block({"reason": "review-required: inspect"}))["ok"]
+    conn = kb.connect()
+    try:
+        kb.route_review_handoffs(conn)
+        reviewer = kb.claim_task(conn, worker_env, claimer="reviewer-lock")
+        run_id = reviewer.current_run_id
+        kb.add_comment(conn, worker_env, "programmer", "REVIEW VERDICT: APPROVE", run_id=run_id)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_PROFILE", "code-reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    assert "review state invalid" in json.loads(kt._handle_unblock({}))["error"]
+
+    conn = kb.connect()
+    try:
+        kb.add_comment(conn, worker_env, "code-reviewer", "REVIEW VERDICT: APPROVE-NOT-EXACT", run_id=run_id)
+    finally:
+        conn.close()
+    assert "review state invalid" in json.loads(kt._handle_unblock({}))["error"]
 
 
 def test_block_rejects_empty_reason(worker_env):

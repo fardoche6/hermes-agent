@@ -1102,6 +1102,7 @@ class Comment:
     author: str
     body: str
     created_at: int
+    run_id: Optional[int] = None
 
 
 @dataclass
@@ -1234,7 +1235,8 @@ CREATE TABLE IF NOT EXISTS task_comments (
     task_id    TEXT NOT NULL,
     author     TEXT NOT NULL,
     body       TEXT NOT NULL,
-    created_at INTEGER NOT NULL
+    created_at INTEGER NOT NULL,
+    run_id     INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_events (
@@ -2268,6 +2270,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     Called by ``init_db`` so opening an old DB is always safe.
     """
+    comment_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_comments'"
+    ).fetchone()
+    if comment_table:
+        comment_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_comments)")}
+        if "run_id" not in comment_cols:
+            _add_column_if_missing(conn, "task_comments", "run_id", "run_id INTEGER")
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     if "tenant" not in cols:
         _add_column_if_missing(conn, "tasks", "tenant", "tenant TEXT")
@@ -3510,7 +3519,8 @@ def parent_results(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, Op
 # ---------------------------------------------------------------------------
 
 def add_comment(
-    conn: sqlite3.Connection, task_id: str, author: str, body: str
+    conn: sqlite3.Connection, task_id: str, author: str, body: str,
+    *, run_id: Optional[int] = None,
 ) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
@@ -3523,11 +3533,14 @@ def add_comment(
         ).fetchone():
             raise ValueError(f"unknown task {task_id}")
         cur = conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (task_id, author.strip(), body.strip(), now),
+            "INSERT INTO task_comments (task_id, author, body, created_at, run_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (task_id, author.strip(), body.strip(), now, run_id),
         )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+        _append_event(
+            conn, task_id, "commented",
+            {"author": author, "len": len(body)}, run_id=run_id,
+        )
         return int(cur.lastrowid or 0)
 
 
@@ -3543,6 +3556,7 @@ def list_comments(conn: sqlite3.Connection, task_id: str) -> list[Comment]:
             author=r["author"],
             body=r["body"],
             created_at=r["created_at"],
+            run_id=(int(r["run_id"]) if r["run_id"] is not None else None),
         )
         for r in rows
     ]
@@ -5814,6 +5828,128 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+REVIEWER_PROFILES = frozenset({"code-reviewer", "code-reviewer-claudecode"})
+
+
+def route_review_handoffs(
+    conn: sqlite3.Connection, *, reviewer_profile: str = "code-reviewer",
+) -> list[str]:
+    """Dispatcher-owned routing for fresh review-required handoffs."""
+    if reviewer_profile not in REVIEWER_PROFILES:
+        raise ValueError("reviewer_profile must be an approved reviewer profile")
+    routed: list[str] = []
+    with write_txn(conn):
+        rows = conn.execute(
+            "SELECT id, assignee FROM tasks WHERE status = 'blocked'"
+        ).fetchall()
+        for row in rows:
+            latest = conn.execute(
+                "SELECT id, run_id, payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'blocked' ORDER BY id DESC LIMIT 1",
+                (row["id"],),
+            ).fetchone()
+            if latest is None:
+                continue
+            payload = json.loads(latest["payload"] or "{}")
+            if not str(payload.get("reason") or "").startswith("review-required:"):
+                continue
+            if conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'review_routed' "
+                "AND id > ? LIMIT 1", (row["id"], latest["id"])
+            ).fetchone():
+                continue
+            original = row["assignee"]
+            if original in REVIEWER_PROFILES:
+                continue
+            cur = conn.execute(
+                "UPDATE tasks SET assignee = ?, status = 'ready', "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+                "WHERE id = ? AND status = 'blocked'",
+                (reviewer_profile, row["id"]),
+            )
+            if cur.rowcount != 1:
+                continue
+            _append_event(conn, row["id"], "review_routed", {
+                "reviewer_profile": reviewer_profile,
+                "implementation_profile": original,
+                "implementation_run_id": latest["run_id"],
+                "blocked_event_id": latest["id"],
+            })
+            routed.append(row["id"])
+    return routed
+
+
+def approve_review_task(
+    conn: sqlite3.Connection, task_id: str, *, reviewer_run_id: int,
+    reviewer_profile: str,
+) -> bool:
+    """Atomically approve the current independent review run."""
+    if reviewer_profile not in REVIEWER_PROFILES:
+        return False
+    now = int(time.time())
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        run = conn.execute(
+            "SELECT profile, status, ended_at FROM task_runs WHERE id = ? AND task_id = ?",
+            (reviewer_run_id, task_id),
+        ).fetchone()
+        if (task is None or task["status"] != "running"
+                or task["assignee"] != reviewer_profile
+                or int(task["current_run_id"] or 0) != int(reviewer_run_id)
+                or run is None or run["profile"] != reviewer_profile
+                or run["status"] != "running" or run["ended_at"] is not None):
+            return False
+        blocked = conn.execute(
+            "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'blocked' ORDER BY id DESC LIMIT 1", (task_id,)
+        ).fetchone()
+        routed = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'review_routed' ORDER BY id DESC LIMIT 1", (task_id,)
+        ).fetchone()
+        if blocked is None or routed is None or int(routed["id"]) < int(blocked["id"]):
+            return False
+        blocked_payload = json.loads(blocked["payload"] or "{}")
+        routed_payload = json.loads(routed["payload"] or "{}")
+        if not str(blocked_payload.get("reason") or "").startswith("review-required:"):
+            return False
+        if (routed_payload.get("reviewer_profile") != reviewer_profile
+                or routed_payload.get("implementation_run_id") != blocked["run_id"]):
+            return False
+        comment = conn.execute(
+            "SELECT author, body, run_id FROM task_comments WHERE task_id = ? "
+            "ORDER BY id DESC LIMIT 1", (task_id,)
+        ).fetchone()
+        if (comment is None or comment["author"] != reviewer_profile
+                or int(comment["run_id"] or 0) != int(reviewer_run_id)
+                or (comment["body"].splitlines() or [""])[0].strip()
+                != "REVIEW VERDICT: APPROVE"):
+            return False
+        original = routed_payload.get("implementation_profile")
+        conn.execute(
+            "UPDATE task_runs SET status = 'done', outcome = 'approved', "
+            "summary = 'review approved', ended_at = ?, claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL WHERE id = ? AND ended_at IS NULL",
+            (now, reviewer_run_id),
+        )
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'ready', assignee = ?, current_run_id = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "consecutive_failures = 0, last_failure_error = NULL WHERE id = ? "
+            "AND status = 'running' AND current_run_id = ?",
+            (original, task_id, reviewer_run_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(conn, task_id, "review_approved", {
+            "reviewer_profile": reviewer_profile, "reviewer_run_id": reviewer_run_id,
+        }, run_id=reviewer_run_id)
+        return True
+
+
 def specify_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6643,6 +6779,7 @@ class DispatchResult:
     """Outcome of a single ``dispatch`` pass."""
 
     reclaimed: int = 0
+    review_routed: list[str] = field(default_factory=list)
     promoted: int = 0
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
@@ -8192,6 +8329,10 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    # Review handoffs are routed by the trusted dispatcher, not by a generic
+    # worker-controlled unblock. This also makes the no-manual-rescue path
+    # deterministic: the next claim is an independent reviewer run.
+    result.review_routed = route_review_handoffs(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather

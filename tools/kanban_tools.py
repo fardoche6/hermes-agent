@@ -124,6 +124,18 @@ def _check_kanban_orchestrator_mode() -> bool:
     return _profile_has_kanban_toolset()
 
 
+def _check_kanban_unblock_mode() -> bool:
+    """Expose ``kanban_unblock`` to orchestrators and scoped reviewers.
+
+    A reviewer is allowed to unblock only its own dispatched card; the
+    handler applies the stronger current-card and approval-comment checks.
+    Other board-routing tools remain orchestrator-only.
+    """
+    if _is_delegated_child_context():
+        return False
+    return bool(os.environ.get("HERMES_KANBAN_TASK")) or _profile_has_kanban_toolset()
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -879,7 +891,10 @@ def _handle_comment(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            cid = kb.add_comment(conn, tid, author=author, body=str(body))
+            cid = kb.add_comment(
+                conn, tid, author=author, body=str(body),
+                run_id=_worker_run_id(str(tid)),
+            )
             return _ok(task_id=tid, comment_id=cid)
         finally:
             conn.close()
@@ -1385,22 +1400,37 @@ def _handle_unblock(args: dict, **kw) -> str:
     delegated_err = _reject_delegated_child_mutation("kanban_unblock")
     if delegated_err:
         return delegated_err
-    guard = _require_orchestrator_tool("kanban_unblock")
-    if guard:
-        return guard
-    tid = args.get("task_id")
+    worker_scoped = bool(os.environ.get("HERMES_KANBAN_TASK"))
+    tid = _default_task_id(args.get("task_id")) if worker_scoped else args.get("task_id")
     if not tid:
-        return tool_error("task_id is required")
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
     ownership_err = _enforce_worker_task_ownership(str(tid))
     if ownership_err:
         return ownership_err
-    board = args.get("board")
+    profile = os.environ.get("HERMES_PROFILE") or ""
+    run_id = _worker_run_id(str(tid))
+    if worker_scoped:
+        if args.get("board"):
+            return tool_error(
+                "kanban_unblock rejects board overrides in dispatched-worker scope"
+            )
+        if profile not in {"code-reviewer", "code-reviewer-claudecode"} or run_id is None:
+            return tool_error(
+                "kanban_unblock is restricted to a trusted current reviewer run"
+            )
+    board = None if worker_scoped else args.get("board")
     try:
         kb, conn = _connect(board=board)
         try:
-            ok = kb.unblock_task(conn, str(tid))
+            if worker_scoped:
+                ok = kb.approve_review_task(
+                    conn, str(tid), reviewer_run_id=run_id,
+                    reviewer_profile=profile,
+                )
+            else:
+                ok = kb.unblock_task(conn, str(tid))
             if not ok:
-                return tool_error(f"could not unblock {tid} (not blocked or unknown)")
+                return tool_error(f"could not approve/unblock {tid} (review state invalid)")
             task = kb.get_task(conn, str(tid))
             return _ok(task_id=str(tid), status=task.status if task else None)
         finally:
@@ -2008,8 +2038,9 @@ KANBAN_UNBLOCK_SCHEMA = {
     "description": (
         "Unblock a Kanban task. It moves to ready when all parents are done, "
         "or todo while any parent remains open. Orchestrator-only — only "
-        "profiles with the kanban toolset can unblock routed work; "
-        "dispatcher-spawned task workers never see this tool."
+        "profiles with the kanban toolset can unblock routed work. A dispatched "
+        "independent reviewer may approve only its current card after posting "
+        "an exact REVIEW VERDICT: APPROVE comment; board overrides are rejected."
     ),
     "parameters": {
         "type": "object",
@@ -2142,7 +2173,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_UNBLOCK_SCHEMA,
     handler=_handle_unblock,
-    check_fn=_check_kanban_orchestrator_mode,
+    check_fn=_check_kanban_unblock_mode,
     emoji="▶",
 )
 
