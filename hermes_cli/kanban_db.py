@@ -5814,6 +5814,68 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+def approve_review_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: int,
+    reviewer_profile: str,
+) -> tuple[bool, str]:
+    """Atomically approve a claimed independent review run."""
+    approved_profiles = {"code-reviewer", "code-reviewer-claudecode"}
+    if reviewer_profile not in approved_profiles:
+        return False, "current profile is not an approved independent reviewer"
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        current = conn.execute(
+            "SELECT profile FROM task_runs WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+            (int(run_id), task_id),
+        ).fetchone()
+        prior = conn.execute(
+            """
+            SELECT 1 FROM task_runs
+             WHERE task_id = ? AND id != ? AND ended_at IS NOT NULL
+               AND outcome = 'blocked' AND summary LIKE 'review-required:%'
+               AND COALESCE(profile, '') != ?
+             LIMIT 1
+            """,
+            (task_id, int(run_id), reviewer_profile),
+        ).fetchone()
+        if row is None or row["status"] != "running" or row["current_run_id"] != int(run_id):
+            return False, "review run is not the task's current running run"
+        if current is None or current["profile"] != reviewer_profile:
+            return False, "review run profile is not trusted"
+        if prior is None:
+            return False, "no prior independent review-required implementation handoff"
+        conn.execute(
+            """
+            UPDATE task_runs
+               SET status = 'completed', outcome = 'completed',
+                   summary = 'review approved', ended_at = ?,
+                   claim_lock = NULL, claim_expires = NULL, worker_pid = NULL
+             WHERE id = ? AND task_id = ? AND ended_at IS NULL
+            """,
+            (now, int(run_id), task_id),
+        )
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'ready', current_run_id = NULL,
+                   claim_lock = NULL, claim_expires = NULL, worker_pid = NULL,
+                   consecutive_failures = 0, last_failure_error = NULL
+             WHERE id = ? AND status = 'running' AND current_run_id = ?
+            """,
+            (task_id, int(run_id)),
+        )
+        if cur.rowcount != 1:
+            return False, "task changed while approving review"
+        _append_event(conn, task_id, "review_approved", {"run_id": int(run_id)})
+        return True, "approved"
+
+
 def specify_triage_task(
     conn: sqlite3.Connection,
     task_id: str,

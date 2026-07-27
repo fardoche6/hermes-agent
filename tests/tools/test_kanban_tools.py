@@ -731,21 +731,76 @@ def test_block_happy_path(worker_env):
 
 
 def test_review_handshake_unblocks_current_card_after_approval_comment(worker_env):
-    """Worker evidence/block -> reviewer verdict -> scoped unblock is executable."""
+    """A non-review worker cannot use the approval transition."""
     from tools import kanban_tools as kt
-    from hermes_cli import kanban_db as kb
-
     assert json.loads(kt._handle_block({"reason": "review-required: inspect"}))["ok"]
     assert json.loads(kt._handle_comment({
         "task_id": worker_env,
         "body": "REVIEW VERDICT: APPROVE\nEvidence: focused tests pass.",
     }))["ok"]
     result = json.loads(kt._handle_unblock({}))
-    assert result["ok"] is True
+    assert "error" in result
+    assert "review approval" in result["error"]
 
+
+def test_implementation_worker_cannot_self_approve_review_block(worker_env):
+    from tools import kanban_tools as kt
+    assert json.loads(kt._handle_block({"reason": "review-required: inspect"}))["ok"]
+    assert json.loads(kt._handle_comment({
+        "task_id": worker_env,
+        "body": "REVIEW VERDICT: APPROVE\nself approval",
+    }))["ok"]
+    result = json.loads(kt._handle_unblock({}))
+    assert "error" in result
+    assert "review approval" in result["error"]
+
+
+def test_review_approval_rejects_cross_board_override(worker_env):
+    from tools import kanban_tools as kt
+    assert json.loads(kt._handle_block({"reason": "review-required: inspect"}))["ok"]
+    assert json.loads(kt._handle_comment({
+        "task_id": worker_env,
+        "body": "REVIEW VERDICT: APPROVE",
+    }))["ok"]
+    result = json.loads(kt._handle_unblock({"board": "other-board"}))
+    assert "error" in result
+    assert "board override" in result["error"]
+
+
+def test_claimed_independent_reviewer_approval_advances_card(monkeypatch, tmp_path):
+    from pathlib import Path as _Path
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "code-reviewer")
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
     conn = kb.connect()
     try:
-        assert kb.get_task(conn, worker_env).status == "ready"
+        tid = kb.create_task(conn, title="review-sequence", assignee="programmer")
+        kb.claim_task(conn, tid)
+        assert kb.block_task(conn, tid, reason="review-required: inspect")
+        kb.assign_task(conn, tid, "code-reviewer")
+        assert kb.unblock_task(conn, tid)
+        assert kb.claim_task(conn, tid)
+        current_run = kb.get_task(conn, tid).current_run_id
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(current_run))
+    assert json.loads(kt._handle_comment({
+        "task_id": tid,
+        "body": "REVIEW VERDICT: APPROVE",
+    }))["ok"]
+    result = json.loads(kt._handle_unblock({}))
+    assert result["ok"]
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, tid).status == "ready"
     finally:
         conn.close()
 

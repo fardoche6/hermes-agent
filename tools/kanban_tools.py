@@ -109,12 +109,11 @@ def _check_kanban_mode() -> bool:
 
 
 def _check_kanban_orchestrator_mode() -> bool:
-    """Board-routing tools (kanban_list, kanban_unblock) are intentionally
-    hidden from task workers.
+    """Board-routing tools (kanban_list) are intentionally hidden from task workers.
 
-    Dispatcher-spawned workers should close their own task via the
-    lifecycle tools (complete/block/heartbeat), not enumerate or unblock
-    board state. Profiles that explicitly opt into the kanban toolset
+    Dispatcher-spawned workers should close their own task via lifecycle
+    tools; approved reviewers receive only the scoped approval transition.
+    Profiles that explicitly opt into the kanban toolset
     and are NOT scoped to a single task are the orchestrator surface.
     """
     if _is_delegated_child_context():
@@ -1393,7 +1392,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
 
 def _handle_unblock(args: dict, **kw) -> str:
-    """Transition a blocked task to ready, or todo while parents remain open."""
+    """Approve the current review run or route a task from an orchestrator."""
     delegated_err = _reject_delegated_child_mutation("kanban_unblock")
     if delegated_err:
         return delegated_err
@@ -1404,27 +1403,34 @@ def _handle_unblock(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(str(tid))
     if ownership_err:
         return ownership_err
-    board = args.get("board")
+    if worker_scoped and args.get("board") is not None:
+        return tool_error("board override is forbidden for dispatched review approval")
+    board = None if worker_scoped else args.get("board")
     try:
         kb, conn = _connect(board=board)
         try:
             if worker_scoped:
-                # A scoped reviewer may only perform the second half of the
-                # documented review handshake. Requiring the durable approval
-                # comment prevents an arbitrary worker/tool call from reopening
-                # its card and keeps board-wide routing unavailable.
                 comments = kb.list_comments(conn, str(tid))
                 if not comments or not comments[-1].body.strip().startswith(
                     "REVIEW VERDICT: APPROVE"
                 ):
                     return tool_error(
-                        "kanban_unblock for a dispatched reviewer requires the "
-                        "latest same-card comment to start with "
-                        "'REVIEW VERDICT: APPROVE'"
+                        "kanban_unblock for a dispatched reviewer requires the latest "
+                        "same-card comment to start with 'REVIEW VERDICT: APPROVE'"
                     )
-            ok = kb.unblock_task(conn, str(tid))
-            if not ok:
-                return tool_error(f"could not unblock {tid} (not blocked or unknown)")
+                run_id = _worker_run_id(str(tid))
+                if run_id is None:
+                    return tool_error("review approval requires the dispatcher's current run id")
+                reviewer = os.environ.get("HERMES_PROFILE", "")
+                ok, reason = kb.approve_review_task(
+                    conn, str(tid), run_id=run_id, reviewer_profile=reviewer
+                )
+                if not ok:
+                    return tool_error(reason)
+            else:
+                ok = kb.unblock_task(conn, str(tid))
+                if not ok:
+                    return tool_error(f"could not unblock {tid} (not blocked or unknown)")
             task = kb.get_task(conn, str(tid))
             return _ok(task_id=str(tid), status=task.status if task else None)
         finally:
@@ -2030,21 +2036,22 @@ KANBAN_CREATE_SCHEMA = {
 KANBAN_UNBLOCK_SCHEMA = {
     "name": "kanban_unblock",
     "description": (
-        "Unblock a Kanban task. It moves to ready when all parents are done, "
-        "or todo while any parent remains open. Orchestrator-only — only "
-        "profiles with the kanban toolset can unblock routed work; "
-        "dispatcher-spawned task workers never see this tool."
+        "Approve the current independent review run, posting a durable "
+        "REVIEW VERDICT: APPROVE comment first. A dispatched reviewer can "
+        "advance only its own claimed review run; orchestrators may still "
+        "unblock routed work. Worker task_id defaults from HERMES_KANBAN_TASK "
+        "and caller-supplied board overrides are rejected in worker scope."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "task_id": {
                 "type": "string",
-                "description": "Blocked task id to move to ready or parent-gated todo.",
+                "description": "Task id; defaults to the dispatched current task.",
             },
             "board": _board_schema_prop(),
         },
-        "required": ["task_id"],
+        "required": [],
     },
 }
 
