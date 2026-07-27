@@ -124,6 +124,18 @@ def _check_kanban_orchestrator_mode() -> bool:
     return _profile_has_kanban_toolset()
 
 
+def _check_kanban_unblock_mode() -> bool:
+    """Expose ``kanban_unblock`` to orchestrators and scoped reviewers.
+
+    A reviewer is allowed to unblock only its own dispatched card; the
+    handler applies the stronger current-card and approval-comment checks.
+    Other board-routing tools remain orchestrator-only.
+    """
+    if _is_delegated_child_context():
+        return False
+    return bool(os.environ.get("HERMES_KANBAN_TASK")) or _profile_has_kanban_toolset()
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -1385,12 +1397,10 @@ def _handle_unblock(args: dict, **kw) -> str:
     delegated_err = _reject_delegated_child_mutation("kanban_unblock")
     if delegated_err:
         return delegated_err
-    guard = _require_orchestrator_tool("kanban_unblock")
-    if guard:
-        return guard
-    tid = args.get("task_id")
+    worker_scoped = bool(os.environ.get("HERMES_KANBAN_TASK"))
+    tid = _default_task_id(args.get("task_id")) if worker_scoped else args.get("task_id")
     if not tid:
-        return tool_error("task_id is required")
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
     ownership_err = _enforce_worker_task_ownership(str(tid))
     if ownership_err:
         return ownership_err
@@ -1398,6 +1408,20 @@ def _handle_unblock(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            if worker_scoped:
+                # A scoped reviewer may only perform the second half of the
+                # documented review handshake. Requiring the durable approval
+                # comment prevents an arbitrary worker/tool call from reopening
+                # its card and keeps board-wide routing unavailable.
+                comments = kb.list_comments(conn, str(tid))
+                if not comments or not comments[-1].body.strip().startswith(
+                    "REVIEW VERDICT: APPROVE"
+                ):
+                    return tool_error(
+                        "kanban_unblock for a dispatched reviewer requires the "
+                        "latest same-card comment to start with "
+                        "'REVIEW VERDICT: APPROVE'"
+                    )
             ok = kb.unblock_task(conn, str(tid))
             if not ok:
                 return tool_error(f"could not unblock {tid} (not blocked or unknown)")
@@ -2142,7 +2166,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_UNBLOCK_SCHEMA,
     handler=_handle_unblock,
-    check_fn=_check_kanban_orchestrator_mode,
+    check_fn=_check_kanban_unblock_mode,
     emoji="▶",
 )
 
