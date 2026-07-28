@@ -356,14 +356,10 @@ def test_codex_pool_refresh_holds_auth_store_lock_across_post(monkeypatch, tmp_p
     assert lock_held["during_post"] is True
 
 
-def test_inherited_codex_manual_device_code_alias_syncs_from_root(profile_and_root):
-    """A stale manual device-code alias must follow the inherited root grant.
-
-    Older auth flows left profile-local ``manual:device_code`` rows behind.
-    They shadow the root pool, but the provider state is still inherited from
-    root.  That exact combination must adopt the current root token pair;
-    otherwise one profile keeps replaying a superseded refresh chain.
-    """
+def test_profile_manual_device_code_stays_independent_without_local_singleton(
+    profile_and_root,
+):
+    """A manual profile account must not adopt root state by inheritance."""
     profile_path, root_path = profile_and_root
     _write_store(
         profile_path,
@@ -373,103 +369,13 @@ def test_inherited_codex_manual_device_code_alias_syncs_from_root(profile_and_ro
             "credential_pool": {
                 "openai-codex": [
                     {
-                        "id": "profile-alias",
-                        "label": "legacy-alias",
-                        "auth_type": "oauth",
-                        "priority": 0,
+                        "id": "profile-account",
                         "source": "manual:device_code",
-                        "access_token": "stale-access",
-                        "refresh_token": "stale-refresh",
-                    }
-                ]
-            },
-        },
-    )
-    _write_store(
-        root_path,
-        {
-            "version": 1,
-            "providers": {
-                "openai-codex": {
-                    "tokens": {
-                        "access_token": "canonical-access",
-                        "refresh_token": "canonical-refresh",
-                    }
-                }
-            },
-        },
-    )
-
-    pool = CredentialPool("openai-codex", [])
-    entry = _entry(
-        "openai-codex",
-        id="profile-alias",
-        access_token="stale-access",
-        refresh_token="stale-refresh",
-        source="manual:device_code",
-    )
-
-    synced = pool._sync_codex_entry_from_auth_store(entry)
-
-    assert synced.access_token == "canonical-access"
-    assert synced.refresh_token == "canonical-refresh"
-
-
-def test_inherited_manual_device_code_alias_rotation_writes_root(
-    profile_and_root,
-):
-    """A rotated inherited alias must publish the new refresh chain to root."""
-    profile_path, root_path = profile_and_root
-    _write_store(profile_path, {"version": 1, "providers": {}})
-    _write_store(
-        root_path,
-        {
-            "version": 1,
-            "providers": {
-                "openai-codex": {
-                    "tokens": {
-                        "access_token": "old-access",
-                        "refresh_token": "old-refresh",
-                    }
-                }
-            },
-        },
-    )
-
-    pool = CredentialPool("openai-codex", [])
-    pool._sync_device_code_entry_to_auth_store(
-        _entry(
-            "openai-codex",
-            id="profile-alias",
-            access_token="rotated-access",
-            refresh_token="rotated-refresh",
-            source="manual:device_code",
-        )
-    )
-
-    root = _read_store(root_path)
-    assert root["providers"]["openai-codex"]["tokens"] == {
-        "access_token": "rotated-access",
-        "refresh_token": "rotated-refresh",
-    }
-
-
-def test_profile_owned_codex_manual_device_code_remains_independent(
-    profile_and_root,
-):
-    """A profile-owned manual device-code account must not be clobbered."""
-    profile_path, root_path = profile_and_root
-    _write_store(
-        profile_path,
-        {
-            "version": 1,
-            "providers": {
-                "openai-codex": {
-                    "tokens": {
+                        "auth_type": "oauth",
                         "access_token": "profile-account",
                         "refresh_token": "profile-refresh",
                     }
-                }
+                ]
             },
         },
     )
@@ -499,6 +405,13 @@ def test_profile_owned_codex_manual_device_code_remains_independent(
 
     synced = pool._sync_codex_entry_from_auth_store(entry)
 
+    assert synced is entry
     assert synced.access_token == "profile-account"
     assert synced.refresh_token == "profile-refresh"
 
+    pool._sync_device_code_entry_to_auth_store(entry)
+    root = _read_store(root_path)
+    assert root["providers"]["openai-codex"]["tokens"] == {
+        "access_token": "root-account",
+        "refresh_token": "root-refresh",
+    }
