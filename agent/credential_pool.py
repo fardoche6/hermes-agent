@@ -30,6 +30,7 @@ from hermes_cli.auth import (
     _decode_jwt_claims,
     _load_auth_store,
     _load_provider_state,
+    _load_provider_state_with_source,
     _resolve_kimi_base_url,
     _resolve_zai_base_url,
     _save_auth_store,
@@ -40,6 +41,14 @@ from hermes_cli.auth import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _auth_state_is_inherited(source_path: Optional[Path]) -> bool:
+    """Return whether a provider state resolves from the global auth store."""
+    return bool(
+        source_path is not None
+        and not auth_mod._same_path(source_path, auth_mod._auth_file_path())
+    )
 
 
 def _load_config_safe() -> Optional[dict]:
@@ -776,7 +785,7 @@ class CredentialPool:
         return entry
 
     def _sync_codex_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
-        """Sync a Codex device_code pool entry from auth.json if tokens differ.
+        """Sync a Codex shared-grant pool entry from auth.json if tokens differ.
 
         When a Codex OAuth access token expires (or the ChatGPT account hits
         its 5h/weekly quota), the pool entry gets marked ``STATUS_EXHAUSTED``
@@ -788,16 +797,24 @@ class CredentialPool:
         though fresh credentials are sitting on disk — and every request
         fails with "no available entries (all exhausted or empty)".
 
-        Mirrors the Nous/Anthropic resync paths above.  Only applies to
-        device_code-sourced entries; env/API-key-sourced entries have no
-        auth.json shadow to sync from.
+        Mirrors the Nous/Anthropic resync paths above.  A legacy
+        ``manual:device_code`` row is also accepted when the profile inherits
+        the provider state from the global root.  Profile-owned manual rows
+        remain independent accounts and are not overwritten.
         """
-        if self.provider != "openai-codex" or entry.source != "device_code":
+        if self.provider != "openai-codex":
             return entry
         try:
             with _auth_store_lock():
                 auth_store = _load_auth_store()
-                state = _load_provider_state(auth_store, "openai-codex")
+                state, source_path = _load_provider_state_with_source(
+                    auth_store, "openai-codex"
+                )
+                inherited_state = _auth_state_is_inherited(source_path)
+            if entry.source == "manual:device_code" and not inherited_state:
+                return entry
+            if entry.source not in {"device_code", "manual:device_code"}:
+                return entry
             if not isinstance(state, dict):
                 return entry
             tokens = state.get("tokens")
@@ -1030,15 +1047,21 @@ class CredentialPool:
         whatever provider happened to refresh last, not whatever the
         user actually chose.
         """
-        # Only sync entries that were seeded *from* a singleton.  Manually
-        # added pool entries (source="manual:*") are independent credentials
-        # and must not write back to the singleton.  All singleton-seeded
-        # device-code sources (nous, openai-codex, xAI) use ``device_code``.
-        if entry.source != "device_code":
+        # Only sync entries that were seeded *from* a singleton.  A legacy
+        # ``manual:device_code`` row is shared only while its profile inherits
+        # provider state from the global root; profile-owned manual rows are
+        # independent credentials and must not write back to the singleton.
+        if entry.source not in {"device_code", "manual:device_code"}:
             return
         try:
             with _auth_store_lock():
                 auth_store = _load_auth_store()
+                _state, state_path = _load_provider_state_with_source(
+                    auth_store, self.provider
+                )
+                inherited_state = _auth_state_is_inherited(state_path)
+                if entry.source == "manual:device_code" and not inherited_state:
+                    return
                 # Decide BEFORE writing whether this profile is reading the
                 # grant from the global root (no own providers.<id> block) vs.
                 # genuinely shadowing it. A pool refresh rotates single-use

@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from hermes_cli import kanban_db as kb
+from hermes_cli import auth, kanban_db as kb
 
 
 @pytest.fixture
@@ -395,6 +395,58 @@ def test_claim_fails_on_non_ready(kanban_home):
         kb.link_tasks(conn, p, t)
         assert kb.get_task(conn, t).status == "todo"
         assert kb.claim_task(conn, t) is None
+
+
+def test_dispatch_blocks_irrecoverable_codex_oauth_before_claim(
+    kanban_home, monkeypatch
+):
+    """A dead Codex grant is a capability block, not a worker attempt."""
+    calls = 0
+
+    def fail_preflight(**_kwargs):
+        nonlocal calls
+        calls += 1
+        raise auth.AuthError(
+            "synthetic OAuth failure",
+            provider="openai-codex",
+            code="token_expired",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(auth, "resolve_codex_runtime_credentials", fail_preflight)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profile_exists", lambda _profile: True
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles.resolve_profile_env", lambda _profile: str(kanban_home)
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="codex capability gate",
+            assignee="synthetic-worker",
+            model_override="synthetic-codex-model",
+            provider_override="openai-codex",
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args: pytest.fail("claimed"),
+        )
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert calls == 1
+        assert result.spawned == []
+        assert result.skipped_capability[0][0] == task_id
+        assert task.status == "blocked"
+        assert task.block_kind == "capability"
+        events = kb.list_events(conn, task_id)
+        assert any("token_expired" in str(event.payload) for event in events)
+        assert any(
+            "hermes auth add openai-codex" in str(event.payload)
+            for event in events
+        )
 
 
 def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):

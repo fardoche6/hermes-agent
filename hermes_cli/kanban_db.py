@@ -6676,6 +6676,10 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_capability: list[tuple[str, str, str]] = field(default_factory=list)
+    """Tasks blocked before claim because the assigned provider capability
+    is irrecoverably unavailable. Entries are ``(task_id, assignee, reason)``.
+    """
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -8059,6 +8063,74 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def _profile_model_provider(profile: Optional[str]) -> str:
+    """Read a profile's primary model provider without changing global state."""
+    if not profile:
+        return ""
+    try:
+        from hermes_cli.profiles import resolve_profile_env
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from hermes_cli.config import load_config_readonly
+
+        hermes_home = resolve_profile_env(profile)
+        token = set_hermes_home_override(hermes_home)
+        try:
+            config = load_config_readonly()
+        finally:
+            reset_hermes_home_override(token)
+        model = config.get("model") if isinstance(config, dict) else None
+        if isinstance(model, dict):
+            return str(model.get("provider") or "").strip().lower()
+    except Exception:
+        _log.debug(
+            "kanban capability: unable to resolve model provider for %s",
+            profile,
+            exc_info=True,
+        )
+    return ""
+
+
+def _codex_capability_failure(task: Task) -> Optional[str]:
+    """Return a bounded remediation when Codex OAuth cannot serve this task.
+
+    This is deliberately a single resolver call. It refreshes once through the
+    canonical auth/pool path, but never invokes fallback providers. Only
+    ``relogin_required`` failures are dispatch blockers; transient network and
+    quota errors remain on the normal worker path.
+    """
+    provider = (
+        task.provider_override or _profile_model_provider(task.assignee)
+    ).strip().lower()
+    if provider != "openai-codex":
+        return None
+    profile_token = None
+    reset_profile_home = None
+    try:
+        from hermes_cli.auth import resolve_codex_runtime_credentials
+        from hermes_cli.profiles import resolve_profile_env
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        reset_profile_home = reset_hermes_home_override
+
+        if task.assignee:
+            profile_home = resolve_profile_env(task.assignee)
+            profile_token = set_hermes_home_override(profile_home)
+        resolve_codex_runtime_credentials(refresh_if_expiring=True)
+    except Exception as exc:
+        if not getattr(exc, "relogin_required", False):
+            return None
+        code = str(getattr(exc, "code", None) or "codex_auth_unavailable")
+        return (
+            "OpenAI Codex OAuth capability unavailable "
+            f"({code}); refresh/re-authenticate the assigned profile with "
+            "`hermes auth add openai-codex`, then unblock this task. "
+            "No provider fallback or retry was attempted."
+        )
+    finally:
+        if profile_token is not None and reset_profile_home is not None:
+            reset_profile_home(profile_token)
+    return None
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -8375,6 +8447,24 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        capability_task = get_task(conn, row["id"])
+        capability_reason = (
+            _codex_capability_failure(capability_task)
+            if capability_task is not None
+            else None
+        )
+        if capability_reason is not None:
+            result.skipped_capability.append(
+                (row["id"], row_assignee, capability_reason)
+            )
+            if not dry_run:
+                block_task(
+                    conn,
+                    row["id"],
+                    reason=capability_reason,
+                    kind="capability",
+                )
+            continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             # Increment per-profile counter even in dry_run so the cap
@@ -8474,6 +8564,24 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        capability_task = get_task(conn, row["id"])
+        capability_reason = (
+            _codex_capability_failure(capability_task)
+            if capability_task is not None
+            else None
+        )
+        if capability_reason is not None:
+            result.skipped_capability.append(
+                (row["id"], row["assignee"], capability_reason)
+            )
+            if not dry_run:
+                block_task(
+                    conn,
+                    row["id"],
+                    reason=capability_reason,
+                    kind="capability",
+                )
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
