@@ -30,6 +30,7 @@ from hermes_cli.auth import (
     _decode_jwt_claims,
     _load_auth_store,
     _load_provider_state,
+    _load_provider_state_with_source,
     _resolve_kimi_base_url,
     _resolve_zai_base_url,
     _save_auth_store,
@@ -40,6 +41,46 @@ from hermes_cli.auth import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _codex_account_identity(token: Any) -> Optional[str]:
+    claims = _decode_jwt_claims(token)
+    claim_sets = [claims]
+    auth_claims = claims.get("https://api.openai.com/auth")
+    if isinstance(auth_claims, dict):
+        claim_sets.append(auth_claims)
+    for claim_set in claim_sets:
+        for key in ("chatgpt_account_id", "account_id"):
+            value = claim_set.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _codex_tokens_match_account(left: Any, right: Any) -> bool:
+    if not isinstance(left, str) or not left.strip():
+        return False
+    if left == right:
+        return True
+    left_identity = _codex_account_identity(left)
+    right_identity = _codex_account_identity(right)
+    return bool(left_identity and left_identity == right_identity)
+
+
+def _codex_manual_alias_proven(
+    entry: "PooledCredential",
+    state: Any,
+    source_path: Optional[Path],
+) -> bool:
+    if source_path is None or auth_mod._same_path(source_path, auth_mod._auth_file_path()):
+        return False
+    if not isinstance(state, dict):
+        return False
+    tokens = state.get("tokens")
+    return isinstance(tokens, dict) and _codex_tokens_match_account(
+        entry.access_token,
+        tokens.get("access_token"),
+    )
 
 
 def _load_config_safe() -> Optional[dict]:
@@ -788,17 +829,24 @@ class CredentialPool:
         though fresh credentials are sitting on disk — and every request
         fails with "no available entries (all exhausted or empty)".
 
-        Mirrors the Nous/Anthropic resync paths above.  Only canonical
-        singleton-seeded ``device_code`` entries are synchronized. Manual
-        entries are independent credentials; inherited provider state alone
-        does not prove that a manual row belongs to the root account.
+        Mirrors the Nous/Anthropic resync paths above. Manual
+        entries are synchronized only when their token/account identity
+        explicitly proves they alias the inherited root grant; otherwise they
+        remain independent credentials.
         """
-        if self.provider != "openai-codex" or entry.source != "device_code":
+        if self.provider != "openai-codex":
             return entry
         try:
             with _auth_store_lock():
                 auth_store = _load_auth_store()
-                state = _load_provider_state(auth_store, "openai-codex")
+                state, source_path = _load_provider_state_with_source(
+                    auth_store, "openai-codex"
+                )
+                if entry.source == "manual:device_code":
+                    if not _codex_manual_alias_proven(entry, state, source_path):
+                        return entry
+                elif entry.source != "device_code":
+                    return entry
             if not isinstance(state, dict):
                 return entry
             tokens = state.get("tokens")
@@ -1031,13 +1079,21 @@ class CredentialPool:
         whatever provider happened to refresh last, not whatever the
         user actually chose.
         """
-        # Only sync entries that were seeded from a singleton. Manual entries
-        # are independent credentials and must not write back to the singleton.
-        if entry.source != "device_code":
+        # Manual entries are eligible only when their Codex token/account
+        # identity proves they alias the inherited root grant.
+        if entry.source not in {"device_code", "manual:device_code"}:
+            return
+        if entry.source == "manual:device_code" and self.provider != "openai-codex":
             return
         try:
             with _auth_store_lock():
                 auth_store = _load_auth_store()
+                if entry.source == "manual:device_code":
+                    state, source_path = _load_provider_state_with_source(
+                        auth_store, "openai-codex"
+                    )
+                    if not _codex_manual_alias_proven(entry, state, source_path):
+                        return
                 # Decide BEFORE writing whether this profile is reading the
                 # grant from the global root (no own providers.<id> block) vs.
                 # genuinely shadowing it. A pool refresh rotates single-use
