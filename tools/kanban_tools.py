@@ -977,6 +977,52 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error(f"kanban_block: {e}")
 
 
+def _handle_submit_review(args: dict, **kw) -> str:
+    tid = _default_task_id(args.get("task_id"))
+    reviewer = args.get("reviewer")
+    if not tid or not reviewer:
+        return tool_error("task_id and reviewer are required")
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            task = kb.submit_task_for_review(conn, tid, reviewer)
+            if task is None:
+                return tool_error(f"could not submit {tid} for review")
+            return _ok(task_id=tid, status=task.status, assignee=task.assignee)
+        finally:
+            conn.close()
+    except (RuntimeError, ValueError) as exc:
+        return tool_error(f"kanban_review: {exc}")
+
+
+def _handle_request_changes(args: dict, **kw) -> str:
+    tid = _default_task_id(args.get("task_id"))
+    programmer = args.get("programmer")
+    if not tid or not programmer:
+        return tool_error("task_id and programmer are required")
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            task = kb.request_changes(
+                conn, tid, programmer,
+                reason=args.get("reason"),
+                claimer=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"),
+            )
+            if task is None:
+                return tool_error(f"could not request changes for {tid}")
+            return _ok(task_id=tid, status=task.status, assignee=task.assignee)
+        finally:
+            conn.close()
+    except (RuntimeError, ValueError) as exc:
+        return tool_error(f"kanban_request_changes: {exc}")
+
+
 def _handle_heartbeat(args: dict, **kw) -> str:
     """Signal that the worker is still alive during a long operation.
 
@@ -1905,6 +1951,27 @@ KANBAN_BLOCK_SCHEMA = {
     },
 }
 
+KANBAN_REVIEW_SCHEMA = {
+    "name": "kanban_review",
+    "description": "Submit the current implementation run for code review; never use blocked for routine review.",
+    "parameters": {"type": "object", "properties": {
+        "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+        "reviewer": {"type": "string", "description": "Reviewer profile, such as code-reviewer"},
+        "board": _board_schema_prop(),
+    }, "required": ["reviewer"]},
+}
+
+KANBAN_REQUEST_CHANGES_SCHEMA = {
+    "name": "kanban_request_changes",
+    "description": "Return a review directly to a programmer implementation run on the same card.",
+    "parameters": {"type": "object", "properties": {
+        "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+        "programmer": {"type": "string", "description": "Programmer profile"},
+        "reason": {"type": "string", "description": "Review feedback"},
+        "board": _board_schema_prop(),
+    }, "required": ["programmer"]},
+}
+
 KANBAN_HEARTBEAT_SCHEMA = {
     "name": "kanban_heartbeat",
     "description": (
@@ -2315,6 +2382,24 @@ registry.register(
     handler=_handle_block,
     check_fn=_check_kanban_mode,
     emoji="⏸",
+)
+
+registry.register(
+    name="kanban_review",
+    toolset="kanban",
+    schema=KANBAN_REVIEW_SCHEMA,
+    handler=_handle_submit_review,
+    check_fn=_check_kanban_mode,
+    emoji="🔎",
+)
+
+registry.register(
+    name="kanban_request_changes",
+    toolset="kanban",
+    schema=KANBAN_REQUEST_CHANGES_SCHEMA,
+    handler=_handle_request_changes,
+    check_fn=_check_kanban_mode,
+    emoji="↩",
 )
 
 registry.register(

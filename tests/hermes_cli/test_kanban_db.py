@@ -377,6 +377,43 @@ def test_claim_once_wins_second_loses(kanban_home):
         assert second is None
 
 
+def test_explicit_review_lifecycle_reuses_same_card(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="implementation", assignee="programmer")
+        claimed = kb.claim_task(conn, task_id, claimer="impl:1")
+        assert claimed and claimed.status == "running"
+
+        reviewed = kb.submit_task_for_review(conn, task_id, "code-reviewer")
+        assert reviewed and reviewed.status == "review"
+        assert reviewed.assignee == "code-reviewer"
+        assert reviewed.claim_lock is None
+        assert kb.get_task(conn, task_id).status == "review"
+
+        reviewer = kb.claim_review_task(conn, task_id, claimer="review:1")
+        assert reviewer and reviewer.status == "running"
+        corrected = kb.request_changes(
+            conn, task_id, "programmer", reason="add regression coverage", claimer="impl:2"
+        )
+        assert corrected and corrected.status == "running"
+        assert corrected.assignee == "programmer"
+        assert corrected.claim_lock == "impl:2"
+        assert kb.get_task(conn, task_id).status not in {"blocked", "todo", "triage"}
+
+        events = [event.kind for event in kb.list_events(conn, task_id)]
+        assert "submitted_for_review" in events
+        assert "changes_requested" in events
+        assert len(kb.list_tasks(conn, status="review")) == 0
+
+
+def test_review_transition_rejects_unclaimed_running_task(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="unclaimed", assignee="programmer")
+        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
+        conn.commit()
+        with pytest.raises(RuntimeError, match="unclaimed"):
+            kb.submit_task_for_review(conn, task_id, "code-reviewer")
+
+
 def test_claim_uses_env_default_ttl(kanban_home, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_CLAIM_TTL_SECONDS", "3600")
     with kb.connect() as conn:
