@@ -8106,7 +8106,8 @@ def _codex_capability_failure(task: Task) -> Optional[str]:
     profile_token = None
     reset_profile_home = None
     try:
-        from hermes_cli.auth import resolve_codex_runtime_credentials
+        from agent.credential_pool import STATUS_EXHAUSTED, load_pool
+        from hermes_cli.auth import AuthError
         from hermes_cli.profiles import resolve_profile_env
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         reset_profile_home = reset_hermes_home_override
@@ -8114,7 +8115,23 @@ def _codex_capability_failure(task: Task) -> Optional[str]:
         if task.assignee:
             profile_home = resolve_profile_env(task.assignee)
             profile_token = set_hermes_home_override(profile_home)
-        resolve_codex_runtime_credentials(refresh_if_expiring=True)
+        pool = load_pool("openai-codex")
+        selected = pool.select()
+        if selected is None:
+            # CredentialPool handles terminal relogin failures by quarantining
+            # the authoritative shared root and its aliases. Transient quota
+            # failures remain on the normal worker path.
+            if any(
+                entry.last_status == STATUS_EXHAUSTED
+                for entry in pool._entries
+            ):
+                return None
+            raise AuthError(
+                "No usable Codex credentials remain after preflight",
+                provider="openai-codex",
+                code="codex_auth_unavailable",
+                relogin_required=True,
+            )
     except Exception as exc:
         if not getattr(exc, "relogin_required", False):
             return None

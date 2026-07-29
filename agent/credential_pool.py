@@ -1253,8 +1253,6 @@ class CredentialPool:
         self, entry: PooledCredential, *, force: bool
     ) -> Optional[PooledCredential]:
         """Refresh a shared Codex alias with a root lock-held RMW transaction."""
-        if entry.source != "manual:device_code":
-            return self._refresh_entry_impl(entry, force=force)
         profile_store = _load_auth_store()
         _, source_path = _load_provider_state_with_source(
             profile_store, "openai-codex"
@@ -1637,6 +1635,29 @@ class CredentialPool:
                         ]
                         if self._current_id in removed_ids:
                             self._current_id = None
+                        # A failed shared refresh must not leave a profile-local
+                        # provider copy shadowing the quarantined root grant.
+                        try:
+                            active_store = _load_auth_store()
+                            active_providers = active_store.get("providers")
+                            if isinstance(active_providers, dict):
+                                active_state = active_providers.get("openai-codex")
+                            else:
+                                active_state = None
+                            if (
+                                isinstance(active_state, dict)
+                                and str(
+                                    active_state.get(_CODEX_GRANT_ID_KEY) or ""
+                                ).strip()
+                                == grant_id
+                            ):
+                                active_providers.pop("openai-codex", None)
+                                _save_auth_store(active_store)
+                        except Exception as clear_exc:
+                            logger.debug(
+                                "Failed to clear shared Codex profile shadow: %s",
+                                clear_exc,
+                            )
                         self._persist(removed_ids=removed_ids)
                         return None
                     try:
@@ -2700,6 +2721,7 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                     "refresh_token": tokens.get("refresh_token"),
                     "base_url": "https://chatgpt.com/backend-api/codex",
                     "last_refresh": state.get("last_refresh"),
+                    "shared_grant_id": state.get("shared_grant_id"),
                     "label": custom_label or label_from_token(tokens.get("access_token", ""), "device_code"),
                 },
             )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -14,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from agent import credential_pool as CP
 from hermes_cli import auth, kanban_db as kb
 
 
@@ -415,6 +417,11 @@ def test_dispatch_blocks_irrecoverable_codex_oauth_before_claim(
 
     monkeypatch.setattr(auth, "resolve_codex_runtime_credentials", fail_preflight)
     monkeypatch.setattr(
+        CP,
+        "load_pool",
+        lambda _provider: CP.CredentialPool("openai-codex", []),
+    )
+    monkeypatch.setattr(
         "hermes_cli.profiles.profile_exists", lambda _profile: True
     )
     monkeypatch.setattr(
@@ -436,17 +443,163 @@ def test_dispatch_blocks_irrecoverable_codex_oauth_before_claim(
 
         task = kb.get_task(conn, task_id)
         assert task is not None
-        assert calls == 1
+        assert calls == 0
         assert result.spawned == []
         assert result.skipped_capability[0][0] == task_id
         assert task.status == "blocked"
         assert task.block_kind == "capability"
         events = kb.list_events(conn, task_id)
-        assert any("token_expired" in str(event.payload) for event in events)
+        assert any("codex_auth_unavailable" in str(event.payload) for event in events)
         assert any(
             "hermes auth add openai-codex" in str(event.payload)
             for event in events
         )
+
+
+def _configure_shared_codex_preflight_stores(
+    kanban_home, monkeypatch, *, alias_count=1
+):
+    profile_home = kanban_home / "profiles" / "synthetic-worker"
+    profile_path = profile_home / "auth.json"
+    root_path = kanban_home / "root-auth.json"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setattr(auth, "_auth_file_path", lambda: profile_path)
+    monkeypatch.setattr(auth, "_global_auth_file_path", lambda: root_path)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.resolve_profile_env",
+        lambda _profile: str(profile_home),
+    )
+    monkeypatch.setattr(CP, "_codex_access_token_is_expiring", lambda *_args: True)
+    aliases = [
+        {
+            "id": f"shared-alias-{index}",
+            "label": f"shared alias {index}",
+            "auth_type": "oauth",
+            "source": "manual:device_code",
+            "access_token": "preflight-access",
+            "refresh_token": "preflight-refresh",
+            "shared_grant_id": "shared-preflight-grant",
+        }
+        for index in range(alias_count)
+    ]
+    profile_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "providers": {},
+                "credential_pool": {"openai-codex": aliases},
+            }
+        ),
+        encoding="utf-8",
+    )
+    root_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "providers": {
+                    "openai-codex": {
+                        "shared_grant_id": "shared-preflight-grant",
+                        "tokens": {
+                            "access_token": "preflight-access",
+                            "refresh_token": "preflight-refresh",
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return profile_path, root_path
+
+
+def test_dispatch_codex_preflight_refreshes_shared_root_without_shadow(
+    kanban_home, monkeypatch
+):
+    profile_path, root_path = _configure_shared_codex_preflight_stores(
+        kanban_home, monkeypatch
+    )
+    monkeypatch.setattr(
+        auth,
+        "resolve_codex_runtime_credentials",
+        lambda **_kwargs: pytest.fail("singleton resolver used"),
+    )
+    monkeypatch.setattr(
+        auth,
+        "refresh_codex_oauth_pure",
+        lambda _access, _refresh: {
+            "access_token": "preflight-access-rotated",
+            "refresh_token": "preflight-refresh-rotated",
+            "last_refresh": "preflight",
+        },
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="codex shared preflight refresh",
+            assignee="synthetic-worker",
+            model_override="synthetic-codex-model",
+            provider_override="openai-codex",
+        )
+        result = kb.dispatch_once(conn, spawn_fn=lambda *_args: None)
+        task = kb.get_task(conn, task_id)
+
+    assert task.status == "running"
+    assert result.spawned[0][0] == task_id
+    root = json.loads(root_path.read_text(encoding="utf-8"))
+    assert root["providers"]["openai-codex"]["tokens"] == {
+        "access_token": "preflight-access-rotated",
+        "refresh_token": "preflight-refresh-rotated",
+    }
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    assert "openai-codex" not in profile.get("providers", {})
+
+
+def test_dispatch_codex_preflight_quarantines_shared_terminal_root(
+    kanban_home, monkeypatch
+):
+    profile_path, root_path = _configure_shared_codex_preflight_stores(
+        kanban_home, monkeypatch, alias_count=2
+    )
+    monkeypatch.setattr(
+        auth,
+        "resolve_codex_runtime_credentials",
+        lambda **_kwargs: pytest.fail("singleton resolver used"),
+    )
+
+    def fail_refresh(_access, _refresh):
+        raise auth.AuthError(
+            "synthetic invalid grant",
+            provider="openai-codex",
+            code="codex_refresh_failed",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(auth, "refresh_codex_oauth_pure", fail_refresh)
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="codex shared preflight terminal",
+            assignee="synthetic-worker",
+            model_override="synthetic-codex-model",
+            provider_override="openai-codex",
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args: pytest.fail("claimed"),
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert task.status == "blocked"
+    assert result.spawned == []
+    root = json.loads(root_path.read_text(encoding="utf-8"))
+    root_state = root["providers"]["openai-codex"]
+    assert root_state["tokens"] == {}
+    assert root_state["last_auth_error"]["code"] == "codex_refresh_failed"
+    assert root_state["last_auth_error"]["relogin_required"] is True
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    assert "openai-codex" not in profile.get("providers", {})
+    assert profile.get("credential_pool", {}).get("openai-codex", []) == []
 
 
 def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
