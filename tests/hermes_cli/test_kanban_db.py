@@ -603,6 +603,25 @@ def test_bounded_review_error_redacts_common_authorization_forms():
     assert len(value) <= 500
 
 
+@pytest.mark.parametrize(
+    ("error", "secrets", "diagnostic"),
+    [
+        ('API Error: 529 Overloaded {"api_key": "SECRETVALUE"}', ("SECRETVALUE",), "API Error: 529 Overloaded"),
+        ('API Error: 529 Overloaded {"password":"hunter2"}', ("hunter2",), "API Error: 529 Overloaded"),
+        ('API Error: 529 Overloaded {"TOKEN" : \'abcxyz\'}', ("abcxyz",), "API Error: 529 Overloaded"),
+        ('API Error: 529 Overloaded {\\"token\\": \\"escaped-secret\\"}', ("escaped-secret",), "API Error: 529 Overloaded"),
+        ('Cookie: session=first-secret; csrf=second-secret; theme=light', ("first-secret", "second-secret"), "Cookie:"),
+        ('Set-Cookie: session=first-secret; refresh=second-secret; Path=/', ("first-secret", "second-secret"), "Set-Cookie:"),
+    ],
+)
+def test_bounded_review_error_redacts_structured_credentials_and_all_cookie_values(error, secrets, diagnostic):
+    value = kb._bounded_review_error(error)
+    for secret in secrets:
+        assert secret not in value
+    assert diagnostic in value
+    assert len(value) <= 500
+
+
 def test_compact_receipt_tracks_latest_transition_without_history(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="compact", assignee="programmer")
