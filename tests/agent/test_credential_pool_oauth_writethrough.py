@@ -389,7 +389,7 @@ def test_proven_manual_codex_alias_rotates_through_inherited_root(
                 "openai-codex": {
                     "tokens": {
                         "access_token": root_token,
-                        "refresh_token": "root-refresh",
+                        "refresh_token": "old-refresh",
                     }
                 }
             },
@@ -419,7 +419,7 @@ def test_proven_manual_codex_alias_rotates_through_inherited_root(
     updated = pool._refresh_entry(entry, force=True)
 
     assert updated is not None
-    assert refresh_args == [(root_token, "root-refresh")]
+    assert refresh_args == [(root_token, "old-refresh")]
     assert updated.access_token == rotated_token
     assert updated.refresh_token == "rotated-refresh"
     root = _read_store(root_path)
@@ -429,11 +429,143 @@ def test_proven_manual_codex_alias_rotates_through_inherited_root(
     }
     profile = _read_store(profile_path)
     metadata = profile["credential_pool"]["openai-codex"][0][
-        "codex_root_alias_proof"
+        "shared_grant_id"
     ]
+    assert root["providers"]["openai-codex"]["shared_grant_id"] == metadata
+    assert len(metadata) == 32
     assert "shared-grant-old" not in metadata
-    assert "root-refresh" not in metadata
-    assert metadata == CP._codex_alias_fingerprint("root-refresh")
+    assert "old-refresh" not in metadata
+
+
+def test_codex_alias_adopts_out_of_band_rotation_by_grant_id(
+    profile_and_root, monkeypatch
+):
+    profile_path, root_path = profile_and_root
+    old_access = "g0-access"
+    old_refresh = "g0-refresh"
+    _write_store(
+        profile_path,
+        {"version": 1, "providers": {}, "credential_pool": {}},
+    )
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": old_access,
+                        "refresh_token": old_refresh,
+                    }
+                }
+            },
+        },
+    )
+    entry = _entry(
+        "openai-codex",
+        id="legacy-alias",
+        access_token=old_access,
+        refresh_token=old_refresh,
+        source="manual:device_code",
+    )
+    pool = CredentialPool("openai-codex", [entry])
+    entry = pool._sync_codex_entry_from_auth_store(entry)
+    grant_id = entry.extra["shared_grant_id"]
+    root = _read_store(root_path)
+    assert root["providers"]["openai-codex"]["shared_grant_id"] == grant_id
+
+    monkeypatch.setattr(
+        A,
+        "refresh_codex_oauth_pure",
+        lambda access, refresh: {
+            "access_token": "g1-access",
+            "refresh_token": "g1-refresh",
+            "last_refresh": "g1",
+        },
+    )
+    entry = pool._refresh_entry(entry, force=True)
+    assert entry.access_token == "g1-access"
+    assert entry.refresh_token == "g1-refresh"
+
+    root = _read_store(root_path)
+    root["providers"]["openai-codex"]["tokens"] = {
+        "access_token": "g2-access",
+        "refresh_token": "g2-refresh",
+    }
+    _write_store(root_path, root)
+
+    adopted = pool._sync_codex_entry_from_auth_store(entry)
+    assert adopted.access_token == "g2-access"
+    assert adopted.refresh_token == "g2-refresh"
+    assert adopted.extra["shared_grant_id"] == grant_id
+    fresh_alias = _entry(
+        "openai-codex",
+        id="fresh-alias",
+        access_token="g2-access",
+        refresh_token="g2-refresh",
+        source="manual:device_code",
+    )
+    fresh_alias = pool._sync_codex_entry_from_auth_store(fresh_alias)
+    assert fresh_alias.extra["shared_grant_id"] == grant_id
+
+
+def test_codex_alias_adopts_root_after_stale_snapshot_without_writing_local_rotation(
+    profile_and_root, monkeypatch
+):
+    profile_path, root_path = profile_and_root
+    _write_store(profile_path, {"version": 1, "providers": {}, "credential_pool": {}})
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "snapshot-access",
+                        "refresh_token": "snapshot-refresh",
+                    }
+                }
+            },
+        },
+    )
+    entry = _entry(
+        "openai-codex",
+        id="stale-alias",
+        access_token="snapshot-access",
+        refresh_token="snapshot-refresh",
+        source="manual:device_code",
+    )
+    pool = CredentialPool("openai-codex", [entry])
+    entry = pool._sync_codex_entry_from_auth_store(entry)
+    grant_id = entry.extra["shared_grant_id"]
+    refresh_calls = []
+
+    def stale_refresh(access, refresh):
+        refresh_calls.append((access, refresh))
+        root = _read_store(root_path)
+        root["providers"]["openai-codex"]["tokens"] = {
+            "access_token": "out-of-band-access",
+            "refresh_token": "out-of-band-refresh",
+        }
+        _write_store(root_path, root)
+        return {
+            "access_token": "discarded-access",
+            "refresh_token": "discarded-refresh",
+            "last_refresh": "discarded",
+        }
+
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", stale_refresh)
+    adopted = pool._refresh_entry(entry, force=True)
+
+    assert refresh_calls == [("snapshot-access", "snapshot-refresh")]
+    assert adopted.access_token == "out-of-band-access"
+    assert adopted.refresh_token == "out-of-band-refresh"
+    assert adopted.extra["shared_grant_id"] == grant_id
+    root = _read_store(root_path)
+    assert root["providers"]["openai-codex"]["tokens"] == {
+        "access_token": "out-of-band-access",
+        "refresh_token": "out-of-band-refresh",
+    }
 
 
 def test_profile_manual_device_code_stays_independent_without_local_singleton(
@@ -497,3 +629,55 @@ def test_profile_manual_device_code_stays_independent_without_local_singleton(
         "access_token": root_token,
         "refresh_token": "same-account-grant-root-refresh",
     }
+
+
+def test_codex_different_shared_grant_ids_stay_isolated(profile_and_root):
+    profile_path, root_path = profile_and_root
+    _write_store(
+        profile_path,
+        {
+            "version": 1,
+            "providers": {},
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "independent",
+                        "source": "manual:device_code",
+                        "auth_type": "oauth",
+                        "access_token": "same-account-current",
+                        "refresh_token": "same-account-refresh",
+                        "shared_grant_id": "independent-grant",
+                    }
+                ]
+            },
+        },
+    )
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "shared_grant_id": "root-grant",
+                    "tokens": {
+                        "access_token": "same-account-current",
+                        "refresh_token": "same-account-refresh",
+                    },
+                }
+            },
+        },
+    )
+    entry = _entry(
+        "openai-codex",
+        id="independent",
+        access_token="same-account-current",
+        refresh_token="same-account-refresh",
+        source="manual:device_code",
+    )
+    entry.extra["shared_grant_id"] = "independent-grant"
+    pool = CredentialPool("openai-codex", [entry])
+
+    synced = pool._sync_codex_entry_from_auth_store(entry)
+
+    assert synced is entry
+    assert synced.extra["shared_grant_id"] == "independent-grant"
