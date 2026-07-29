@@ -186,13 +186,13 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
         _log.debug("kanban lifecycle hook %s failed: %s", event, exc)
 
 
-# A running task's claim is valid for 15 minutes by default; after that the
+# A running task's claim is valid for two hours by default; after that the
 # next dispatcher tick reclaims it. Workers that outlive this window should
 # call ``heartbeat_claim(task_id)`` periodically. In practice most kanban
-# workloads either finish within 15m, set a longer claim explicitly, or use
+# workloads either finish within two hours, set a longer claim explicitly, or use
 # ``HERMES_KANBAN_CLAIM_TTL_SECONDS`` to raise the default claim window for
 # long single-call MCP workflows.
-DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
+DEFAULT_CLAIM_TTL_SECONDS = 2 * 60 * 60
 
 # If a worker's PID is still alive but its ``last_heartbeat_at`` is
 # older than this when ``release_stale_claims`` runs, treat the worker
@@ -4282,7 +4282,7 @@ def heartbeat_claim(
 ) -> bool:
     """Extend a running claim.  Returns True if we still own it.
 
-    Workers that know they'll exceed 15 minutes should call this every
+    Workers that know they'll exceed two hours should call this every
     few minutes to keep ownership.
     """
     expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -4313,7 +4313,8 @@ def release_stale_claims(
 
     A stale-by-TTL claim whose host-local worker PID is still alive is
     *extended* (with a ``claim_extended`` event) instead of being
-    reclaimed. Reclaiming a live worker mid-flight produces the spawn-
+    reclaimed. A claim with a heartbeat older than the one-hour backstop is
+    reclaimed even before its TTL expires. Reclaiming a live worker mid-flight produces the spawn-
     then-immediately-reclaim loop seen on slow models that spend longer
     than ``DEFAULT_CLAIM_TTL_SECONDS`` inside a single tool-free LLM
     call (#23025): no tool calls means no ``kanban_heartbeat``, even
@@ -4341,8 +4342,9 @@ def release_stale_claims(
         "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
-        "  AND claim_expires < ?",
-        (now,),
+        "  AND (claim_expires < ? OR "
+        "       (last_heartbeat_at IS NOT NULL AND last_heartbeat_at < ?))",
+        (now, now - DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS),
     ).fetchall()
     for row in stale:
         lock = row["claim_lock"] or ""
@@ -4406,7 +4408,10 @@ def release_stale_claims(
         if _worker_survived_termination(termination):
             _defer_reclaim_for_live_worker(
                 conn, row["id"], row["claim_lock"], now, termination,
-                reason="ttl_expired_worker_alive",
+                reason=(
+                    "heartbeat_stale_worker_alive"
+                    if heartbeat_stale else "ttl_expired_worker_alive"
+                ),
             )
             continue
         with write_txn(conn):
@@ -4414,8 +4419,13 @@ def release_stale_claims(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
-                "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (row["id"], row["claim_lock"], now),
+                "AND claim_expires IS NOT NULL "
+                "AND (claim_expires < ? OR "
+                "     (last_heartbeat_at IS NOT NULL AND last_heartbeat_at < ?))",
+                (
+                    row["id"], row["claim_lock"], now,
+                    now - DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS,
+                ),
             )
             if cur.rowcount != 1:
                 continue

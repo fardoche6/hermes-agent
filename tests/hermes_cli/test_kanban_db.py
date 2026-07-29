@@ -523,6 +523,35 @@ def test_stale_claim_with_live_pid_uses_env_ttl_override(
         assert task.claim_expires > int(time.time()) + 3000
 
 
+def test_stale_heartbeat_reclaimed_before_two_hour_claim_expires(
+    kanban_home, monkeypatch,
+):
+    """The one-hour wedged-worker backstop is independent of claim TTL."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kb._set_worker_pid(conn, t, 12345)
+        now = int(time.time())
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? WHERE id = ?",
+            (
+                now + kb.DEFAULT_CLAIM_TTL_SECONDS - 60,
+                now - kb.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS - 1,
+                t,
+            ),
+        )
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+        monkeypatch.setattr(_kb, "_worker_survived_termination", lambda _termination: False)
+        reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+        assert reclaimed == 1
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "ready"
+
+
 def test_stale_claim_deferred_when_live_worker_survives_termination(
     kanban_home, monkeypatch,
 ):

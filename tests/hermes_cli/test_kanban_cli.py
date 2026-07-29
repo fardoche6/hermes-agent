@@ -310,6 +310,31 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
     assert beta_titles == ["beta-task"]
 
 
+def test_claim_parser_and_explicit_ttl_override(kanban_home):
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+
+    default_args = parser.parse_args(["kanban", "claim", "t_demo"])
+    assert default_args.ttl == kb.DEFAULT_CLAIM_TTL_SECONDS == 2 * 60 * 60
+    explicit_args = parser.parse_args(["kanban", "claim", "t_demo", "--ttl", "37"])
+    assert explicit_args.ttl == 37
+
+    out = kc.run_slash("create 'ttl override'")
+    import re
+    match = re.search(r"(t_[a-f0-9]+)", out)
+    assert match is not None
+    tid = match.group(1)
+    import time
+    before = int(time.time())
+    assert "Claimed" in kc.run_slash(f"claim {tid} --ttl 37")
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.claim_expires is not None
+    assert before + 35 <= task.claim_expires <= before + 39
+
+
 # ---------------------------------------------------------------------------
 # Integration with the COMMAND_REGISTRY
 # ---------------------------------------------------------------------------
