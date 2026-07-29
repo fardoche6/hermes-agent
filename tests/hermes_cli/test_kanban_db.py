@@ -715,6 +715,59 @@ def test_stale_claim_reclaimed(kanban_home, monkeypatch):
         assert killed == [signal.SIGTERM]
 
 
+def test_null_claim_expiry_is_not_stale_by_itself_or_crash(kanban_home, monkeypatch):
+    """A schema-valid NULL expiry is an unleased claim, not an expired one."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="unleased review", assignee="reviewer")
+        conn.execute(
+            "UPDATE tasks SET status='review', claim_lock='remote:review', "
+            "claim_expires=NULL, worker_pid=12345, last_heartbeat_at=NULL "
+            "WHERE id=?",
+            (task_id,),
+        )
+        conn.commit()
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        assert kb.release_stale_claims(conn, signal_fn=lambda *_args: None) == 0
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "review"
+        assert task.claim_expires is None
+
+
+def test_null_claim_expiry_with_stale_heartbeat_reclaims_without_int_none(
+    kanban_home, monkeypatch,
+):
+    """Heartbeat backstop may select a NULL-expiry row; its payload stays NULL."""
+    import json
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="stale review", assignee="reviewer")
+        stale_heartbeat = int(time.time()) - kb.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS - 1
+        conn.execute(
+            "UPDATE tasks SET status='review', claim_lock='remote:review', "
+            "claim_expires=NULL, worker_pid=NULL, last_heartbeat_at=? "
+            "WHERE id=?",
+            (stale_heartbeat, task_id),
+        )
+        conn.commit()
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        assert kb.release_stale_claims(conn, signal_fn=lambda *_args: None) == 1
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "review"
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='reclaimed'",
+            (task_id,),
+        ).fetchone()
+        assert event is not None
+        assert json.loads(event["payload"])["claim_expires"] is None
+
+
 def test_default_claim_ttl_sets_two_hour_expiry(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="default lease", assignee="worker")

@@ -4823,7 +4823,10 @@ def release_stale_claims(
                     int(row["worker_pid"])
                     if row["worker_pid"] is not None else None
                 ),
-                "claim_expires": int(row["claim_expires"]),
+                "claim_expires": (
+                    int(row["claim_expires"])
+                    if row["claim_expires"] is not None else None
+                ),
                 "last_heartbeat_at": (
                     int(row["last_heartbeat_at"])
                     if row["last_heartbeat_at"] is not None else None
