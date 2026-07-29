@@ -309,13 +309,24 @@ def _resolve_task_or_error(task_id: str, board: Optional[str], tool_name: str, *
     # follow a task onto a different board discovered by the global search.
     if mutation:
         from hermes_cli import kanban_db as kb
-        target = str(board or kb.get_current_board()).strip().lower()
+        if board is None:
+            # Resolve the implicit target from the connection actually opened.
+            # ``get_current_board()`` only reflects HERMES_KANBAN_BOARD and can
+            # disagree with an inherited HERMES_KANBAN_DB path pin.
+            target_kb, target_conn = _connect()
+            try:
+                target = _connection_board(target_kb, target_conn)
+            finally:
+                target_conn.close()
+        else:
+            target = kb._normalize_board_slug(board) or kb.DEFAULT_BOARD
         if resolution.board != target:
             return None, _resolution_error(
                 tool_name,
                 _TaskBoardResolution(
                     "board_mismatch", board=resolution.board,
-                    boards=(resolution.board or "",),
+                    boards=resolution.boards,
+                    searched_boards=resolution.searched_boards,
                 ),
             )
     return resolution, None
