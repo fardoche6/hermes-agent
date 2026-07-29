@@ -2142,12 +2142,16 @@ def test_board_param_routes_show_to_alt_board(multi_board_env):
     from tools import kanban_tools as kt
 
     alt_seed = multi_board_env["alt_seed"]
-    # Without board override, the alt task is invisible.
-    bad = json.loads(kt._handle_show({"task_id": alt_seed}))
-    assert "not found" in bad.get("error", "")
+    # Without board override, a unique task on another live board is
+    # resolved globally and the owning board is reported.
+    inferred = json.loads(kt._handle_show({"task_id": alt_seed}))
+    assert inferred["board"] == "alt"
+    assert inferred["task"]["id"] == alt_seed
+    assert inferred["task"]["title"] == "seed-alt"
 
-    # With board override, it's readable.
+    # An explicit board remains a strict target.
     good = json.loads(kt._handle_show({"task_id": alt_seed, "board": "alt"}))
+    assert good["board"] == "alt"
     assert good["task"]["id"] == alt_seed
     assert good["task"]["title"] == "seed-alt"
 
