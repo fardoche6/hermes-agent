@@ -4422,10 +4422,37 @@ def _bounded_review_error(error: object) -> str:
     # shell-style assignments. Redact the value but retain the field name so
     # the diagnostic remains useful. Keep this deliberately bounded after
     # redaction because this string is persisted in task history.
+    cookie_attributes = {"domain", "expires", "httponly", "max-age", "path", "samesite", "secure"}
+
+    def redact_cookie_header(match: re.Match[str]) -> str:
+        header = match.group(1)
+        body = match.group(2)
+        is_set_cookie = header.lower() == "set-cookie"
+
+        def redact_pair(pair: re.Match[str]) -> str:
+            key = pair.group(1)
+            if is_set_cookie and key.lower() in cookie_attributes:
+                return pair.group(0)
+            return f"{key}{pair.group(2)}[REDACTED]"
+
+        body = re.sub(
+            r"(?i)([!#$%&'*+\-.^_`|~0-9a-z]+)(\s*=\s*)"
+            r"(?:\"[^\"]*\"|'[^']*'|[^;,\s]+)",
+            redact_pair,
+            body,
+        )
+        return f"{header}: {body}"
+
+    text = re.sub(
+        r"(?im)^(set-cookie|cookie)\s*:\s*([^\r\n]*)$",
+        redact_cookie_header,
+        text,
+    )
     text = re.sub(
         r"(?i)(authorization\s*[:=]\s*(?:(?:bearer|basic)\s+)?|bearer\s+|"
         r"(?:api[_ -]?key|access[_ -]?token|auth[_ -]?token|token|"
-        r"password|passwd|secret|cookie)\s*[:=]\s*)[^\s,;]+",
+        r"password|passwd|secret|cookie)\s*\\?[\"']?\s*[:=]\s*\\?[\"']?)"
+        r"[^\s,;\"'}]+",
         r"\1[REDACTED]",
         text,
     )
