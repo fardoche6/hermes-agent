@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import random
@@ -43,6 +44,14 @@ from hermes_cli.auth import (
 logger = logging.getLogger(__name__)
 
 _CODEX_ALIAS_PROOF_KEY = "codex_root_alias_proof"
+_CODEX_ALIAS_PROOF_DOMAIN = b"hermes:openai-codex:root-grant:v1:\x00"
+
+
+def _codex_alias_fingerprint(token: Any) -> str:
+    value = str(token or "").strip()
+    if not value:
+        return ""
+    return hashlib.sha256(_CODEX_ALIAS_PROOF_DOMAIN + value.encode()).hexdigest()
 
 
 def _codex_manual_alias_proven(
@@ -62,7 +71,10 @@ def _codex_manual_alias_proven(
     store_access = str(tokens.get("access_token") or "").strip()
     store_refresh = str(tokens.get("refresh_token") or "").strip()
     proof = str(entry.extra.get(_CODEX_ALIAS_PROOF_KEY) or "").strip()
-    if proof and proof in {store_access, store_refresh}:
+    if proof and proof in {
+        _codex_alias_fingerprint(store_access),
+        _codex_alias_fingerprint(store_refresh),
+    }:
         return True
     return bool(
         (entry_access and store_access and entry_access == store_access)
@@ -839,6 +851,7 @@ class CredentialPool:
                         str(token_state.get("refresh_token") or "").strip()
                         or str(token_state.get("access_token") or "").strip()
                     )
+                    proof = _codex_alias_fingerprint(proof)
                     if proof and entry.extra.get(_CODEX_ALIAS_PROOF_KEY) != proof:
                         extra = dict(entry.extra)
                         extra[_CODEX_ALIAS_PROOF_KEY] = proof

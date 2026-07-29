@@ -428,10 +428,12 @@ def test_proven_manual_codex_alias_rotates_through_inherited_root(
         "refresh_token": "rotated-refresh",
     }
     profile = _read_store(profile_path)
-    assert (
-        profile["credential_pool"]["openai-codex"][0]["codex_root_alias_proof"]
-        == "root-refresh"
-    )
+    metadata = profile["credential_pool"]["openai-codex"][0][
+        "codex_root_alias_proof"
+    ]
+    assert "shared-grant-old" not in metadata
+    assert "root-refresh" not in metadata
+    assert metadata == CP._codex_alias_fingerprint("root-refresh")
 
 
 def test_profile_manual_device_code_stays_independent_without_local_singleton(
