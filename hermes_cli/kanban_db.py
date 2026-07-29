@@ -4280,6 +4280,132 @@ def claim_review_task(
         return get_task(conn, task_id)
 
 
+def submit_task_for_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    reviewer: str,
+) -> Optional[Task]:
+    """Atomically hand an implementation run to a reviewer.
+
+    This is the only normal implementation -> review transition.  A claimed
+    ``running`` task, or a legacy ``blocked`` review handoff, may be submitted;
+    terminal and unrelated states are rejected.  The implementation run is
+    closed before the reviewer assignment is installed, so no claim or run is
+    orphaned.
+    """
+    reviewer = _canonical_assignee(reviewer)
+    if not reviewer:
+        raise ValueError("reviewer is required")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, claim_lock, current_run_id, assignee "
+            "FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if not row:
+            return None
+        if row["status"] not in {"running", "blocked"}:
+            raise RuntimeError(
+                f"cannot submit {task_id} for review from status {row['status']!r}"
+            )
+        if row["status"] == "blocked":
+            legacy = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? "
+                "AND kind='blocked' ORDER BY id DESC LIMIT 1", (task_id,),
+            ).fetchone()
+            try:
+                blocked_payload = json.loads(legacy["payload"]) if legacy and legacy["payload"] else {}
+            except (TypeError, ValueError):
+                blocked_payload = {}
+            if not str(blocked_payload.get("reason") or "").startswith("review-required:"):
+                raise RuntimeError(
+                    f"cannot submit {task_id} for review from unrelated blocked state"
+                )
+        if row["status"] == "running" and row["claim_lock"] is None:
+            raise RuntimeError(f"cannot submit {task_id}: running task is unclaimed")
+        old_run_id = _end_run(
+            conn, task_id, outcome="review_submitted", status="review",
+        )
+        conn.execute(
+            "UPDATE tasks SET status='review', assignee=?, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, block_kind=NULL, "
+            "block_recurrences=0 WHERE id=?",
+            (reviewer, task_id),
+        )
+        _append_event(
+            conn, task_id, "submitted_for_review",
+            {"reviewer": reviewer, "previous_assignee": row["assignee"]},
+            run_id=old_run_id,
+        )
+        return get_task(conn, task_id)
+
+
+def request_changes(
+    conn: sqlite3.Connection,
+    task_id: str,
+    programmer: str,
+    *,
+    reason: Optional[str] = None,
+    claimer: Optional[str] = None,
+    ttl_seconds: Optional[int] = None,
+) -> Optional[Task]:
+    """Return a review directly to a claimed programmer implementation run.
+
+    The same card is reused and is never parked in ``blocked``, ``todo``, or
+    ``triage``.  The reviewer run is closed, the programmer is assigned, and a
+    fresh claim/run is created in one transaction.
+    """
+    programmer = _canonical_assignee(programmer)
+    if not programmer:
+        raise ValueError("programmer is required")
+    now = int(time.time())
+    lock = claimer or _claimer_id()
+    expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, claim_lock, assignee, max_runtime_seconds, "
+            "current_step_key FROM tasks WHERE id=?", (task_id,),
+        ).fetchone()
+        if not row:
+            return None
+        if row["status"] not in {"review", "running"}:
+            raise RuntimeError(
+                f"cannot request changes for {task_id} from status {row['status']!r}"
+            )
+        if row["status"] == "running" and row["claim_lock"] is None:
+            raise RuntimeError(f"cannot request changes for {task_id}: unclaimed run")
+        reviewer_run_id = _end_run(
+            conn, task_id, outcome="changes_requested", status="running",
+            summary=reason,
+        )
+        conn.execute(
+            "UPDATE tasks SET status='running', assignee=?, claim_lock=?, "
+            "claim_expires=?, started_at=COALESCE(started_at, ?), "
+            "completed_at=NULL, block_kind=NULL WHERE id=?",
+            (programmer, lock, expires, now, task_id),
+        )
+        run_cur = conn.execute(
+            "INSERT INTO task_runs (task_id, profile, step_key, status, "
+            "claim_lock, claim_expires, max_runtime_seconds, started_at) "
+            "VALUES (?, ?, ?, 'running', ?, ?, ?, ?)",
+            (task_id, programmer, row["current_step_key"], lock, expires,
+             row["max_runtime_seconds"], now),
+        )
+        run_id = int(run_cur.lastrowid)
+        conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, task_id))
+        _append_event(
+            conn, task_id, "changes_requested",
+            {"programmer": programmer, "reason": reason, "run_id": run_id},
+            run_id=reviewer_run_id,
+        )
+        _append_event(
+            conn, task_id, "claimed",
+            {"lock": lock, "expires": expires, "run_id": run_id,
+             "source_status": "review_changes_requested"},
+            run_id=run_id,
+        )
+        return get_task(conn, task_id)
+
+
 def heartbeat_claim(
     conn: sqlite3.Connection,
     task_id: str,

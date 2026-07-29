@@ -641,6 +641,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         ),
     )
 
+    p_review = sub.add_parser("review", help="Submit an implementation to review")
+    p_review.add_argument("task_id")
+    p_review.add_argument("reviewer", help="Reviewer profile")
+
+    p_changes = sub.add_parser("request-changes", help="Return a review to implementation")
+    p_changes.add_argument("task_id")
+    p_changes.add_argument("programmer", help="Programmer profile")
+    p_changes.add_argument("reason", nargs="*", help="Review feedback")
+
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
     p_schedule.add_argument("reason", nargs="*", help="Reason/timing note (also appended as a comment)")
@@ -1067,6 +1076,8 @@ def kanban_command(args: argparse.Namespace) -> int:
             "complete": _cmd_complete,
             "edit":     _cmd_edit,
             "block":    _cmd_block,
+            "review":   _cmd_review,
+            "request-changes": _cmd_request_changes,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
@@ -1130,6 +1141,8 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "attach",
     "attach-rm",
     "complete",
+    "review",
+    "request-changes",
     "edit",
     "block",
     "schedule",
@@ -2255,6 +2268,29 @@ def _cmd_edit(args: argparse.Namespace) -> int:
             )
             return 1
     print(f"Edited {args.task_id}")
+    return 0
+
+
+def _cmd_review(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        task = kb.submit_task_for_review(conn, args.task_id, args.reviewer)
+    if task is None:
+        print(f"cannot submit {args.task_id} for review: task not found", file=sys.stderr)
+        return 1
+    print(f"Submitted {args.task_id} for review → {task.assignee}")
+    return 0
+
+
+def _cmd_request_changes(args: argparse.Namespace) -> int:
+    reason = " ".join(args.reason).strip() if args.reason else None
+    with kb.connect_closing() as conn:
+        task = kb.request_changes(
+            conn, args.task_id, args.programmer, reason=reason,
+        )
+    if task is None:
+        print(f"cannot request changes for {args.task_id}: task not found", file=sys.stderr)
+        return 1
+    print(f"Requested changes on {args.task_id} → {task.assignee} ({task.status})")
     return 0
 
 
