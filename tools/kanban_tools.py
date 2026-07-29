@@ -255,10 +255,13 @@ def _resolve_task_board(
             if conn is not None:
                 conn.close()
 
-    normalized_explicit = (
-        kb._normalize_board_slug(explicit_board)
-        if explicit_board is not None else None
-    )
+    try:
+        normalized_explicit = (
+            kb._normalize_board_slug(explicit_board)
+            if explicit_board is not None else None
+        )
+    except ValueError as exc:
+        return _TaskBoardResolution("invalid_board", board=str(exc), searched_boards=searched)
     candidates = tuple(slug for slug, _ in hits)
     if normalized_explicit is not None:
         target_hits = [(slug, task) for slug, task in hits if slug == normalized_explicit]
@@ -279,13 +282,20 @@ def _resolve_task_board(
 
 def _resolution_error(tool_name: str, resolution: _TaskBoardResolution) -> str:
     """Map resolver outcomes to stable, machine-readable tool errors."""
+    if resolution.kind == "invalid_board":
+        return tool_error(f"{tool_name}: invalid board: {resolution.board}")
     if resolution.kind == "board_mismatch":
         owner = resolution.board or "unknown"
+        details = {
+            "error_kind": "board_mismatch",
+            "board": owner,
+            "searched_boards": list(resolution.searched_boards),
+        }
+        if resolution.boards:
+            details["boards"] = list(resolution.boards)
         return tool_error(
             f"{tool_name}: task belongs to board {owner!r}; retry with board={owner}",
-            error_kind="board_mismatch",
-            board=owner,
-            searched_boards=list(resolution.searched_boards),
+            **details,
         )
     if resolution.kind == "ambiguous_board":
         return tool_error(
@@ -519,7 +529,7 @@ def _task_summary_dict(kb, conn, task, *, board: Optional[str] = None) -> dict[s
 # Handlers
 # ---------------------------------------------------------------------------
 
-def _connection_board(kb, conn) -> str:
+def _connection_board(kb, conn) -> Optional[str]:
     """Return the canonical board owning an opened sqlite connection."""
     db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve()
     for meta in kb.list_boards(include_archived=False):
@@ -528,7 +538,7 @@ def _connection_board(kb, conn) -> str:
                      else kb.board_dir(slug) / "kanban.db").resolve()
         if candidate == db_path:
             return slug
-    return kb.DEFAULT_BOARD
+    return None
 
 def _handle_show(args: dict, **kw) -> str:
     """Read a task's full state: task row, parents, children, comments,
