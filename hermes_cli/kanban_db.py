@@ -4386,6 +4386,57 @@ def submit_review(
     return True
 
 
+def queue_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reviewer_profile: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> bool:
+    """Queue a running implementation card for an independent reviewer."""
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row or row["status"] != "running" or row["current_run_id"] is None:
+            return False
+        implementer = row["assignee"]
+        reviewer = (
+            _canonical_assignee(reviewer_profile)
+            if reviewer_profile else _reviewer_profile(implementer)
+        )
+        if not reviewer or reviewer == implementer:
+            return False
+        source = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? "
+            "AND kind = 'claimed' ORDER BY id DESC LIMIT 1",
+            (task_id, int(row["current_run_id"])),
+        ).fetchone()
+        try:
+            source_payload = json.loads(source["payload"]) if source and source["payload"] else {}
+        except (TypeError, json.JSONDecodeError):
+            source_payload = {}
+        if source_payload.get("source_status") != "implementation":
+            return False
+        conn.execute(
+            "UPDATE tasks SET status = 'review', assignee = ?, claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL WHERE id = ? AND status = 'running'",
+            (reviewer, task_id),
+        )
+        run_id = _end_run(
+            conn, task_id, outcome="review_submitted", status="review_submitted",
+            summary=summary, metadata=metadata,
+        )
+        _append_event(
+            conn, task_id, "review_submitted",
+            {"reviewer": reviewer, "summary": summary, "metadata": metadata},
+            run_id=run_id,
+        )
+    return True
+
+
 def review_verdict(
     conn: sqlite3.Connection,
     task_id: str,

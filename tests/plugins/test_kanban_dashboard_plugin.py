@@ -475,6 +475,25 @@ def test_patch_status_complete(client):
     assert any(x["id"] == t["id"] for x in done["tasks"])
 
 
+def test_patch_status_review_assigns_reviewer_and_returns_readback(client, kanban_home):
+    conn = kb.connect(kanban_home / "kanban.db")
+    try:
+        task_id = kb.create_task(conn, title="review me", assignee="programmer")
+        assert kb.claim_task(conn, task_id, claimer="host:implementer") is not None
+    finally:
+        conn.close()
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"status": "review", "reviewer": "code-reviewer", "summary": "handoff"},
+    )
+    assert response.status_code == 200
+    assert response.json()["task"]["status"] == "review"
+    assert response.json()["task"]["assignee"] == "code-reviewer"
+    assert response.json()["task"]["claim_lock"] is None
+    assert response.json()["task"]["current_run_id"] is None
+
+
 def test_patch_block_then_unblock(client):
     t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
     r = client.patch(

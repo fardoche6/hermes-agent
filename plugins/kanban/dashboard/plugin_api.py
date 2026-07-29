@@ -817,6 +817,7 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
 class UpdateTaskBody(BaseModel):
     status: Optional[str] = None
     assignee: Optional[str] = None
+    reviewer: Optional[str] = None
     priority: Optional[int] = None
     title: Optional[str] = None
     body: Optional[str] = None
@@ -846,7 +847,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
 
         # --- assignee ----------------------------------------------------
-        if payload.assignee is not None:
+        if payload.assignee is not None and payload.status != "review":
             try:
                 ok = kanban_db.assign_task(
                     conn, task_id, payload.assignee or None,
@@ -867,6 +868,17 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     summary=payload.summary,
                     metadata=payload.metadata,
                 )
+            elif s == "review":
+                try:
+                    ok = kanban_db.queue_review(
+                        conn,
+                        task_id,
+                        reviewer_profile=payload.reviewer or payload.assignee,
+                        summary=payload.summary or payload.result,
+                        metadata=payload.metadata,
+                    )
+                except ValueError as e:
+                    raise HTTPException(status_code=409, detail=str(e))
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
             elif s == "scheduled":

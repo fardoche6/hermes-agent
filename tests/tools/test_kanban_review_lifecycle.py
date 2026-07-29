@@ -113,6 +113,29 @@ def test_approved_verdict_completes_only_reviewers_claimed_card(tmp_path, monkey
         conn.close()
 
 
+def test_dashboard_style_review_queue_assigns_reviewer_on_same_card(tmp_path, monkeypatch):
+    kb = _db(tmp_path, monkeypatch)
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="dashboard handoff", assignee="programmer")
+        implementation = kb.claim_task(conn, task_id, claimer="host:implementer")
+        assert implementation is not None
+        assert kb.queue_review(
+            conn,
+            task_id,
+            reviewer_profile="code-reviewer",
+            summary="ready for independent review",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "review"
+        assert task.assignee == "code-reviewer"
+        assert task.claim_lock is None
+        assert task.current_run_id is None
+    finally:
+        conn.close()
+
+
 def test_review_handlers_fail_closed_without_exact_worker_tokens(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_missing")
