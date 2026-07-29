@@ -31,6 +31,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -209,7 +211,135 @@ def _connect(board: Optional[str] = None):
     the env-pinned active board without restarting Hermes.
     """
     from hermes_cli import kanban_db as kb
-    return kb, kb.connect(board=board)
+    if board is not None:
+        # An explicit tool target must beat the worker's inherited
+        # HERMES_KANBAN_DB pin; resolve the canonical board path directly.
+        slug = kb._normalize_board_slug(board) or kb.DEFAULT_BOARD
+        path = (
+            kb.kanban_home() / "kanban.db"
+            if slug == kb.DEFAULT_BOARD
+            else kb.board_dir(slug) / "kanban.db"
+        )
+        return kb, kb.connect(db_path=path)
+    return kb, kb.connect()
+
+
+@dataclass(frozen=True)
+class _TaskBoardResolution:
+    """Result of resolving a task id across the live board set."""
+
+    kind: str
+    board: Optional[str] = None
+    task: Any = None
+    boards: tuple[str, ...] = ()
+    searched_boards: tuple[str, ...] = ()
+
+
+def _resolve_task_board(
+    task_id: str,
+    explicit_board: Optional[str] = None,
+) -> _TaskBoardResolution:
+    """Find ``task_id`` across the live boards, honoring explicit targets."""
+    from hermes_cli import kanban_db as kb
+
+    searched = tuple(str(item["slug"]) for item in kb.list_boards(include_archived=False))
+    hits: list[tuple[str, Any]] = []
+    for slug in searched:
+        conn = None
+        try:
+            _, conn = _connect(board=slug)
+            task = kb.get_task(conn, str(task_id))
+            if task is not None:
+                hits.append((slug, task))
+        finally:
+            if conn is not None:
+                conn.close()
+
+    try:
+        normalized_explicit = (
+            kb._normalize_board_slug(explicit_board)
+            if explicit_board is not None else None
+        )
+    except ValueError as exc:
+        return _TaskBoardResolution("invalid_board", board=str(exc), searched_boards=searched)
+    candidates = tuple(slug for slug, _ in hits)
+    if normalized_explicit is not None:
+        target_hits = [(slug, task) for slug, task in hits if slug == normalized_explicit]
+        if target_hits:
+            owner, task = target_hits[0]
+            return _TaskBoardResolution("found", owner, task, candidates, searched)
+        if hits:
+            owner, task = hits[0]
+            return _TaskBoardResolution("board_mismatch", owner, task, candidates, searched)
+        return _TaskBoardResolution("not_found", searched_boards=searched)
+    if len(hits) > 1:
+        return _TaskBoardResolution("ambiguous_board", boards=candidates, searched_boards=searched)
+    if not hits:
+        return _TaskBoardResolution("not_found", searched_boards=searched)
+    owner, task = hits[0]
+    return _TaskBoardResolution("found", owner, task, candidates, searched)
+
+
+def _resolution_error(tool_name: str, resolution: _TaskBoardResolution) -> str:
+    """Map resolver outcomes to stable, machine-readable tool errors."""
+    if resolution.kind == "invalid_board":
+        return tool_error(f"{tool_name}: invalid board: {resolution.board}")
+    if resolution.kind == "board_mismatch":
+        owner = resolution.board or "unknown"
+        details = {
+            "error_kind": "board_mismatch",
+            "board": owner,
+            "searched_boards": list(resolution.searched_boards),
+        }
+        if resolution.boards:
+            details["boards"] = list(resolution.boards)
+        return tool_error(
+            f"{tool_name}: task belongs to board {owner!r}; retry with board={owner}",
+            **details,
+        )
+    if resolution.kind == "ambiguous_board":
+        return tool_error(
+            f"{tool_name}: task id exists on multiple boards; specify a board",
+            error_kind="ambiguous_board",
+            boards=list(resolution.boards),
+            searched_boards=list(resolution.searched_boards),
+        )
+    return tool_error(
+        f"{tool_name}: task not found",
+        error_kind="not_found",
+        searched_boards=list(resolution.searched_boards),
+    )
+
+
+def _resolve_task_or_error(task_id: str, board: Optional[str], tool_name: str, *, mutation: bool = False):
+    resolution = _resolve_task_board(task_id, board)
+    if resolution.kind != "found":
+        return None, _resolution_error(tool_name, resolution)
+    # A mutation may use the caller's active board implicitly, but may never
+    # follow a task onto a different board discovered by the global search.
+    if mutation:
+        from hermes_cli import kanban_db as kb
+        if board is None:
+            # Resolve the implicit target from the connection actually opened.
+            # ``get_current_board()`` only reflects HERMES_KANBAN_BOARD and can
+            # disagree with an inherited HERMES_KANBAN_DB path pin.
+            target_kb, target_conn = _connect()
+            try:
+                target = _connection_board(target_kb, target_conn)
+            finally:
+                target_conn.close()
+        else:
+            target = kb._normalize_board_slug(board) or kb.DEFAULT_BOARD
+        if resolution.board != target:
+            return None, _resolution_error(
+                tool_name,
+                _TaskBoardResolution(
+                    "board_mismatch", board=resolution.board,
+                    boards=resolution.boards,
+                    searched_boards=resolution.searched_boards,
+                ),
+            )
+    return resolution, None
 
 
 _GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
@@ -366,12 +496,13 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
     return None
 
 
-def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
+def _task_summary_dict(kb, conn, task, *, board: Optional[str] = None) -> dict[str, Any]:
     """Compact task shape for board-listing tools."""
     parents = kb.parent_ids(conn, task.id)
     children = kb.child_ids(conn, task.id)
     return {
         "id": task.id,
+        "board": board,
         "title": task.title,
         "assignee": task.assignee,
         "status": task.status,
@@ -398,6 +529,17 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
 # Handlers
 # ---------------------------------------------------------------------------
 
+def _connection_board(kb, conn) -> Optional[str]:
+    """Return the canonical board owning an opened sqlite connection."""
+    db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve()
+    for meta in kb.list_boards(include_archived=False):
+        slug = str(meta["slug"])
+        candidate = (kb.kanban_home() / "kanban.db" if slug == kb.DEFAULT_BOARD
+                     else kb.board_dir(slug) / "kanban.db").resolve()
+        if candidate == db_path:
+            return slug
+    return None
+
 def _handle_show(args: dict, **kw) -> str:
     """Read a task's full state: task row, parents, children, comments,
     runs (attempt history), and the last N events."""
@@ -407,6 +549,10 @@ def _handle_show(args: dict, **kw) -> str:
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
     board = args.get("board")
+    resolution, resolution_err = _resolve_task_or_error(tid, board, "kanban_show")
+    if resolution_err:
+        return resolution_err
+    board = resolution.board
     try:
         kb, conn = _connect(board=board)
         try:
@@ -445,6 +591,7 @@ def _handle_show(args: dict, **kw) -> str:
                 }
 
             return json.dumps({
+                "board": board,
                 "task": _task_dict(task),
                 "parents": parents,
                 "children": children,
@@ -516,9 +663,31 @@ def _handle_list(args: dict, **kw) -> str:
             )
             truncated = len(rows) > limit
             tasks = rows[:limit]
+            selected_board = _connection_board(kb, conn)
+            other_board_count = 0
+            for meta in kb.list_boards(include_archived=False):
+                other = str(meta["slug"])
+                if other == selected_board:
+                    continue
+                other_conn = None
+                try:
+                    _, other_conn = _connect(board=other)
+                    other_board_count += len(kb.list_tasks(
+                        other_conn,
+                        assignee=assignee,
+                        status=status,
+                        tenant=tenant,
+                        include_archived=include_archived,
+                        limit=KANBAN_LIST_MAX_LIMIT + 1,
+                    ))
+                finally:
+                    if other_conn is not None:
+                        other_conn.close()
             return json.dumps({
-                "tasks": [_task_summary_dict(kb, conn, t) for t in tasks],
+                "tasks": [_task_summary_dict(kb, conn, t, board=selected_board) for t in tasks],
                 "count": len(tasks),
+                "board": selected_board,
+                "other_board_count": other_board_count,
                 "limit": limit,
                 "truncated": truncated,
                 "next_limit": (
@@ -627,6 +796,12 @@ def _handle_complete(args: dict, **kw) -> str:
         )
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
+    resolution, resolution_err = _resolve_task_or_error(
+        tid, board, "kanban_complete", mutation=True
+    )
+    if resolution_err:
+        return resolution_err
+    board = resolution.board
     try:
         kb, conn = _connect(board=board)
         try:
@@ -734,6 +909,12 @@ def _handle_block(args: dict, **kw) -> str:
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
     board = args.get("board")
+    resolution, resolution_err = _resolve_task_or_error(
+        tid, board, "kanban_block", mutation=True
+    )
+    if resolution_err:
+        return resolution_err
+    board = resolution.board
     try:
         kb, conn = _connect(board=board)
         if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
@@ -819,6 +1000,12 @@ def _handle_heartbeat(args: dict, **kw) -> str:
         return ownership_err
     note = args.get("note")
     board = args.get("board")
+    resolution, resolution_err = _resolve_task_or_error(
+        tid, board, "kanban_heartbeat", mutation=True
+    )
+    if resolution_err:
+        return resolution_err
+    board = resolution.board
     try:
         kb, conn = _connect(board=board)
         try:
@@ -876,6 +1063,12 @@ def _handle_comment(args: dict, **kw) -> str:
     # comments are the deliberate handoff channel between tasks.
     author = os.environ.get("HERMES_PROFILE") or "worker"
     board = args.get("board")
+    resolution, resolution_err = _resolve_task_or_error(
+        tid, board, "kanban_comment", mutation=True
+    )
+    if resolution_err:
+        return resolution_err
+    board = resolution.board
     try:
         kb, conn = _connect(board=board)
         try:
@@ -925,6 +1118,12 @@ def _handle_attach(args: dict, **kw) -> str:
         return tool_error(f"content_base64 is not valid base64: {e}")
     content_type = args.get("content_type")
     board = args.get("board")
+    resolution, resolution_err = _resolve_task_or_error(
+        tid, board, "kanban_attach", mutation=True
+    )
+    if resolution_err:
+        return resolution_err
+    board = resolution.board
     try:
         _, conn = _connect(board=board)
         try:
@@ -1045,6 +1244,12 @@ def _handle_attach_url(args: dict, **kw) -> str:
         filename = leaf or "download"
     content_type = args.get("content_type")
     board = args.get("board")
+    resolution, resolution_err = _resolve_task_or_error(
+        tid, board, "kanban_attach_url", mutation=True
+    )
+    if resolution_err:
+        return resolution_err
+    board = resolution.board
     try:
         data, fetched_ct = _download_url_with_cap(url, kb.KANBAN_ATTACHMENT_MAX_BYTES)
     except ValueError as e:
@@ -1084,6 +1289,12 @@ def _handle_attachments(args: dict, **kw) -> str:
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
     board = args.get("board")
+    resolution, resolution_err = _resolve_task_or_error(
+        tid, board, "kanban_attachments"
+    )
+    if resolution_err:
+        return resolution_err
+    board = resolution.board
     try:
         kb, conn = _connect(board=board)
         try:
@@ -1395,6 +1606,12 @@ def _handle_unblock(args: dict, **kw) -> str:
     if ownership_err:
         return ownership_err
     board = args.get("board")
+    resolution, resolution_err = _resolve_task_or_error(
+        str(tid), board, "kanban_unblock", mutation=True
+    )
+    if resolution_err:
+        return resolution_err
+    board = resolution.board
     try:
         kb, conn = _connect(board=board)
         try:
@@ -1422,6 +1639,23 @@ def _handle_link(args: dict, **kw) -> str:
     if not parent_id or not child_id:
         return tool_error("both parent_id and child_id are required")
     board = args.get("board")
+    parent_resolution, parent_error = _resolve_task_or_error(
+        str(parent_id), board, "kanban_link", mutation=True
+    )
+    if parent_error:
+        return parent_error
+    child_resolution, child_error = _resolve_task_or_error(
+        str(child_id), board, "kanban_link", mutation=True
+    )
+    if child_error:
+        return child_error
+    if parent_resolution.board != child_resolution.board:
+        return tool_error(
+            "kanban_link: parent and child must be on the same board",
+            error_kind="board_mismatch",
+            boards=[parent_resolution.board, child_resolution.board],
+        )
+    board = parent_resolution.board
     try:
         kb, conn = _connect(board=board)
         try:
