@@ -1586,6 +1586,59 @@ class CredentialPool:
                     logger.debug(
                         "Codex OAuth refresh token is terminally invalid; clearing local token state"
                     )
+                    if codex_shared_root is not None:
+                        root_path, _, grant_id = codex_shared_root
+                        try:
+                            root_store = _load_auth_store(root_path)
+                            root_state = _load_provider_state(
+                                root_store, "openai-codex"
+                            )
+                            if (
+                                isinstance(root_state, dict)
+                                and str(root_state.get(_CODEX_GRANT_ID_KEY) or "").strip()
+                                == grant_id
+                            ):
+                                tokens = root_state.get("tokens") or {}
+                                if not isinstance(tokens, dict):
+                                    tokens = {}
+                                tokens.pop("access_token", None)
+                                tokens.pop("refresh_token", None)
+                                root_state["tokens"] = tokens
+                                root_state["last_auth_error"] = {
+                                    "provider": "openai-codex",
+                                    "code": getattr(exc, "code", "unknown"),
+                                    "message": str(exc),
+                                    "reason": "credential_pool_refresh_failure",
+                                    "relogin_required": True,
+                                    "at": datetime.now(timezone.utc).isoformat(),
+                                }
+                                _store_provider_state(
+                                    root_store,
+                                    "openai-codex",
+                                    root_state,
+                                    set_active=False,
+                                )
+                                _save_auth_store(root_store, target_path=root_path)
+                        except Exception as clear_exc:
+                            logger.debug(
+                                "Failed to clear terminal shared Codex state: %s",
+                                clear_exc,
+                            )
+                        removed_ids = [
+                            item.id
+                            for item in self._entries
+                            if str(item.extra.get(_CODEX_GRANT_ID_KEY) or "").strip()
+                            == grant_id
+                        ]
+                        self._entries = [
+                            item
+                            for item in self._entries
+                            if item.id not in removed_ids
+                        ]
+                        if self._current_id in removed_ids:
+                            self._current_id = None
+                        self._persist(removed_ids=removed_ids)
+                        return None
                     try:
                         with _auth_store_lock():
                             auth_store = _load_auth_store()

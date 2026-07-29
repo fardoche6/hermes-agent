@@ -714,7 +714,15 @@ def test_shared_codex_auth_errors_use_canonical_refresh_failure_handling(
         refresh_token="failure-refresh",
         source="manual:device_code",
     )
-    pool = CredentialPool("openai-codex", [entry])
+    independent = _entry(
+        "openai-codex",
+        id="independent-alias",
+        access_token="independent-access",
+        refresh_token="independent-refresh",
+        source="manual:device_code",
+    )
+    independent.extra["shared_grant_id"] = "independent-grant"
+    pool = CredentialPool("openai-codex", [entry, independent])
     entry = pool._sync_codex_entry_from_auth_store(entry)
 
     def fail_refresh(access, refresh):
@@ -729,8 +737,25 @@ def test_shared_codex_auth_errors_use_canonical_refresh_failure_handling(
     result = pool._refresh_entry(entry, force=True)
 
     assert result is None
-    stored = pool._entries[0]
     if relogin_required:
-        assert stored.last_status != STATUS_EXHAUSTED
+        assert [item.id for item in pool._entries] == ["independent-alias"]
+        root = _read_store(root_path)
+        root_state = root["providers"]["openai-codex"]
+        assert root_state["tokens"] == {}
+        assert root_state["last_auth_error"]["provider"] == "openai-codex"
+        assert root_state["last_auth_error"]["code"] == "codex_refresh_failed"
+        assert root_state["last_auth_error"]["relogin_required"] is True
+        profile = _read_store(profile_path)
+        assert "openai-codex" not in profile.get("providers", {})
     else:
+        stored = next(item for item in pool._entries if item.id == "failure-alias")
         assert stored.last_status == STATUS_EXHAUSTED
+        assert [item.id for item in pool._entries] == [
+            "failure-alias",
+            "independent-alias",
+        ]
+        root = _read_store(root_path)
+        assert root["providers"]["openai-codex"]["tokens"] == {
+            "access_token": "failure-access",
+            "refresh_token": "failure-refresh",
+        }
