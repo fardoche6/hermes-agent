@@ -16,7 +16,6 @@ real on-disk auth stores (profile + root under ``tmp_path``) rather than
 mocking the save boundary, so they exercise the actual atomic write path.
 """
 
-import base64
 import json
 import threading
 
@@ -58,16 +57,6 @@ def _entry(
         access_token=access_token,
         refresh_token=refresh_token,
     )
-
-
-def _codex_token(account_id: str, token_id: str) -> str:
-    payload = {
-        "https://api.openai.com/auth": {"chatgpt_account_id": account_id},
-        "jti": token_id,
-    }
-    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
-    return f"header.{encoded}.signature"
-
 
 @pytest.fixture
 def profile_and_root(tmp_path, monkeypatch):
@@ -371,9 +360,9 @@ def test_proven_manual_codex_alias_rotates_through_inherited_root(
 ):
     """A matching manual alias adopts and publishes the inherited grant."""
     profile_path, root_path = profile_and_root
-    old_token = _codex_token("account-shared", "old")
-    root_token = _codex_token("account-shared", "root")
-    rotated_token = _codex_token("account-shared", "rotated")
+    old_token = "shared-grant-old"
+    root_token = old_token
+    rotated_token = "shared-grant-rotated"
     _write_store(
         profile_path,
         {
@@ -418,7 +407,6 @@ def test_proven_manual_codex_alias_rotates_through_inherited_root(
         }
 
     monkeypatch.setattr(A, "refresh_codex_oauth_pure", fake_refresh)
-    pool = CredentialPool("openai-codex", [])
     entry = _entry(
         "openai-codex",
         id="legacy-alias",
@@ -426,6 +414,7 @@ def test_proven_manual_codex_alias_rotates_through_inherited_root(
         refresh_token="old-refresh",
         source="manual:device_code",
     )
+    pool = CredentialPool("openai-codex", [entry])
 
     updated = pool._refresh_entry(entry, force=True)
 
@@ -438,6 +427,11 @@ def test_proven_manual_codex_alias_rotates_through_inherited_root(
         "access_token": rotated_token,
         "refresh_token": "rotated-refresh",
     }
+    profile = _read_store(profile_path)
+    assert (
+        profile["credential_pool"]["openai-codex"][0]["codex_root_alias_proof"]
+        == "root-refresh"
+    )
 
 
 def test_profile_manual_device_code_stays_independent_without_local_singleton(
@@ -445,8 +439,8 @@ def test_profile_manual_device_code_stays_independent_without_local_singleton(
 ):
     """A manual profile account must not adopt root state by inheritance."""
     profile_path, root_path = profile_and_root
-    profile_token = _codex_token("account-independent", "profile")
-    root_token = _codex_token("account-root", "root")
+    profile_token = "same-account-grant-profile"
+    root_token = "same-account-grant-root"
     _write_store(
         profile_path,
         {
@@ -459,7 +453,7 @@ def test_profile_manual_device_code_stays_independent_without_local_singleton(
                         "source": "manual:device_code",
                         "auth_type": "oauth",
                         "access_token": profile_token,
-                        "refresh_token": "profile-refresh",
+                        "refresh_token": "same-account-grant-profile-refresh",
                     }
                 ]
             },
@@ -473,7 +467,7 @@ def test_profile_manual_device_code_stays_independent_without_local_singleton(
                 "openai-codex": {
                     "tokens": {
                         "access_token": root_token,
-                        "refresh_token": "root-refresh",
+                        "refresh_token": "same-account-grant-root-refresh",
                     }
                 }
             },
@@ -485,7 +479,7 @@ def test_profile_manual_device_code_stays_independent_without_local_singleton(
         "openai-codex",
         id="profile-account",
         access_token=profile_token,
-        refresh_token="profile-refresh",
+        refresh_token="same-account-grant-profile-refresh",
         source="manual:device_code",
     )
 
@@ -493,11 +487,11 @@ def test_profile_manual_device_code_stays_independent_without_local_singleton(
 
     assert synced is entry
     assert synced.access_token == profile_token
-    assert synced.refresh_token == "profile-refresh"
+    assert synced.refresh_token == "same-account-grant-profile-refresh"
 
     pool._sync_device_code_entry_to_auth_store(entry)
     root = _read_store(root_path)
     assert root["providers"]["openai-codex"]["tokens"] == {
         "access_token": root_token,
-        "refresh_token": "root-refresh",
+        "refresh_token": "same-account-grant-root-refresh",
     }

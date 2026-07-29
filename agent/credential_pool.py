@@ -42,29 +42,7 @@ from hermes_cli.auth import (
 
 logger = logging.getLogger(__name__)
 
-
-def _codex_account_identity(token: Any) -> Optional[str]:
-    claims = _decode_jwt_claims(token)
-    claim_sets = [claims]
-    auth_claims = claims.get("https://api.openai.com/auth")
-    if isinstance(auth_claims, dict):
-        claim_sets.append(auth_claims)
-    for claim_set in claim_sets:
-        for key in ("chatgpt_account_id", "account_id"):
-            value = claim_set.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    return None
-
-
-def _codex_tokens_match_account(left: Any, right: Any) -> bool:
-    if not isinstance(left, str) or not left.strip():
-        return False
-    if left == right:
-        return True
-    left_identity = _codex_account_identity(left)
-    right_identity = _codex_account_identity(right)
-    return bool(left_identity and left_identity == right_identity)
+_CODEX_ALIAS_PROOF_KEY = "codex_root_alias_proof"
 
 
 def _codex_manual_alias_proven(
@@ -77,9 +55,18 @@ def _codex_manual_alias_proven(
     if not isinstance(state, dict):
         return False
     tokens = state.get("tokens")
-    return isinstance(tokens, dict) and _codex_tokens_match_account(
-        entry.access_token,
-        tokens.get("access_token"),
+    if not isinstance(tokens, dict):
+        return False
+    entry_access = str(entry.access_token or "").strip()
+    entry_refresh = str(entry.refresh_token or "").strip()
+    store_access = str(tokens.get("access_token") or "").strip()
+    store_refresh = str(tokens.get("refresh_token") or "").strip()
+    proof = str(entry.extra.get(_CODEX_ALIAS_PROOF_KEY) or "").strip()
+    if proof and proof in {store_access, store_refresh}:
+        return True
+    return bool(
+        (entry_access and store_access and entry_access == store_access)
+        or (entry_refresh and store_refresh and entry_refresh == store_refresh)
     )
 
 
@@ -188,6 +175,7 @@ _EXTRA_KEYS = frozenset({
     "token_type", "scope", "client_id", "portal_base_url", "obtained_at",
     "expires_in", "agent_key_id", "agent_key_expires_in", "agent_key_reused",
     "agent_key_obtained_at", "tls", "secret_source", "secret_fingerprint",
+    "codex_root_alias_proof",
 })
 
 
@@ -830,8 +818,8 @@ class CredentialPool:
         fails with "no available entries (all exhausted or empty)".
 
         Mirrors the Nous/Anthropic resync paths above. Manual
-        entries are synchronized only when their token/account identity
-        explicitly proves they alias the inherited root grant; otherwise they
+        entries are synchronized only when an exact access- or refresh-token
+        match proves they alias the inherited root grant; otherwise they
         remain independent credentials.
         """
         if self.provider != "openai-codex":
@@ -845,6 +833,16 @@ class CredentialPool:
                 if entry.source == "manual:device_code":
                     if not _codex_manual_alias_proven(entry, state, source_path):
                         return entry
+                    tokens = state.get("tokens") if isinstance(state, dict) else None
+                    token_state = tokens if isinstance(tokens, dict) else {}
+                    proof = (
+                        str(token_state.get("refresh_token") or "").strip()
+                        or str(token_state.get("access_token") or "").strip()
+                    )
+                    if proof and entry.extra.get(_CODEX_ALIAS_PROOF_KEY) != proof:
+                        extra = dict(entry.extra)
+                        extra[_CODEX_ALIAS_PROOF_KEY] = proof
+                        entry = replace(entry, extra=extra)
                 elif entry.source != "device_code":
                     return entry
             if not isinstance(state, dict):
