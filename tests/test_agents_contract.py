@@ -13,7 +13,9 @@ def test_active_agents_contract_is_bounded_and_has_fallbacks():
     assert (ROOT / "_study/agents-refactor/development-lifecycle.md").is_file()
     assert len(active.encode("utf-8")) < 20_000
     for phrase in (
-        "exact-pinned",
+        "bound PyPI dependencies",
+        "SHA-pin Git URLs and GitHub\n  Actions",
+        "exact-pin CI-only pip installs",
         "outbound telemetry",
         "`.env` is\n  for secrets only",
         "scripts/run_tests.sh",
@@ -35,11 +37,9 @@ def test_profile_path_links_use_relocated_reference():
 
 
 def test_preserved_reference_matches_pre_shrink_guide():
-    import subprocess
+    import hashlib
 
-    expected = subprocess.check_output(
-        ["git", "show", "d3d2ac187:_study/agents-refactor/AGENTS.md"],
-        cwd=ROOT,
-    )
     actual = (ROOT / "_study/agents-refactor/AGENTS.md").read_bytes()
-    assert actual == expected
+    assert hashlib.sha256(actual).hexdigest() == (
+        "0b5828f02e6c8daea2721a00e08a041ff0ca7ef3a90d0ecbc21148657509dbdd"
+    )

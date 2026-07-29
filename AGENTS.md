@@ -23,9 +23,10 @@ growing this file. Keep this file below 20,000 bytes and verify the bound with
 - Report exact commands and results. Do not claim tests, CI, deployment, or
   external writes succeeded without fresh evidence. Keep secrets and
   credentials out of logs, diffs, comments, and handoffs.
-- Security guardrails: direct dependencies are exact-pinned; do not add
-  outbound telemetry or attribution without generic user opt-in; `.env` is
-  for secrets only; never print, commit, or paste secret values.
+- Security guardrails: bound PyPI dependencies; SHA-pin Git URLs and GitHub
+  Actions; exact-pin CI-only pip installs; do not add outbound telemetry or
+  attribution without generic user opt-in; `.env` is for secrets only; never
+  print, commit, or paste secret values.
 - Use `scripts/run_tests.sh`, not direct `pytest`; it supplies CI-parity
   isolation and environment cleanup. For skill changes, use its focused skill
   test path as described in the reference map.
