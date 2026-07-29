@@ -4735,7 +4735,7 @@ def release_stale_claims(
         # even if the PID is still alive (it's likely in a logic loop).
         heartbeat_stale = (
             hb is not None
-            and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+            and (now - int(hb)) >= DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         )
         if (
             host_local
@@ -4771,7 +4771,10 @@ def release_stale_claims(
                         "reason": "pid_alive",
                         "worker_pid": int(row["worker_pid"]),
                         "claim_lock": row["claim_lock"],
-                        "claim_expires_was": int(row["claim_expires"]),
+                        "claim_expires_was": (
+                            int(row["claim_expires"])
+                            if row["claim_expires"] is not None else None
+                        ),
                         "claim_expires_now": new_expires,
                         "last_heartbeat_at": (
                             int(row["last_heartbeat_at"])

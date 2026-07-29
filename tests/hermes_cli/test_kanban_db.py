@@ -768,6 +768,51 @@ def test_null_claim_expiry_with_stale_heartbeat_reclaims_without_int_none(
         assert json.loads(event["payload"])["claim_expires"] is None
 
 
+def test_null_claim_expiry_at_heartbeat_boundary_reclaims_live_local_pid(
+    kanban_home, monkeypatch,
+):
+    """The inclusive stale-row boundary must not route NULL expiry to extension."""
+    import json
+    import hermes_cli.kanban_db as _kb
+
+    fixed_now = 1_900_000_000
+    monkeypatch.setattr(_kb.time, "time", lambda: fixed_now)
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(
+        _kb,
+        "_terminate_reclaimed_worker",
+        lambda *_args, **_kwargs: {
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": True,
+        },
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="boundary review", assignee="reviewer")
+        host = kb._claimer_id().split(":", 1)[0]
+        boundary_heartbeat = (
+            fixed_now - kb.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+        )
+        conn.execute(
+            "UPDATE tasks SET status='review', claim_lock=?, claim_expires=NULL, "
+            "worker_pid=12345, last_heartbeat_at=? WHERE id=?",
+            (f"{host}:review", boundary_heartbeat, task_id),
+        )
+        conn.commit()
+
+        assert kb.release_stale_claims(conn, signal_fn=lambda *_args: None) == 1
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "review"
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='reclaimed'",
+            (task_id,),
+        ).fetchone()
+        assert event is not None
+        assert json.loads(event["payload"])["claim_expires"] is None
+
+
 def test_default_claim_ttl_sets_two_hour_expiry(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="default lease", assignee="worker")
