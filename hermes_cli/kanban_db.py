@@ -4209,7 +4209,7 @@ def claim_review_task(
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
 ) -> Optional[Task]:
-    """Atomically transition ``review -> running``.
+    """Atomically claim a ``review`` task without leaving the review column.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``review`` status).
@@ -4229,7 +4229,7 @@ def claim_review_task(
         cur = conn.execute(
             """
             UPDATE tasks
-               SET status        = 'running',
+               SET status        = 'review',
                    claim_lock    = ?,
                    claim_expires = ?,
                    last_heartbeat_at = ?,
@@ -4423,7 +4423,7 @@ def heartbeat_claim(
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock = ?",
+            "WHERE id = ? AND status IN ('running', 'review') AND claim_lock = ?",
             (expires, task_id, lock),
         )
         if cur.rowcount == 1:
@@ -4471,9 +4471,9 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
+        "SELECT id, status, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
         "FROM tasks "
-        "WHERE status = 'running' AND ("
+        "WHERE status IN ('running', 'review') AND ("
         "  (claim_expires IS NOT NULL AND claim_expires < ?) OR "
         "  (last_heartbeat_at IS NOT NULL AND last_heartbeat_at <= ?)"
         ")",
@@ -4501,13 +4501,13 @@ def release_stale_claims(
             with write_txn(conn):
                 cur = conn.execute(
                     "UPDATE tasks SET claim_expires = ? "
-                    "WHERE id = ? AND status = 'running' "
+                    "WHERE id = ? AND status = ? "
                     "  AND claim_lock IS ? "
                     "  AND claim_expires IS NOT NULL "
                     "  AND claim_expires < ? "
                     "  AND (last_heartbeat_at IS NULL OR last_heartbeat_at > ?)",
                     (
-                        new_expires, row["id"], row["claim_lock"], now,
+                        new_expires, row["id"], row["status"], row["claim_lock"], now,
                         now - DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS,
                     ),
                 )
@@ -4549,16 +4549,17 @@ def release_stale_claims(
             )
             continue
         with write_txn(conn):
+            release_status = "review" if row["status"] == "review" else "ready"
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
+                "WHERE id = ? AND status = ? AND claim_lock IS ? "
                 "AND ("
                 "  (claim_expires IS NOT NULL AND claim_expires < ?) OR "
                 "  (last_heartbeat_at IS NOT NULL AND last_heartbeat_at <= ?)"
                 ")",
                 (
-                    row["id"], row["claim_lock"], now,
+                    release_status, row["id"], row["status"], row["claim_lock"], now,
                     now - DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS,
                 ),
             )
@@ -4628,9 +4629,9 @@ def reclaim_task(
     )
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "UPDATE tasks SET status = CASE WHEN status = 'review' THEN 'review' ELSE 'ready' END, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
+            "WHERE id = ? AND status IN ('running', 'review', 'ready', 'blocked') "
             "AND claim_lock IS ?",
             (task_id, prev_lock),
         )
@@ -4915,7 +4916,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'review', 'ready', 'blocked')
                 """,
                 (result, now, task_id),
             )
@@ -4932,7 +4933,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                   AND status IN ('running', 'review', 'ready', 'blocked')
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
@@ -7557,8 +7558,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # (task_id, pid, claimer, protocol_violation, error_text)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
+            "SELECT id, worker_pid, claim_lock, started_at, status, current_run_id "
+            "FROM tasks "
+            "WHERE status IN ('running', 'review') AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
@@ -7641,12 +7643,13 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
+            source_status = "review" if row["status"] == "review" else "ready"
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND status = 'running' "
+                "WHERE id = ? AND status = ? "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (row["id"], pid, row["claim_lock"]),
+                (source_status, row["id"], row["status"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —

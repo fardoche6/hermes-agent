@@ -390,7 +390,7 @@ def test_explicit_review_lifecycle_reuses_same_card(kanban_home):
         assert kb.get_task(conn, task_id).status == "review"
 
         reviewer = kb.claim_review_task(conn, task_id, claimer="review:1")
-        assert reviewer and reviewer.status == "running"
+        assert reviewer and reviewer.status == "review"
         corrected = kb.request_changes(
             conn, task_id, "programmer", reason="add regression coverage", claimer="impl:2"
         )
@@ -3963,14 +3963,15 @@ def _set_task_status(conn: sqlite3.Connection, task_id: str, status: str) -> Non
     conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, task_id))
 
 
-def test_claim_review_task_transitions_to_running(kanban_home):
-    """claim_review_task atomically transitions review -> running."""
+def test_claim_review_task_keeps_task_in_review(kanban_home):
+    """A reviewer claim keeps the card in the Review column."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="review me", assignee="alice")
         _set_task_status(conn, t, "review")
         claimed = kb.claim_review_task(conn, t)
     assert claimed is not None
-    assert claimed.status == "running"
+    with kb.connect() as conn:
+        assert kb.get_task(conn, t).status == "review"
     assert claimed.claim_lock is not None
 
 
@@ -3992,6 +3993,32 @@ def test_claim_review_task_fails_when_already_claimed(kanban_home):
         assert first is not None
         second = kb.claim_review_task(conn, t)
     assert second is None
+
+
+def test_review_claim_crash_returns_to_review(kanban_home, monkeypatch):
+    """Reviewer recovery must not move the card out of the Review column."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="review crash", assignee="alice")
+        _set_task_status(conn, task_id, "review")
+        pid = 98765
+        host = _kb._claimer_id().split(":", 1)[0]
+        claimed = kb.claim_review_task(conn, task_id, claimer=f"{host}:review")
+        assert claimed is not None
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, started_at=? WHERE id=?",
+            (pid, int(time.time()) - 60, task_id),
+        )
+        conn.commit()
+        _kb._record_worker_exit(pid, _exited_status(1))
+
+        assert task_id in kb.detect_crashed_workers(conn)
+        recovered = kb.get_task(conn, task_id)
+        assert recovered is not None
+        assert recovered.status == "review"
+        assert recovered.claim_lock is None
 
 
 def test_dispatch_review_dry_run(kanban_home, all_assignees_spawnable):
