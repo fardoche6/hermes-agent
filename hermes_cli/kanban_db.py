@@ -4406,6 +4406,120 @@ def request_changes(
         return get_task(conn, task_id)
 
 
+def _bounded_review_error(error: object) -> str:
+    """Return a durable, bounded reviewer-lane error excerpt."""
+    text = " ".join(str(error or "reviewer failed").split())
+    return text[:500]
+
+
+def _reviewer_candidates(
+    current: Optional[str], *, required_skill: str = "sdlc-review",
+) -> tuple[list[str], list[dict[str, str]]]:
+    """Return compatible ``code-reviewer*`` profiles and preflight failures.
+
+    Reviewer failover is deliberately limited to the reviewer lane.  A missing
+    forced skill is a capability failure, not a review decision, so it is
+    reported before a worker is spawned and does not consume a task retry.
+    """
+    failures: list[dict[str, str]] = []
+    try:
+        from hermes_cli.profiles import get_profile_dir, list_profiles, profile_exists
+        profiles = list_profiles()
+    except Exception as exc:
+        return [], [{"profile": str(current or ""), "error": _bounded_review_error(exc)}]
+    names = [
+        str(p.name) for p in profiles
+        if str(p.name).startswith("code-reviewer")
+    ]
+    if current and current not in names:
+        names.insert(0, current)
+    names = list(dict.fromkeys(names))
+    compatible: list[str] = []
+    for name in names:
+        try:
+            if not profile_exists(name):
+                failures.append({"profile": name, "error": "profile unavailable"})
+                continue
+            profile_dir = get_profile_dir(name)
+            # Test fixtures and control-plane callers may provide a synthetic
+            # assignee without a profile directory; leave those to the normal
+            # profile_exists gate rather than misclassifying them as a skill
+            # failure. Real profile directories are preflighted strictly.
+            if not profile_dir.is_dir():
+                compatible.append(name)
+                continue
+            skill_dir = profile_dir / "skills" / required_skill
+            if not skill_dir.is_dir():
+                failures.append({
+                    "profile": name,
+                    "error": f"missing skill: {required_skill}",
+                })
+                continue
+        except Exception as exc:
+            failures.append({"profile": name, "error": _bounded_review_error(exc)})
+            continue
+        compatible.append(name)
+    return compatible, failures
+
+
+def failover_review_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    reviewer: Optional[str],
+    *,
+    error: Optional[str] = None,
+    attempted: Optional[list[dict[str, str]]] = None,
+) -> Optional[Task]:
+    """Keep a failed reviewer handoff in ``review`` or block it terminally.
+
+    ``reviewer`` selects the next lane.  ``None`` means every compatible lane
+    failed and the card must be surfaced to a human; it never passes through
+    ``ready``/``running`` and never creates a child card.
+    """
+    reviewer = _canonical_assignee(reviewer) if reviewer else None
+    bounded = _bounded_review_error(error) if error else None
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        if row is None or row["status"] != "review":
+            return None
+        run_id = _end_run(
+            conn, task_id, outcome="reviewer_failed", status="failed",
+            error=bounded, metadata={"attempted": attempted or []},
+        )
+        if reviewer:
+            conn.execute(
+                "UPDATE tasks SET status='review', assignee=?, claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+                (reviewer, task_id),
+            )
+            _append_event(
+                conn, task_id, "review_failover",
+                {"reviewer": reviewer, "error": bounded, "attempted": attempted or []},
+                run_id=run_id,
+            )
+        else:
+            reason = "all reviewer lanes failed"
+            if attempted:
+                reason += ": " + "; ".join(
+                    f"{item.get('profile', '?')}: {item.get('error', 'failed')}"
+                    for item in attempted
+                )
+            conn.execute(
+                "UPDATE tasks SET status='blocked', assignee=NULL, claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL, block_kind='capability', "
+                "last_failure_error=? WHERE id=?",
+                (_bounded_review_error(reason), task_id),
+            )
+            _append_event(
+                conn, task_id, "review_lanes_failed",
+                {"reason": _bounded_review_error(reason), "attempted": attempted or []},
+                run_id=run_id,
+            )
+        return get_task(conn, task_id)
+
+
 def heartbeat_claim(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7556,9 +7670,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # counter (see the post-txn loop below).
     crash_details: list[tuple[str, int, str, bool, str]] = []
     # (task_id, pid, claimer, protocol_violation, error_text)
+    review_crashes: dict[str, str] = {}
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, status, current_run_id "
+            "SELECT id, worker_pid, claim_lock, started_at, status, current_run_id, assignee "
             "FROM tasks "
             "WHERE status IN ('running', 'review') AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -7696,6 +7811,34 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         (row["id"], pid, row["claim_lock"],
                          protocol_violation, error_text)
                     )
+                    if row["status"] == "review":
+                        review_crashes[row["id"]] = error_text
+    # Reviewer process failures are transport/capability failures, not review
+    # decisions. Try each compatible reviewer lane exactly once while keeping
+    # the card in Review. If none remain, surface one bounded capability block.
+    for task_id, error_text in review_crashes.items():
+        current = get_task(conn, task_id)
+        if current is None:
+            continue
+        candidates, preflight = _reviewer_candidates(current.assignee)
+        candidates = [candidate for candidate in candidates if candidate != current.assignee]
+        attempted = [{
+            "profile": current.assignee or "",
+            "error": _bounded_review_error(error_text),
+        }]
+        attempted.extend(preflight)
+        next_reviewer = candidates[0] if candidates else None
+        # A synthetic/terminal assignee may have no profile lane at all. Keep
+        # legacy recovery in Review in that case; only a real capability
+        # preflight failure is terminal here.
+        if next_reviewer is None and not any(
+            "missing skill" in item.get("error", "") for item in preflight
+        ):
+            continue
+        failover_review_task(
+            conn, task_id, next_reviewer,
+            error=_bounded_review_error(error_text), attempted=attempted,
+        )
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the task transitions ready → blocked with a ``gave_up`` event
     # on top of the event we already emitted).
@@ -7720,6 +7863,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
         for tid, pid, claimer, protocol_violation, error_text in crash_details:
+            if tid in review_crashes:
+                continue
             if protocol_violation:
                 streak = _protocol_violation_streak(conn, tid)
                 trow = conn.execute(
@@ -8616,66 +8761,78 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
-        try:
-            from hermes_cli.profiles import profile_exists
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
-            result.skipped_nonspawnable.append(row["id"])
+        candidates, preflight_failures = _reviewer_candidates(row["assignee"])
+        if not candidates:
+            if not dry_run:
+                failover_review_task(
+                    conn, row["id"], None,
+                    attempted=preflight_failures,
+                )
+            else:
+                result.skipped_nonspawnable.append(row["id"])
             continue
         if dry_run:
-            result.spawned.append((row["id"], row["assignee"], ""))
+            result.spawned.append((row["id"], candidates[0], ""))
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
-        if claimed is None:
-            continue
-        try:
-            resolved_branch_name = None
-            if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
-            else:
-                workspace = resolve_workspace(claimed, board=board)
-        except Exception as exc:
-            auto = _record_spawn_failure(
-                conn, claimed.id, f"workspace: {exc}",
-                failure_limit=failure_limit,
-            )
-            if auto:
-                result.auto_blocked.append(claimed.id)
-            continue
-        # Persist the resolved workspace path so the worker can cd there.
-        set_workspace_path(conn, claimed.id, str(workspace))
-        if claimed.workspace_kind == "worktree":
-            set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
-        _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        # Force-load the sdlc-review skill for review agents — it carries
-        # the review logic (AC verification, merge, etc.). The mandatory
-        # kanban lifecycle is already injected into every worker's system
-        # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
-        # review agent needs.
-        claimed.skills = ["sdlc-review"]
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
-        try:
-            import inspect
+
+        attempted = list(preflight_failures)
+        spawned_review = False
+        for candidate_index, reviewer in enumerate(candidates):
+            if reviewer != row["assignee"] and not assign_task(conn, row["id"], reviewer):
+                attempted.append({"profile": reviewer, "error": "assignment refused"})
+                continue
+            claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+            if claimed is None:
+                attempted.append({"profile": reviewer, "error": "review claim refused"})
+                continue
             try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
+                resolved_branch_name = None
+                if claimed.workspace_kind == "worktree":
+                    workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
                 else:
+                    workspace = resolve_workspace(claimed, board=board)
+                set_workspace_path(conn, claimed.id, str(workspace))
+                if claimed.workspace_kind == "worktree":
+                    set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+                _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+                claimed.skills = ["sdlc-review"]
+                _spawn = spawn_fn if spawn_fn is not None else _default_spawn
+                import inspect
+                try:
+                    sig = inspect.signature(_spawn)
+                    if "board" in sig.parameters:
+                        pid = _spawn(claimed, str(workspace), board=board)
+                    else:
+                        pid = _spawn(claimed, str(workspace))
+                except (TypeError, ValueError):
                     pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
-            if pid:
-                _set_worker_pid(conn, claimed.id, int(pid))
-            result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
-            spawned += 1
-        except Exception as exc:
-            auto = _record_spawn_failure(
-                conn, claimed.id, str(exc),
-                failure_limit=failure_limit,
+                if pid:
+                    _set_worker_pid(conn, claimed.id, int(pid))
+                result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
+                spawned += 1
+                spawned_review = True
+                break
+            except Exception as exc:
+                attempted.append({
+                    "profile": reviewer,
+                    "error": _bounded_review_error(exc),
+                })
+                next_reviewer = (
+                    candidates[candidate_index + 1]
+                    if candidate_index + 1 < len(candidates) else None
+                )
+                failover_review_task(
+                    conn, claimed.id, next_reviewer,
+                    error=_bounded_review_error(exc), attempted=attempted,
+                )
+        current_review = get_task(conn, row["id"])
+        if not spawned_review and candidates and current_review and current_review.status == "review":
+            failover_review_task(
+                conn, row["id"], None,
+                attempted=attempted or [
+                    {"profile": row["assignee"], "error": "reviewer failed"}
+                ],
             )
-            if auto:
-                result.auto_blocked.append(claimed.id)
     return result
 
 
