@@ -26,6 +26,7 @@ from agent.credential_pool import (
     AUTH_TYPE_OAUTH,
     CredentialPool,
     PooledCredential,
+    STATUS_EXHAUSTED,
 )
 from hermes_cli import auth as A
 
@@ -681,3 +682,55 @@ def test_codex_different_shared_grant_ids_stay_isolated(profile_and_root):
 
     assert synced is entry
     assert synced.extra["shared_grant_id"] == "independent-grant"
+
+
+@pytest.mark.parametrize(
+    ("relogin_required", "error_code"),
+    [(False, "codex_rate_limited"), (True, "codex_refresh_failed")],
+)
+def test_shared_codex_auth_errors_use_canonical_refresh_failure_handling(
+    profile_and_root, monkeypatch, relogin_required, error_code
+):
+    profile_path, root_path = profile_and_root
+    _write_store(profile_path, {"version": 1, "providers": {}, "credential_pool": {}})
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "failure-access",
+                        "refresh_token": "failure-refresh",
+                    }
+                }
+            },
+        },
+    )
+    entry = _entry(
+        "openai-codex",
+        id="failure-alias",
+        access_token="failure-access",
+        refresh_token="failure-refresh",
+        source="manual:device_code",
+    )
+    pool = CredentialPool("openai-codex", [entry])
+    entry = pool._sync_codex_entry_from_auth_store(entry)
+
+    def fail_refresh(access, refresh):
+        raise A.AuthError(
+            "synthetic Codex refresh failure",
+            provider="openai-codex",
+            code=error_code,
+            relogin_required=relogin_required,
+        )
+
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", fail_refresh)
+    result = pool._refresh_entry(entry, force=True)
+
+    assert result is None
+    stored = pool._entries[0]
+    if relogin_required:
+        assert stored.last_status != STATUS_EXHAUSTED
+    else:
+        assert stored.last_status == STATUS_EXHAUSTED

@@ -1281,69 +1281,11 @@ class CredentialPool:
                 tokens.get("access_token", ""),
                 tokens.get("refresh_token", ""),
             )
-            refreshed = auth_mod.refresh_codex_oauth_pure(
-                snapshot[0],
-                snapshot[1],
-            )
-            current_store = _load_auth_store(source_path)
-            current_state = _load_provider_state(current_store, "openai-codex")
-            current_tokens = (
-                current_state.get("tokens", {}).get("access_token", ""),
-                current_state.get("tokens", {}).get("refresh_token", ""),
-            ) if isinstance(current_state, dict) else ("", "")
-            if current_tokens != snapshot:
-                if (
-                    isinstance(current_state, dict)
-                    and str(current_state.get(_CODEX_GRANT_ID_KEY) or "").strip()
-                    == alias_grant_id
-                ):
-                    updated = replace(
-                        entry,
-                        access_token=current_tokens[0],
-                        refresh_token=current_tokens[1],
-                        last_refresh=current_state.get("last_refresh"),
-                        last_status=STATUS_OK,
-                        last_status_at=None,
-                        last_error_code=None,
-                        last_error_reason=None,
-                        last_error_message=None,
-                        last_error_reset_at=None,
-                    )
-                    self._replace_entry(entry, updated)
-                    self._persist()
-                    return updated
-                return entry
-            if not isinstance(current_state, dict):
-                return entry
-            current_tokens_state = current_state.get("tokens")
-            if not isinstance(current_tokens_state, dict):
-                return entry
-            current_tokens_state["access_token"] = refreshed["access_token"]
-            current_tokens_state["refresh_token"] = refreshed["refresh_token"]
-            if refreshed.get("last_refresh"):
-                current_state["last_refresh"] = refreshed["last_refresh"]
-            _store_provider_state(
-                current_store,
-                "openai-codex",
-                current_state,
-                set_active=False,
-            )
-            _save_auth_store(current_store, target_path=source_path)
-            updated = replace(
+            return self._refresh_entry_impl(
                 entry,
-                access_token=refreshed["access_token"],
-                refresh_token=refreshed["refresh_token"],
-                last_refresh=refreshed.get("last_refresh"),
-                last_status=STATUS_OK,
-                last_status_at=None,
-                last_error_code=None,
-                last_error_reason=None,
-                last_error_message=None,
-                last_error_reset_at=None,
+                force=force,
+                codex_shared_root=(source_path, snapshot, alias_grant_id),
             )
-            self._replace_entry(entry, updated)
-            self._persist()
-            return updated
 
     def _single_use_refresh_lock_timeout(self) -> float:
         """Lock timeout for single-use-refresh-token providers.
@@ -1365,7 +1307,13 @@ class CredentialPool:
         )
 
     def _refresh_entry_impl(
-        self, entry: PooledCredential, *, force: bool
+        self,
+        entry: PooledCredential,
+        *,
+        force: bool,
+        codex_shared_root: Optional[
+            Tuple[Path, Tuple[Any, Any], str]
+        ] = None,
     ) -> Optional[PooledCredential]:
         try:
             if self.provider == "anthropic":
@@ -1395,23 +1343,75 @@ class CredentialPool:
                     except Exception as wexc:
                         logger.debug("Failed to write refreshed token to credentials file: %s", wexc)
             elif self.provider == "openai-codex":
-                # Adopt fresher tokens from auth.json before spending the
-                # refresh_token — single-use tokens consumed by another Hermes
-                # process sharing the same auth.json singleton would otherwise
-                # trigger ``refresh_token_reused`` on the next POST.
-                synced = self._sync_codex_entry_from_auth_store(entry)
-                if synced is not entry:
-                    entry = synced
-                refreshed = auth_mod.refresh_codex_oauth_pure(
-                    entry.access_token,
-                    entry.refresh_token,
-                )
-                updated = replace(
-                    entry,
-                    access_token=refreshed["access_token"],
-                    refresh_token=refreshed["refresh_token"],
-                    last_refresh=refreshed.get("last_refresh"),
-                )
+                if codex_shared_root is not None:
+                    root_path, snapshot, grant_id = codex_shared_root
+                    refreshed = auth_mod.refresh_codex_oauth_pure(
+                        snapshot[0],
+                        snapshot[1],
+                    )
+                    current_store = _load_auth_store(root_path)
+                    current_state = _load_provider_state(
+                        current_store, "openai-codex"
+                    )
+                    current_tokens = (
+                        current_state.get("tokens", {}).get("access_token", ""),
+                        current_state.get("tokens", {}).get("refresh_token", ""),
+                    ) if isinstance(current_state, dict) else ("", "")
+                    if current_tokens != snapshot:
+                        if (
+                            isinstance(current_state, dict)
+                            and str(current_state.get(_CODEX_GRANT_ID_KEY) or "").strip()
+                            == grant_id
+                        ):
+                            updated = replace(
+                                entry,
+                                access_token=current_tokens[0],
+                                refresh_token=current_tokens[1],
+                                last_refresh=current_state.get("last_refresh"),
+                            )
+                        else:
+                            return entry
+                    else:
+                        if not isinstance(current_state, dict):
+                            return entry
+                        current_tokens_state = current_state.get("tokens")
+                        if not isinstance(current_tokens_state, dict):
+                            return entry
+                        current_tokens_state["access_token"] = refreshed["access_token"]
+                        current_tokens_state["refresh_token"] = refreshed["refresh_token"]
+                        if refreshed.get("last_refresh"):
+                            current_state["last_refresh"] = refreshed["last_refresh"]
+                        _store_provider_state(
+                            current_store,
+                            "openai-codex",
+                            current_state,
+                            set_active=False,
+                        )
+                        _save_auth_store(current_store, target_path=root_path)
+                        updated = replace(
+                            entry,
+                            access_token=refreshed["access_token"],
+                            refresh_token=refreshed["refresh_token"],
+                            last_refresh=refreshed.get("last_refresh"),
+                        )
+                else:
+                    # Adopt fresher tokens from auth.json before spending the
+                    # refresh_token — single-use tokens consumed by another
+                    # Hermes process sharing the same auth.json singleton
+                    # would otherwise trigger ``refresh_token_reused``.
+                    synced = self._sync_codex_entry_from_auth_store(entry)
+                    if synced is not entry:
+                        entry = synced
+                    refreshed = auth_mod.refresh_codex_oauth_pure(
+                        entry.access_token,
+                        entry.refresh_token,
+                    )
+                    updated = replace(
+                        entry,
+                        access_token=refreshed["access_token"],
+                        refresh_token=refreshed["refresh_token"],
+                        last_refresh=refreshed.get("last_refresh"),
+                    )
             elif self.provider == "xai-oauth":
                 # Adopt fresher tokens from auth.json before spending the
                 # refresh_token — single-use tokens consumed by another
@@ -1706,10 +1706,12 @@ class CredentialPool:
         )
         self._replace_entry(entry, updated)
         self._persist()
-        # Sync refreshed tokens back to auth.json providers so that
-        # _seed_from_singletons() on the next load_pool() sees fresh state
-        # instead of re-seeding stale/consumed tokens.
-        self._sync_device_code_entry_to_auth_store(updated)
+        if codex_shared_root is None:
+            # Sync refreshed tokens back to auth.json providers so that
+            # _seed_from_singletons() on the next load_pool() sees fresh state
+            # instead of re-seeding stale/consumed tokens. Shared aliases have
+            # already committed the root transaction above.
+            self._sync_device_code_entry_to_auth_store(updated)
         return updated
 
     def _codex_quota_restored_upstream(self, entry: PooledCredential) -> bool:
