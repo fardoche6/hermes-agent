@@ -1496,7 +1496,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    with kb.connect_closing() as conn:
+    board = kb.get_current_board()
+    requested_board = getattr(args, "board", None)
+    requested_tenant = args.tenant or os.environ.get("HERMES_TENANT")
+    admission_board = board if requested_board else None
+    with kb.connect_closing(board=admission_board) as conn:
         task_id = kb.create_task(
             conn,
             title=args.title,
@@ -1507,7 +1511,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             workspace_path=ws_path,
             branch_name=branch_name,
             project_id=getattr(args, "project", None),
-            tenant=args.tenant,
+            tenant=requested_tenant,
             priority=args.priority,
             parents=tuple(args.parent or ()),
             triage=bool(getattr(args, "triage", False)),
@@ -1520,6 +1524,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            board=admission_board,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -1550,7 +1555,8 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
     if not workers:
         print("kanban swarm: at least one --worker is required", file=sys.stderr)
         return 2
-    with kb.connect_closing() as conn:
+    board = kb.get_current_board()
+    with kb.connect_closing(board=board) as conn:
         created = ks.create_swarm(
             conn,
             goal=args.goal,
@@ -1558,6 +1564,7 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
             verifier_assignee=args.verifier,
             synthesizer_assignee=args.synthesizer,
             tenant=args.tenant,
+            board=board,
             created_by=args.created_by or _profile_author(),
             priority=args.priority,
             idempotency_key=getattr(args, "idempotency_key", None),

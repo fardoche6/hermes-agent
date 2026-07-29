@@ -1194,8 +1194,13 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
-    board = args.get("board")
+    explicit_board = args.get("board") or os.environ.get("HERMES_KANBAN_BOARD")
+    # Protected tenant-bearing mutations need an independently selected board;
+    # fully unscoped legacy calls remain a generic-board path.
+    board = explicit_board
     try:
+        from hermes_cli import kanban_db as _kb
+        _kb.validate_task_admission(board, tenant)
         kb, conn = _connect(board=board)
         try:
             # A project link is safe to inherit because ``create_task`` turns
@@ -1215,6 +1220,7 @@ def _handle_create(args: dict, **kw) -> str:
                 assignee=str(assignee),
                 parents=tuple(parents),
                 tenant=tenant,
+                board=board,
                 priority=int(priority) if priority is not None else 0,
                 workspace_kind=str(workspace_kind),
                 workspace_path=workspace_path,
