@@ -186,13 +186,13 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
         _log.debug("kanban lifecycle hook %s failed: %s", event, exc)
 
 
-# A running task's claim is valid for 15 minutes by default; after that the
+# A running task's claim is valid for 2 hours by default; after that the
 # next dispatcher tick reclaims it. Workers that outlive this window should
 # call ``heartbeat_claim(task_id)`` periodically. In practice most kanban
-# workloads either finish within 15m, set a longer claim explicitly, or use
+# workloads either finish within 2h, set a longer claim explicitly, or use
 # ``HERMES_KANBAN_CLAIM_TTL_SECONDS`` to raise the default claim window for
 # long single-call MCP workflows.
-DEFAULT_CLAIM_TTL_SECONDS = 15 * 60
+DEFAULT_CLAIM_TTL_SECONDS = 2 * 60 * 60
 
 # If a worker's PID is still alive but its ``last_heartbeat_at`` is
 # older than this when ``release_stale_claims`` runs, treat the worker

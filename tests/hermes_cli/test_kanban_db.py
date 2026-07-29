@@ -387,6 +387,30 @@ def test_claim_uses_env_default_ttl(kanban_home, monkeypatch):
     assert expires > int(time.time()) + 3000
 
 
+def test_claim_uses_two_hour_default_ttl(kanban_home, monkeypatch):
+    """A fresh claim uses the two-hour default lease."""
+    now = 1_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        claimed = kb.claim_task(conn, t, claimer="host:1")
+        assert claimed is not None
+        assert claimed.claim_expires == now + (2 * 60 * 60)
+
+
+def test_claim_ttl_argument_overrides_two_hour_default(kanban_home, monkeypatch):
+    """An explicit claim TTL still takes precedence over the default."""
+    now = 1_000_000
+    monkeypatch.setattr(kb.time, "time", lambda: now)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        claimed = kb.claim_task(conn, t, claimer="host:1", ttl_seconds=60)
+        assert claimed is not None
+        assert claimed.claim_expires == now + 60
+
+
 def test_claim_fails_on_non_ready(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x")
