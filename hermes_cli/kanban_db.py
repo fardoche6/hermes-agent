@@ -4089,11 +4089,15 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
-        prior_run = conn.execute(
-            "SELECT 1 FROM task_runs WHERE task_id = ? LIMIT 1",
-            (task_id,),
+        prior = conn.execute(
+            "SELECT outcome FROM task_runs WHERE task_id = ? "
+            "ORDER BY id DESC LIMIT 1", (task_id,),
         ).fetchone()
-        heartbeat_at = now if prior_run else None
+        # Explicit operator/worker reclaim starts a fresh live attempt and can
+        # seed its heartbeat immediately. Crash recovery intentionally waits
+        # for the worker's first heartbeat so a dead launch is not presented
+        # as healthy merely because it was re-queued.
+        heartbeat_at = now if prior and prior["outcome"] == "reclaimed" else None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4407,9 +4411,70 @@ def request_changes(
 
 
 def _bounded_review_error(error: object) -> str:
-    """Return a durable, bounded reviewer-lane error excerpt."""
+    """Return a durable, bounded and redacted reviewer-lane excerpt.
+
+    Reviewer launch failures often contain provider diagnostics. Keep enough
+    detail to choose a fallback lane, but never persist raw credentials or
+    unbounded subprocess output in the board history.
+    """
     text = " ".join(str(error or "reviewer failed").split())
+    text = re.sub(
+        r"(?i)(bearer\s+|api[_ -]?key\s*[:=]\s*|token\s*[:=]\s*)[^\s,;]+",
+        r"\1[REDACTED]",
+        text,
+    )
     return text[:500]
+
+
+def _review_failure_class(error: object) -> str:
+    """Classify a reviewer failure without treating transport as a verdict."""
+    text = str(error or "").lower()
+    if re.search(r"\b529\b|overloaded|rate[ -]?limit|too many requests", text):
+        return "provider_overload"
+    if "unknown skill" in text or "missing skill" in text:
+        return "missing_skill"
+    if re.search(r"profile .* does not exist|spawn|launcher|startup", text):
+        return "launcher_startup"
+    return "reviewer_transport"
+
+
+def get_task_receipt(
+    conn: sqlite3.Connection, task_id: str, *, max_error: int = 500,
+) -> Optional[dict[str, Any]]:
+    """Return the compact state needed for one orchestration decision.
+
+    This intentionally omits comments, full run history, and worker context.
+    It is safe for repeated event-driven readbacks after the initial full
+    orientation.
+    """
+    row = conn.execute(
+        "SELECT id, status, assignee, current_run_id, last_failure_error "
+        "FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    event = conn.execute(
+        "SELECT kind, payload, created_at, run_id FROM task_events "
+        "WHERE task_id = ? ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    payload = None
+    if event and event["payload"]:
+        try:
+            payload = json.loads(event["payload"])
+        except (TypeError, ValueError):
+            payload = {"raw": _bounded_review_error(event["payload"])}
+    return {
+        "id": row["id"],
+        "status": row["status"],
+        "assignee": row["assignee"],
+        "current_run_id": row["current_run_id"],
+        "last_transition": ({
+            "kind": event["kind"], "payload": payload,
+            "created_at": event["created_at"], "run_id": event["run_id"],
+        } if event else None),
+        "last_error": _bounded_review_error(row["last_failure_error"])[:max_error]
+        if row["last_failure_error"] else None,
+    }
 
 
 def _reviewer_candidates(
@@ -4484,9 +4549,14 @@ def failover_review_task(
         ).fetchone()
         if row is None or row["status"] != "review":
             return None
+        failure_class = _review_failure_class(bounded)
         run_id = _end_run(
             conn, task_id, outcome="reviewer_failed", status="failed",
-            error=bounded, metadata={"attempted": attempted or []},
+            error=bounded,
+            metadata={
+                "attempted": attempted or [],
+                "failure_class": failure_class,
+            },
         )
         if reviewer:
             conn.execute(
@@ -4496,7 +4566,12 @@ def failover_review_task(
             )
             _append_event(
                 conn, task_id, "review_failover",
-                {"reviewer": reviewer, "error": bounded, "attempted": attempted or []},
+                {
+                    "reviewer": reviewer,
+                    "error": bounded,
+                    "failure_class": failure_class,
+                    "attempted": attempted or [],
+                },
                 run_id=run_id,
             )
         else:
