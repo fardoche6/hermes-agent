@@ -70,6 +70,25 @@ def test_true_idle_window_blocks_on_gateway_child(monkeypatch, tmp_path):
     assert MOD.true_idle_window([board], "restart", gateway_pids=[42]) is False
 
 
+def test_true_idle_window_fails_closed_when_no_boards_are_discovered(monkeypatch):
+    monkeypatch.setattr(MOD, "gateway_worker_descendants", lambda *_args: [])
+    assert MOD.true_idle_window([], "restart", gateway_pids=[42]) is False
+
+
+def test_proc_stat_parser_handles_spaces_and_parentheses_in_comm():
+    raw = "123 (gateway helper (x y)) S 42 0 0 0 0 0 0 0 0 0 0"
+    assert MOD._proc_stat_state_ppid(raw) == ("S", 42)
+
+
+def test_gateway_worker_descendants_detects_spaced_process_name(tmp_path):
+    proc = tmp_path / "proc"
+    (proc / "100").mkdir(parents=True)
+    (proc / "101").mkdir()
+    (proc / "100" / "stat").write_text("100 (gateway) S 1 0 0")
+    (proc / "101" / "stat").write_text("101 (worker with spaces) S 100 0 0")
+    assert MOD.gateway_worker_descendants([100], proc_root=proc) == [101]
+
+
 def test_timeout_notifies_command_and_comments(tmp_path):
     board = tmp_path / "kanban.db"
     make_board(board)
@@ -87,15 +106,17 @@ def test_timeout_notifies_command_and_comments(tmp_path):
         assert db.execute("select body from task_comments").fetchone()[0] == "SAFE_RESTART=BLOCKED"
 
 
-def test_once_live_controller_fails_closed_without_restart():
-    import os
-    env = os.environ.copy()
-    env["HERMES_KANBAN_DB"] = "/home/fardochebot/.hermes/kanban.db"
-    proc = subprocess.run(
-        [sys.executable, str(Path(__file__).parents[1] / "scripts" / "gateway-safe-restart.py"),
-         "--task-id", "t_609a173d", "--once"],
-        text=True, capture_output=True, env=env,
-    )
-    # Current fleet has gateway-owned workers; --once must inspect only.
-    assert proc.returncode in (0, 2)
-    assert "pending" in proc.stdout or "SAFE_RESTART=ERROR" in proc.stderr
+def test_once_inspection_never_restarts(monkeypatch, tmp_path, capsys):
+    board = tmp_path / "kanban.db"
+    make_board(board)
+    monkeypatch.setattr(MOD, "pending_state", lambda _services: {
+        "demo.service": {"pid": 0, "newer": []}
+    })
+    monkeypatch.setattr(MOD, "gateway_worker_descendants", lambda *_args: [])
+    monkeypatch.setattr(MOD, "run", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError(args)))
+    result = MOD.main([
+        "--task-id", "restart", "--board", str(board),
+        "--services", "demo.service", "--once",
+    ])
+    assert result == 0
+    assert '"pending"' in capsys.readouterr().out

@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Iterable, cast
+from typing import Iterable
 
 DEFAULT_SERVICES = (
     "hermes-gateway-orchestrator.service",
@@ -137,18 +137,27 @@ def true_idle_window(
     callers that must decide whether to restart, rather than a diagnostic
     snapshot that could be interpreted loosely.
     """
+    databases = list(databases)
+    if not databases:
+        return False
     state = idle_state(databases, task_id)
     workers = gateway_worker_descendants(gateway_pids, exclude or {os.getpid()})
     return not state["busy_tasks"] and not state["live_worker_runs"] and not workers
 
 
-def gateway_worker_descendants(gateway_pids: Iterable[int], exclude: set[int] | None = None) -> list[int]:
+def gateway_worker_descendants(
+    gateway_pids: Iterable[int],
+    exclude: set[int] | None = None,
+    proc_root: Path | None = None,
+) -> list[int]:
     excluded = exclude or set()
+    root = proc_root or Path("/proc")
     children: dict[int, list[int]] = {}
-    for entry in Path("/proc").glob("[0-9]*"):
+    for entry in root.glob("[0-9]*"):
         try:
-            stat = (entry / "stat").read_text().split()
-            children.setdefault(int(cast(str, stat[3])), []).append(int(entry.name))
+            state, ppid = _proc_stat_state_ppid((entry / "stat").read_text())
+            if state != "Z":
+                children.setdefault(ppid, []).append(int(entry.name))
         except (OSError, ValueError, IndexError):
             continue
     result: list[int] = []
@@ -164,12 +173,23 @@ def gateway_worker_descendants(gateway_pids: Iterable[int], exclude: set[int] | 
                 # process tree.  Do not rely on command-line markers: watchdogs
                 # and adapter helpers can use arbitrary executables and would
                 # otherwise create a false idle window.
-                stat = (Path(f"/proc/{pid}") / "stat").read_text().split()
+                state, _ppid = _proc_stat_state_ppid((root / str(pid) / "stat").read_text())
             except (OSError, ValueError, IndexError):
                 continue
-            if len(stat) > 2 and stat[2] != "Z":
+            if state != "Z":
                 result.append(pid)
     return sorted(set(result))
+
+
+def _proc_stat_state_ppid(raw: str) -> tuple[str, int]:
+    """Parse state and PPID without splitting the process name."""
+    close = raw.rfind(")")
+    if close < 0:
+        raise ValueError("invalid /proc stat: missing process-name terminator")
+    fields = raw[close + 1 :].split()
+    if len(fields) < 2:
+        raise ValueError("invalid /proc stat: missing state or PPID")
+    return fields[0], int(fields[1])
 
 
 def append_comment(databases: Iterable[Path], task_id: str, body: str) -> None:
@@ -203,6 +223,9 @@ def wait_for_idle(args: argparse.Namespace, services: tuple[str, ...], databases
             {os.getpid()},
         )
         snapshot = {"pending": pending, "idle": idle, "gateway_worker_children": workers}
+        if args.once:
+            print(json.dumps(snapshot, indent=2, sort_keys=True))
+            return snapshot
         if any(state["newer"] for state in pending.values()) and true_idle_window(
             databases,
             args.task_id,
@@ -210,9 +233,7 @@ def wait_for_idle(args: argparse.Namespace, services: tuple[str, ...], databases
             {os.getpid()},
         ):
             return snapshot
-        if args.once:
-            print(json.dumps(snapshot, indent=2, sort_keys=True))
-            raise SystemExit(2)
+
         if time.monotonic() >= deadline:
             reason = "idle window not observed within 24h; restart skipped"
             channel = notify_owner(reason, command=args.notify_command, hermes_home=args.hermes_home)
@@ -225,6 +246,8 @@ def perform(args: argparse.Namespace) -> int:
     services = tuple(filter(None, args.services.split(",")))
     databases = board_paths(args.board)
     snapshot = wait_for_idle(args, services, databases)
+    if args.once:
+        return 0
     run("systemctl", "--user", "restart", *services)
     deadline = time.monotonic() + args.verify_timeout
     states = {}
