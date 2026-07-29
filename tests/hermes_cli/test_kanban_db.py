@@ -526,6 +526,43 @@ def test_review_crash_failover_keeps_same_card_in_review(kanban_home, monkeypatc
         assert task.status not in {"ready", "running", "todo", "triage"}
 
 
+def test_reviewer_failure_receipt_is_bounded_redacted_and_classified(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="receipt", assignee="code-reviewer-a")
+        _set_task_status(conn, task_id, "review")
+        assert kb.claim_review_task(conn, task_id, claimer="review:receipt") is not None
+        kb.failover_review_task(
+            conn,
+            task_id,
+            "code-reviewer-b",
+            error="API Error: 529 Overloaded bearer secret-token " + "x" * 1000,
+        )
+        run = kb.list_runs(conn, task_id)[-1]
+        receipt = kb.get_task_receipt(conn, task_id)
+        assert receipt is not None
+
+        assert run.metadata["failure_class"] == "provider_overload"
+        assert "secret-token" not in (run.error or "")
+        assert len(run.error or "") <= 500
+        assert receipt["status"] == "review"
+        assert receipt["assignee"] == "code-reviewer-b"
+        assert receipt["last_transition"]["kind"] == "review_failover"
+
+
+def test_compact_receipt_tracks_latest_transition_without_history(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="compact", assignee="programmer")
+        receipt = kb.get_task_receipt(conn, task_id)
+        assert receipt is not None
+        assert receipt["status"] == "ready"
+        assert receipt["current_run_id"] is None
+        assert receipt["last_transition"]["kind"] == "created"
+        assert set(receipt) == {
+            "id", "status", "assignee", "current_run_id",
+            "last_transition", "last_error",
+        }
+
+
 def test_claim_uses_env_default_ttl(kanban_home, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_CLAIM_TTL_SECONDS", "3600")
     with kb.connect() as conn:

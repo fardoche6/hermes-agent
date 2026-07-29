@@ -500,6 +500,7 @@ def _task_summary_dict(kb, conn, task, *, board: Optional[str] = None) -> dict[s
     """Compact task shape for board-listing tools."""
     parents = kb.parent_ids(conn, task.id)
     children = kb.child_ids(conn, task.id)
+    receipt = kb.get_task_receipt(conn, task.id)
     return {
         "id": task.id,
         "board": board,
@@ -522,6 +523,9 @@ def _task_summary_dict(kb, conn, task, *, board: Optional[str] = None) -> dict[s
         "children": children,
         "parent_count": len(parents),
         "child_count": len(children),
+        # Compact event-driven receipt; callers needing comments, full runs,
+        # or worker context must opt into kanban_show.
+        "current_receipt": receipt,
     }
 
 
@@ -1774,7 +1778,8 @@ KANBAN_LIST_SCHEMA = {
         "work to route. Supports the same core filters as the CLI: assignee, "
         "status, tenant, include_archived, and limit. Returns compact rows "
         "with ids, title, status, assignee, priority, parent/child ids, and "
-        "counts. Bounded to 50 rows by default, 200 max, with truncation "
+        "counts, and a compact current receipt (last transition and bounded "
+        "error). Bounded to 50 rows by default, 200 max, with truncation "
         "metadata. Also recomputes ready tasks before listing, matching the "
         "CLI. Orchestrator-only — dispatcher-spawned task workers never see "
         "this tool."
@@ -1790,7 +1795,7 @@ KANBAN_LIST_SCHEMA = {
                 "type": "string",
                 "enum": [
                     "triage", "todo", "ready", "running",
-                    "blocked", "done", "archived",
+                    "blocked", "review", "done", "archived",
                 ],
                 "description": "Optional task status filter.",
             },
