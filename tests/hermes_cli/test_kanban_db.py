@@ -414,6 +414,118 @@ def test_review_transition_rejects_unclaimed_running_task(kanban_home):
             kb.submit_task_for_review(conn, task_id, "code-reviewer")
 
 
+def test_review_dispatch_failover_on_overload_keeps_review_column(
+    kanban_home, monkeypatch,
+):
+    """A reviewer transport failure tries the next reviewer on the same card."""
+    monkeypatch.setattr(
+        kb, "_reviewer_candidates",
+        lambda current: (["code-reviewer-claudecode", "code-reviewer"], []),
+    )
+    attempts = []
+
+    def spawn(task, workspace):
+        attempts.append(task.assignee)
+        if task.assignee == "code-reviewer-claudecode":
+            raise RuntimeError("API Error: 529 Overloaded")
+        return 12345
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="review failover", assignee="programmer")
+        kb.claim_task(conn, task_id, claimer="impl")
+        kb.submit_task_for_review(conn, task_id, "code-reviewer-claudecode")
+        result = kb.dispatch_once(conn, spawn_fn=spawn)
+        task = kb.get_task(conn, task_id)
+
+        assert attempts == ["code-reviewer-claudecode", "code-reviewer"]
+        assert result.spawned and result.spawned[0][1] == "code-reviewer"
+        assert task and task.status == "review"
+        assert task.assignee == "code-reviewer"
+        assert [e.kind for e in kb.list_events(conn, task_id)].count("review_failover") == 1
+
+
+def test_review_dispatch_missing_skill_preflight_uses_alternate(
+    kanban_home, monkeypatch,
+):
+    """A missing reviewer skill is recorded and skipped before spawning."""
+    monkeypatch.setattr(
+        kb, "_reviewer_candidates",
+        lambda current: (
+            ["code-reviewer"],
+            [{"profile": current, "error": "missing skill: sdlc-review"}],
+        ),
+    )
+    spawned = []
+
+    def spawn(task, workspace):
+        spawned.append(task.assignee)
+        return 12346
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="missing reviewer skill", assignee="programmer")
+        kb.claim_task(conn, task_id, claimer="impl")
+        kb.submit_task_for_review(conn, task_id, "code-reviewer-claudecode")
+        kb.dispatch_once(conn, spawn_fn=spawn)
+        task = kb.get_task(conn, task_id)
+
+        assert spawned == ["code-reviewer"]
+        assert task and task.status == "review"
+        assert task.assignee == "code-reviewer"
+
+
+def test_review_dispatch_all_lanes_failed_blocks_with_bounded_diagnostics(
+    kanban_home, monkeypatch,
+):
+    """Exhausted reviewer lanes block once instead of looping through ready."""
+    monkeypatch.setattr(
+        kb, "_reviewer_candidates",
+        lambda current: (["code-reviewer-a", "code-reviewer-b"], []),
+    )
+
+    def spawn(task, workspace):
+        raise RuntimeError("API Error: 529 Overloaded " + "x" * 1000)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="all reviewers down", assignee="programmer")
+        kb.claim_task(conn, task_id, claimer="impl")
+        kb.submit_task_for_review(conn, task_id, "code-reviewer-a")
+        kb.dispatch_once(conn, spawn_fn=spawn)
+        task = kb.get_task(conn, task_id)
+
+        assert task and task.status == "blocked"
+        assert task.status not in {"ready", "running", "todo", "triage"}
+        assert task.last_failure_error and len(task.last_failure_error) <= 500
+        assert any(e.kind == "review_lanes_failed" for e in kb.list_events(conn, task_id))
+
+
+def test_review_crash_failover_keeps_same_card_in_review(kanban_home, monkeypatch):
+    """A dead reviewer process is replaced without a Ready/Blocked hop."""
+    monkeypatch.setattr(
+        kb, "_reviewer_candidates",
+        lambda current: (["code-reviewer-a", "code-reviewer-b"], []),
+    )
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="review crash failover", assignee="code-reviewer-a")
+        _set_task_status(conn, task_id, "review")
+        host = kb._claimer_id().split(":", 1)[0]
+        claimed = kb.claim_review_task(conn, task_id, claimer=f"{host}:review")
+        assert claimed is not None
+        pid = 98766
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, started_at=? WHERE id=?",
+            (pid, int(time.time()) - 60, task_id),
+        )
+        conn.commit()
+        kb._record_worker_exit(pid, _exited_status(1))
+
+        assert task_id in kb.detect_crashed_workers(conn)
+        task = kb.get_task(conn, task_id)
+        assert task and task.status == "review"
+        assert task.assignee == "code-reviewer-b"
+        assert task.status not in {"ready", "running", "todo", "triage"}
+
+
 def test_claim_uses_env_default_ttl(kanban_home, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_CLAIM_TTL_SECONDS", "3600")
     with kb.connect() as conn:
