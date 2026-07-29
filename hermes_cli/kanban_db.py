@@ -4450,8 +4450,8 @@ def _bounded_review_error(error: object) -> str:
     )
     text = re.sub(
         r"(?i)(authorization\s*[:=]\s*(?:(?:bearer|basic)\s+)?|bearer\s+|"
-        r"(?:api[_ -]?key|access[_ -]?token|auth[_ -]?token|token|"
-        r"password|passwd|secret|cookie)\s*\\?[\"']?\s*[:=]\s*\\?[\"']?)"
+        r"(?:authorization|api[_ -]?key|access[_ -]?token|auth[_ -]?token|token|"
+        r"password|passwd|secret|cookie)\s*\\*[\"']?\s*[:=]\s*\\*[\"']?)"
         r"[^\s,;\"'}]+",
         r"\1[REDACTED]",
         text,
