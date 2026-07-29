@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -823,6 +824,42 @@ def test_detect_crashed_workers_isolated_failure_normal_retry(
             assert task.status == "ready", (
                 f"task {tid} should stay ready (isolated), got {task.status}"
             )
+
+
+def test_detect_crashed_review_worker_restores_review_status(
+    kanban_home, monkeypatch,
+):
+    """A dead reviewer must return the card to Review, not implementation."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(
+        _kb, "_classify_worker_exit", lambda _pid: ("nonzero_exit", 1),
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="review crash", assignee="programmer")
+        host = _kb._claimer_id().split(":", 1)[0]
+        assert kb.claim_task(conn, task_id, claimer=f"{host}:implement")
+        assert kb.submit_task_for_review(conn, task_id, "code-reviewer")
+        assert kb.claim_review_task(conn, task_id, claimer=f"{host}:review")
+        kb._set_worker_pid(conn, task_id, 54321)
+        conn.execute(
+            "UPDATE tasks SET started_at = ? WHERE id = ?",
+            (int(time.time()) - 60, task_id),
+        )
+        conn.commit()
+
+        assert kb.detect_crashed_workers(conn) == [task_id]
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "review"
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? "
+            "AND kind = 'crashed' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert json.loads(event["payload"])["source_status"] == "review"
 
 
 def test_detect_crashed_workers_skips_freshly_claimed_tasks(

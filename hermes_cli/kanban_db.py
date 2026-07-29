@@ -7534,7 +7534,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # (task_id, pid, claimer, protocol_violation, error_text)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
+            "SELECT id, worker_pid, claim_lock, started_at, current_run_id "
+            "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -7618,12 +7619,33 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
+            # A review claim temporarily changes the task row to ``running``.
+            # Preserve that source state when reclaiming a dead reviewer so a
+            # crash/rate-limit/protocol recovery returns the card to Review,
+            # rather than silently moving it into the implementation queue.
+            source_status = "ready"
+            if row["current_run_id"] is not None:
+                claim_event = conn.execute(
+                    "SELECT payload FROM task_events "
+                    "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (row["id"], row["current_run_id"]),
+                ).fetchone()
+                if claim_event is not None and claim_event["payload"]:
+                    try:
+                        claim_payload = json.loads(claim_event["payload"])
+                        if claim_payload.get("source_status") == "review":
+                            source_status = "review"
+                    except (TypeError, ValueError):
+                        pass
+            event_payload["source_status"] = source_status
+
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (row["id"], pid, row["claim_lock"]),
+                (source_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
