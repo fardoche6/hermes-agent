@@ -4418,8 +4418,20 @@ def _bounded_review_error(error: object) -> str:
     unbounded subprocess output in the board history.
     """
     text = " ".join(str(error or "reviewer failed").split())
+    # Logs commonly contain credentials in headers, structured fields, or
+    # shell-style assignments. Redact the value but retain the field name so
+    # the diagnostic remains useful. Keep this deliberately bounded after
+    # redaction because this string is persisted in task history.
     text = re.sub(
-        r"(?i)(bearer\s+|api[_ -]?key\s*[:=]\s*|token\s*[:=]\s*)[^\s,;]+",
+        r"(?i)(authorization\s*[:=]\s*(?:(?:bearer|basic)\s+)?|bearer\s+|"
+        r"(?:api[_ -]?key|access[_ -]?token|auth[_ -]?token|token|"
+        r"password|passwd|secret|cookie)\s*[:=]\s*)[^\s,;]+",
+        r"\1[REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)([?&](?:api[_-]?key|access[_-]?token|auth[_-]?token|token|"
+        r"password|secret)=)[^&\s]+",
         r"\1[REDACTED]",
         text,
     )
@@ -4593,6 +4605,24 @@ def failover_review_task(
                 run_id=run_id,
             )
         return get_task(conn, task_id)
+
+
+def _board_for_connection(conn: sqlite3.Connection) -> Optional[str]:
+    """Resolve the board owning ``conn`` without consulting global selection."""
+    try:
+        db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2]).resolve()
+        for meta in list_boards(include_archived=True):
+            slug = str(meta["slug"])
+            candidate = (
+                kanban_home() / "kanban.db"
+                if slug == DEFAULT_BOARD
+                else board_dir(slug) / "kanban.db"
+            ).resolve()
+            if candidate == db_path:
+                return slug
+    except (OSError, KeyError, TypeError, IndexError, sqlite3.Error):
+        pass
+    return None
 
 
 def heartbeat_claim(
@@ -7832,6 +7862,17 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 if code is not None and kind != "unknown":
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
+
+            # A dead PID is only transport evidence. The worker's bounded tail
+            # is the load-bearing diagnostic used to classify provider
+            # overload/capability failures while retaining board scoping.
+            if row["status"] == "review":
+                log_tail = read_worker_log(
+                    row["id"], tail_bytes=4096,
+                    board=_board_for_connection(conn),
+                )
+                if log_tail:
+                    error_text = f"{error_text}; worker log tail: {log_tail}"
 
             source_status = "review" if row["status"] == "review" else "ready"
             cur = conn.execute(
