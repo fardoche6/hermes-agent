@@ -453,6 +453,38 @@ def test_stale_claim_reclaimed(kanban_home, monkeypatch):
         assert killed == [signal.SIGTERM]
 
 
+def test_default_claim_ttl_sets_two_hour_expiry(kanban_home, monkeypatch):
+    """A default claim expires at approximately now + two hours."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.delenv("HERMES_KANBAN_CLAIM_TTL_SECONDS", raising=False)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="x", assignee="a")
+        before = int(time.time())
+        claimed = kb.claim_task(conn, task_id, claimer="test-worker")
+        after = int(time.time())
+        assert claimed is not None
+        expires = claimed.claim_expires
+
+    assert _kb.DEFAULT_CLAIM_TTL_SECONDS == 2 * 60 * 60
+    assert expires is not None
+    assert before + _kb.DEFAULT_CLAIM_TTL_SECONDS <= expires <= after + _kb.DEFAULT_CLAIM_TTL_SECONDS
+
+
+def test_explicit_claim_ttl_overrides_two_hour_default(kanban_home):
+    """An explicit TTL remains authoritative over the built-in default."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="x", assignee="a")
+        before = int(time.time())
+        claimed = kb.claim_task(conn, task_id, ttl_seconds=37, claimer="test-worker")
+        after = int(time.time())
+        assert claimed is not None
+        expires = claimed.claim_expires
+
+    assert expires is not None
+    assert before + 37 <= expires <= after + 37
+
+
 def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
     kanban_home, monkeypatch,
 ):
