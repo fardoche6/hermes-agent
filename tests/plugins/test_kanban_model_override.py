@@ -290,3 +290,40 @@ def test_model_options_endpoint_shape(client, monkeypatch):
         assert "slug" in row and "label" in row and "models" in row
         assert isinstance(row["models"], list)
         assert len(row["models"]) >= 1  # empty-model rows are filtered out
+
+
+def test_patch_review_branch(client):
+    task = _create(client, assignee="programmer")
+    with kb.connect() as conn:
+        assert kb.claim_task(conn, task["id"]) is not None
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "review", "reviewer": "code-reviewer"},
+    )
+    assert response.status_code == 200, response.text
+    updated = response.json()["task"]
+    assert updated["status"] == "review"
+    assert updated["assignee"] == "code-reviewer"
+
+
+def test_patch_request_change_branch(client):
+    task = _create(client, assignee="programmer")
+    with kb.connect() as conn:
+        assert kb.claim_task(conn, task["id"]) is not None
+    review = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "review", "reviewer": "code-reviewer"},
+    )
+    assert review.status_code == 200, review.text
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "review_decision": "REQUEST_CHANGES",
+            "programmer": "programmer",
+            "review_reason": "add missing test",
+        },
+    )
+    assert response.status_code == 200, response.text
+    updated = response.json()["task"]
+    assert updated["status"] == "running"
+    assert updated["assignee"] == "programmer"

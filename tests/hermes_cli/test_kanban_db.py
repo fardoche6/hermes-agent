@@ -549,6 +549,60 @@ def test_reviewer_failure_receipt_is_bounded_redacted_and_classified(kanban_home
         assert receipt["last_transition"]["kind"] == "review_failover"
 
 
+def test_review_crash_uses_bounded_board_scoped_worker_log(kanban_home, monkeypatch):
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="logged review crash", assignee="code-reviewer-a")
+        _set_task_status(conn, task_id, "review")
+        host = kb._claimer_id().split(":", 1)[0]
+        assert kb.claim_review_task(conn, task_id, claimer=f"{host}:review") is not None
+        pid = 98767
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, started_at=? WHERE id=?",
+            (pid, int(time.time()) - 60, task_id),
+        )
+        conn.commit()
+        board_seen = []
+        monkeypatch.setattr(
+            kb, "read_worker_log",
+            lambda tid, *, tail_bytes, board: (
+                board_seen.append((tid, tail_bytes, board))
+                or "API Error: 529 Overloaded password=top-secret"
+            ),
+        )
+        kb._record_worker_exit(pid, _exited_status(1))
+        monkeypatch.setattr(
+            kb, "_reviewer_candidates",
+            lambda current: (["code-reviewer-b"], []),
+        )
+        captured = []
+        original_failover = kb.failover_review_task
+        monkeypatch.setattr(
+            kb, "failover_review_task",
+            lambda *args, **kwargs: (
+                captured.append(kwargs["error"])
+                or original_failover(*args, **kwargs)
+            ),
+        )
+        assert task_id in kb.detect_crashed_workers(conn)
+        assert len(captured) == 1
+        assert kb._review_failure_class(captured[0]) == "provider_overload"
+        assert "top-secret" not in kb._bounded_review_error(captured[0])
+        assert board_seen == [(task_id, 4096, "default")]
+
+
+def test_bounded_review_error_redacts_common_authorization_forms():
+    value = kb._bounded_review_error(
+        "Authorization: Bearer abc authorization=xyz api_key=one "
+        "access-token=two password=three secret=four cookie=five "
+        "https://x.test/?token=six"
+    )
+    for secret in ("abc", "xyz", "one", "two", "three", "four", "five", "six"):
+        assert secret not in value
+    assert "Authorization: Bearer [REDACTED]" in value
+    assert len(value) <= 500
+
+
 def test_compact_receipt_tracks_latest_transition_without_history(kanban_home):
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="compact", assignee="programmer")

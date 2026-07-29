@@ -3035,3 +3035,42 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+def test_kanban_review_handler_submits_same_card(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import kanban_db as kb
+    import tools.kanban_tools as kt
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="review handler", assignee="programmer")
+        assert kb.claim_task(conn, task_id) is not None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    result = json.loads(kt._handle_submit_review({"reviewer": "code-reviewer"}))
+    assert result == {
+        "ok": True, "task_id": task_id, "status": "review",
+        "assignee": "code-reviewer",
+    }
+
+
+def test_kanban_request_changes_handler_returns_to_programmer(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import kanban_db as kb
+    import tools.kanban_tools as kt
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="changes handler", assignee="programmer")
+        assert kb.claim_task(conn, task_id) is not None
+        assert kb.submit_task_for_review(conn, task_id, "code-reviewer") is not None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    result = json.loads(kt._handle_request_changes({
+        "programmer": "programmer", "reason": "add coverage",
+    }))
+    assert result == {
+        "ok": True, "task_id": task_id, "status": "running",
+        "assignee": "programmer",
+    }
