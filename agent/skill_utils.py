@@ -49,6 +49,14 @@ EXCLUDED_SKILL_DIRS = frozenset(
 # archive workflow preserves a complete old skill package under references/.
 SKILL_SUPPORT_DIRS = frozenset(("references", "templates", "assets", "scripts"))
 
+# Curator pre-edit snapshots used to be written below a live skills root. A
+# snapshot is not a skill, even when it contains copied SKILL.md frontmatter.
+# Keep this narrow so ordinary directories named ``snapshot`` or ``pre-edit``
+# remain valid skill categories.
+_PRE_EDIT_SNAPSHOT_DIR_RE = re.compile(
+    r"^[A-Za-z0-9_-]+-pre-edit-snapshot-[A-Za-z0-9_-]+$"
+)
+
 # ── Org-shared skills (sync contract) ───────────────────────────
 # Org mirrors live under ~/.hermes/skills/_org/<org_id>/. Resolution is
 # TOKEN-GATED via a marker file the sync client writes after verifying the
@@ -114,8 +122,10 @@ def is_excluded_skill_path(path, *, root: Optional[Path] = None) -> bool:
     except AttributeError:
         from pathlib import PurePath
         parts = PurePath(str(path)).parts
-    return any(part in EXCLUDED_SKILL_DIRS for part in parts) or is_skill_support_path(
-        path, root=root
+    return (
+        any(part in EXCLUDED_SKILL_DIRS for part in parts)
+        or any(_PRE_EDIT_SNAPSHOT_DIR_RE.fullmatch(part) for part in parts)
+        or is_skill_support_path(path, root=root)
     )
 
 
@@ -888,6 +898,7 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
             d
             for d in dirs
             if d not in EXCLUDED_SKILL_DIRS
+            and not _PRE_EDIT_SNAPSHOT_DIR_RE.fullmatch(d)
             and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
         ]
         if filename in files:

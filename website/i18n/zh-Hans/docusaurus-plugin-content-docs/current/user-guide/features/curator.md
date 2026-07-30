@@ -101,7 +101,7 @@ hermes curator restore <skill>  # move an archived skill back to active
 
 ## 备份与回滚
 
-在每次真正的 curator pass 之前，Hermes 会在 `~/.hermes/skills/.curator_backups/<utc-iso>/skills.tar.gz` 处对 `~/.hermes/skills/` 进行 tar.gz 快照。如果某次 pass 归档或合并了你不希望被触碰的内容，可以用一条命令撤销整次运行：
+在每次真正的 curator pass 之前，Hermes 会在 `~/.hermes/skill-snapshots/<utc-iso>/skills.tar.gz` 处对 `~/.hermes/skills/` 进行 tar.gz 快照。如果某次 pass 归档或合并了你不希望被触碰的内容，可以用一条命令撤销整次运行：
 
 ```bash
 hermes curator rollback        # restore newest snapshot (with confirmation)

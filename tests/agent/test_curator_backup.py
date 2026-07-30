@@ -77,7 +77,7 @@ def test_snapshot_prunes_to_keep_count(backup_env, monkeypatch):
         monkeypatch.setattr(cb, "_utc_id", lambda now=None, _f=fid: _f)
         cb.snapshot_skills(reason=f"n{i}")
 
-    remaining = sorted(p.name for p in (backup_env["skills"] / ".curator_backups").iterdir())
+    remaining = sorted(p.name for p in (backup_env["home"] / "skill-snapshots").iterdir())
     # Newest 3 kept (lex order == date order for this id format)
     assert remaining == ids[2:], f"expected newest 3, got {remaining}"
 
@@ -128,7 +128,7 @@ def test_rollback_is_itself_undoable(backup_env):
         f"{[(r.get('id'), r.get('reason')) for r in rows]}"
     )
     # And the transient staging dir must be gone (it's implementation detail)
-    backups_dir = skills / ".curator_backups"
+    backups_dir = backup_env["home"] / "skill-snapshots"
     staging_dirs = [p for p in backups_dir.iterdir() if p.name.startswith(".rollback-staging-")]
     assert staging_dirs == [], (
         f"staging dir should be cleaned up on success, got: {staging_dirs}"
@@ -337,7 +337,7 @@ def test_restore_cron_skill_links_standalone(backup_env):
     home = backup_env["home"]
 
     # Prime a snapshot dir manually with cron-jobs.json
-    backups_dir = home / "skills" / ".curator_backups" / "fake-id"
+    backups_dir = home / "skill-snapshots" / "fake-id"
     backups_dir.mkdir(parents=True)
     (backups_dir / cb.CRON_JOBS_FILENAME).write_text(json.dumps([
         {"id": "job-1", "name": "one", "skills": ["narrow-a", "narrow-b"]},

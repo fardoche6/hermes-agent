@@ -138,6 +138,26 @@ def test_skill_support_path_uses_explicit_discovery_root_not_cwd(tmp_path, monke
     assert is_excluded_skill_path(relative, root=discovery_root) is True
 
 
+def test_pre_edit_snapshot_directories_are_excluded_without_overmatching(tmp_path):
+    """Only the explicit pre-edit snapshot artifact convention is excluded."""
+    snapshot = tmp_path / "category" / "kanban-lifecycle-pre-edit-snapshot-t_0bd96003" / "SKILL.md"
+    snapshot.parent.mkdir(parents=True)
+    snapshot.write_text("---\nname: kanban-lifecycle\n---\n", encoding="utf-8")
+
+    top_level_snapshot = tmp_path / "hermes-kanban-pre-edit-snapshot-t_0bd96003" / "SKILL.md"
+    top_level_snapshot.parent.mkdir()
+    top_level_snapshot.write_text("---\nname: kanban-lifecycle\n---\n", encoding="utf-8")
+
+    legitimate = tmp_path / "snapshot" / "pre-edit" / "skill" / "SKILL.md"
+    legitimate.parent.mkdir(parents=True)
+    legitimate.write_text("---\nname: legitimate\n---\n", encoding="utf-8")
+
+    assert is_excluded_skill_path(snapshot) is True
+    assert is_excluded_skill_path(top_level_snapshot) is True
+    assert is_excluded_skill_path(legitimate) is False
+    assert list(iter_skill_index_files(tmp_path, "SKILL.md")) == [legitimate]
+
+
 # ── skill_matches_platform on Termux ──────────────────────────────────────
 
 
