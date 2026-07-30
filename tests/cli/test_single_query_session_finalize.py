@@ -201,3 +201,53 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
     assert ("claim", "cli", True) in calls
     assert ("run", "hello", []) in calls
     assert calls[-1] == ("finalize", "quiet-session")
+
+
+def test_quiet_kanban_goal_loop_defers_transport_failure_without_blocking(monkeypatch):
+    task = SimpleNamespace(
+        title="finish the task",
+        body="",
+        goal_max_turns=1,
+        status="running",
+    )
+    calls = []
+
+    class FakeConnection:
+        def close(self):
+            pass
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "quiet-transport-task")
+    monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: FakeConnection())
+    monkeypatch.setattr("hermes_cli.kanban_db.get_task", lambda _conn, _task_id: task)
+    monkeypatch.setattr(
+        "hermes_cli.kanban_db.block_task",
+        lambda _conn, _task_id, *, reason: calls.append(("block", reason)),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.goals.judge_goal",
+        lambda *_args, **_kwargs: (
+            "continue",
+            "launcher transport unavailable",
+            False,
+            None,
+            True,
+        ),
+    )
+
+    def run_conversation(**_kwargs):
+        calls.append("run_turn")
+        return {"final_response": "unexpected continuation"}
+
+    fake_cli = SimpleNamespace(
+        agent=SimpleNamespace(
+            session_id="quiet-session",
+            run_conversation=run_conversation,
+        ),
+        conversation_history=[],
+        session_id="quiet-session",
+    )
+
+    cli._run_kanban_goal_loop_q(fake_cli, "first response")
+
+    assert "run_turn" not in calls
+    assert not any(call[0] == "block" for call in calls if isinstance(call, tuple))
