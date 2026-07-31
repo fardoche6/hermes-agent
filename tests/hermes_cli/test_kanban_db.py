@@ -2201,8 +2201,22 @@ def test_dispatch_reclaims_stale_before_spawning(kanban_home):
             "UPDATE tasks SET claim_expires = ? WHERE id = ?",
             (int(time.time()) - 1, t),
         )
+        before = [tuple(row) for row in conn.execute(
+            "SELECT status, claim_expires, current_run_id FROM tasks WHERE id = ?", (t,)
+        ).fetchall()]
+        before_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ?", (t,)
+        ).fetchone()[0]
         res = kb.dispatch_once(conn, dry_run=True)
-    assert res.reclaimed == 1
+        after = [tuple(row) for row in conn.execute(
+            "SELECT status, claim_expires, current_run_id FROM tasks WHERE id = ?", (t,)
+        ).fetchall()]
+        after_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ?", (t,)
+        ).fetchone()[0]
+    assert res.reclaimed == 0
+    assert after == before
+    assert after_events == before_events
 
 
 # ---------------------------------------------------------------------------

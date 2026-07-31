@@ -310,3 +310,102 @@ def test_dry_run_agrees_with_real_dispatch_for_review_handoff(
         )
         assert real.review_reconciled == dry.review_reconciled
         assert real_spawned == [(task_id, "code-reviewer", "")]
+
+
+def test_natural_todo_dry_run_is_strictly_read_only(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """A dependency handoff in its natural todo state is only predicted."""
+    monkeypatch.setattr(
+        kb, "_reviewer_candidates", lambda current: (["code-reviewer"], []),
+    )
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="coding card", assignee="programmer")
+        assert kb.claim_task(conn, task_id, claimer=f"{host}:impl") is not None
+        assert kb.block_task(
+            conn, task_id, kind="dependency",
+            reason="review-required: needs sign-off",
+        ) is True
+        before = {
+            table: [tuple(row) for row in conn.execute(f"SELECT * FROM {table}").fetchall()]
+            for table in ("tasks", "task_runs", "task_events", "task_comments")
+        }
+
+        result = kb.dispatch_once(conn, dry_run=True)
+
+        assert task_id in result.review_reconciled
+        assert (task_id, "code-reviewer", "") in result.spawned
+        for table, rows in before.items():
+            assert [tuple(row) for row in conn.execute(
+                f"SELECT * FROM {table}"
+            ).fetchall()] == rows
+
+
+def test_no_compatible_reviewer_is_fail_closed_in_dry_and_real_dispatch(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    monkeypatch.setattr(kb, "_reviewer_candidates", lambda current: ([], []))
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="coding card", assignee="programmer")
+        assert kb.claim_task(conn, task_id, claimer=f"{host}:impl") is not None
+        assert kb.block_task(
+            conn, task_id, kind="dependency",
+            reason="review-required: needs sign-off",
+        ) is True
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+        conn.commit()
+
+        dry = kb.dispatch_once(conn, dry_run=True)
+        assert dry.review_reconciled == []
+        assert dry.spawned == []
+        assert kb.get_task(conn, task_id).status == "ready"
+
+        spawned = []
+        real = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawned.append(task.id),
+        )
+        assert real.review_reconciled == []
+        assert real.spawned == []
+        assert spawned == []
+        assert kb.get_task(conn, task_id).status == "ready"
+
+
+def test_review_reconciliation_cas_does_not_touch_a_racing_claim(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    monkeypatch.setattr(
+        kb, "_reviewer_candidates", lambda current: (["code-reviewer"], []),
+    )
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="coding card", assignee="programmer")
+        assert kb.claim_task(conn, task_id, claimer=f"{host}:impl") is not None
+        assert kb.block_task(
+            conn, task_id, kind="dependency",
+            reason="review-required: needs sign-off",
+        ) is True
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+        conn.commit()
+
+        original_submit = kb.submit_task_for_review
+        raced = {}
+
+        def race_then_submit(connection, task, reviewer, **kwargs):
+            raced["run"] = kb.claim_task(connection, task, claimer=f"{host}:racer")
+            return original_submit(connection, task, reviewer, **kwargs)
+
+        monkeypatch.setattr(kb, "submit_task_for_review", race_then_submit)
+        assert kb.reconcile_review_handoffs(conn) == []
+        current = kb.get_task(conn, task_id)
+        assert current.status == "running"
+        assert current.assignee == "programmer"
+        assert raced["run"] is not None
+        run = conn.execute(
+            "SELECT status, ended_at FROM task_runs WHERE id=?",
+            (raced["run"].current_run_id,),
+        ).fetchone()
+        assert run["status"] == "running"
+        assert run["ended_at"] is None
