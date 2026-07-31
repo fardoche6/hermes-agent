@@ -4537,6 +4537,10 @@ def submit_task_for_review(
     conn: sqlite3.Connection,
     task_id: str,
     reviewer: str,
+    *,
+    expected_directive_id: Optional[int] = None,
+    expected_assignee: Optional[str] = None,
+    expected_status: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically hand an implementation run to a reviewer.
 
@@ -4556,6 +4560,8 @@ def submit_task_for_review(
         ).fetchone()
         if not row:
             return None
+        if expected_status is not None and row["status"] != expected_status:
+            return None
         if row["status"] not in {"running", "blocked", "ready"}:
             raise RuntimeError(
                 f"cannot submit {task_id} for review from status {row['status']!r}"
@@ -4571,6 +4577,12 @@ def submit_task_for_review(
                     f"cannot submit {task_id} for review from unrelated "
                     f"{row['status']} state"
                 )
+            if (
+                expected_directive_id is not None
+                and _latest_review_directive_id(conn, task_id)
+                != expected_directive_id
+            ):
+                return None
             if row["claim_lock"] is not None:
                 raise RuntimeError(
                     f"cannot submit {task_id} for review: task is claimed"
@@ -4594,15 +4606,33 @@ def submit_task_for_review(
                 return None
         if row["status"] == "running" and row["claim_lock"] is None:
             raise RuntimeError(f"cannot submit {task_id}: running task is unclaimed")
-        old_run_id = _end_run(
-            conn, task_id, outcome="review_submitted", status="review",
-        )
-        conn.execute(
-            "UPDATE tasks SET status='review', assignee=?, claim_lock=NULL, "
-            "claim_expires=NULL, worker_pid=NULL, block_kind=NULL, "
-            "block_recurrences=0 WHERE id=?",
-            (reviewer, task_id),
-        )
+        old_run_id = None
+        if row["status"] == "running":
+            old_run_id = _end_run(
+                conn, task_id, outcome="review_submitted", status="review",
+            )
+            conn.execute(
+                "UPDATE tasks SET status='review', assignee=?, claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL, block_kind=NULL, "
+                "block_recurrences=0 WHERE id=?",
+                (reviewer, task_id),
+            )
+        else:
+            # Apply the parked-handoff plan as a CAS. A concurrent claim must
+            # win; never close or otherwise mutate that racing run.
+            predicates = ["id = ?", "status = ?", "claim_lock IS NULL"]
+            params: list[object] = [task_id, row["status"]]
+            if expected_assignee is not None:
+                predicates.append("assignee = ?")
+                params.append(expected_assignee)
+            cur = conn.execute(
+                "UPDATE tasks SET status='review', assignee=?, claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL, block_kind=NULL, "
+                "block_recurrences=0 WHERE " + " AND ".join(predicates),
+                (reviewer, *params),
+            )
+            if cur.rowcount != 1:
+                return None
         _append_event(
             conn, task_id, "submitted_for_review",
             {"reviewer": reviewer, "previous_assignee": row["assignee"]},
@@ -8578,18 +8608,18 @@ _clear_spawn_failures = _clear_failure_counter
 
 def _plan_review_handoffs(
     conn: sqlite3.Connection,
-) -> list[tuple[str, str]]:
-    """Read-only plan of ``(task_id, reviewer)`` review handoffs to apply.
+) -> list[tuple[str, str, int, str, str]]:
+    """Read-only plan including task status for the apply-time CAS.
 
     Pure: performs no writes, so a dry-run tick can compute exactly the same
     routing decision as a real tick without mutating the board. The applier
     (:func:`reconcile_review_handoffs`) executes this plan verbatim.
     """
-    plan: list[tuple[str, str]] = []
+    plan: list[tuple[str, str, int, str, str]] = []
     try:
         rows = conn.execute(
-            "SELECT id, assignee FROM tasks "
-            "WHERE status = 'ready' AND claim_lock IS NULL "
+            "SELECT id, assignee, status FROM tasks "
+            "WHERE status IN ('todo', 'ready') AND claim_lock IS NULL "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
     except sqlite3.Error:
@@ -8607,10 +8637,15 @@ def _plan_review_handoffs(
             reviewer = next(
                 (name for name in candidates if name != row["assignee"]),
                 None,
-            ) or row["assignee"]
+            )
             if not reviewer:
                 continue
-            plan.append((task_id, reviewer))
+            plan.append((
+                task_id, reviewer,
+                _latest_review_directive_id(conn, task_id),
+                row["assignee"],
+                row["status"],
+            ))
         except Exception:
             _log.debug(
                 "kanban dispatch: review handoff planning failed for %s",
@@ -8645,9 +8680,14 @@ def reconcile_review_handoffs(conn: sqlite3.Connection) -> list[str]:
     Returns the list of reconciled task ids.
     """
     moved: list[str] = []
-    for task_id, reviewer in _plan_review_handoffs(conn):
+    for task_id, reviewer, directive_id, assignee, status in _plan_review_handoffs(conn):
         try:
-            if submit_task_for_review(conn, task_id, reviewer) is not None:
+            if submit_task_for_review(
+                conn, task_id, reviewer,
+                expected_directive_id=directive_id,
+                expected_assignee=assignee,
+                expected_status=status,
+            ) is not None:
                 moved.append(task_id)
         except Exception:
             # Never let one malformed card take down the tick; the card stays
@@ -8980,11 +9020,12 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
-    result.reclaimed = release_stale_claims(conn)
-    result.stale = detect_stale_running(
-        conn, stale_timeout_seconds=stale_timeout_seconds,
-    )
-    result.crashed = detect_crashed_workers(conn)
+    if not dry_run:
+        result.reclaimed = release_stale_claims(conn)
+        result.stale = detect_stale_running(
+            conn, stale_timeout_seconds=stale_timeout_seconds,
+        )
+        result.crashed = detect_crashed_workers(conn)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
@@ -9001,21 +9042,40 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
-    result.timed_out = enforce_max_runtime(conn)
-    result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    if not dry_run:
+        result.timed_out = enforce_max_runtime(conn)
+        result.promoted = recompute_ready(conn, failure_limit=failure_limit)
     # Reconcile documented ``review-required:`` handoffs that were promoted
     # into generic ``ready`` back into the reviewer lane on the SAME card,
     # before the ready loop can hand them to a programmer (or the respawn
     # guard can strand them). See reconcile_review_handoffs().
     # Dry run computes the SAME plan read-only so the reported (task,
     # profile, action) matches the real tick without any durable mutation.
+    # A racy writer may have promoted a parked handoff while its parent is
+    # still open. Restore the virtual todo state before planning; dry-run must
+    # only observe this condition, never repair it.
+    if not dry_run:
+        with write_txn(conn):
+            for parked in conn.execute(
+                "SELECT id FROM tasks WHERE status='ready' AND claim_lock IS NULL"
+            ).fetchall():
+                parked_id = parked["id"]
+                if pending_review_handoff(conn, parked_id) and _has_unfinished_parents(conn, parked_id):
+                    conn.execute(
+                        "UPDATE tasks SET status='todo' WHERE id=? AND status='ready'",
+                        (parked_id,),
+                    )
+                    _append_event(
+                        conn, parked_id, "review_submit_rejected",
+                        {"reason": "parents_not_done"},
+                    )
     _review_plan: dict[str, str] = {}
     if not dry_run:
         result.review_reconciled = reconcile_review_handoffs(conn)
     else:
         _plan = _plan_review_handoffs(conn)
-        _review_plan = dict(_plan)
-        result.review_reconciled = [task_id for task_id, _ in _plan]
+        _review_plan = {task_id: reviewer for task_id, reviewer, *_ in _plan}
+        result.review_reconciled = [task_id for task_id, *_ in _plan]
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -9032,11 +9092,20 @@ def _dispatch_once_locked(
             ).fetchone()[0]
         )
 
-    ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
-    ).fetchall()
+    if dry_run:
+        ready_rows = conn.execute(
+            "SELECT id, assignee FROM tasks WHERE claim_lock IS NULL AND "
+            "(status = 'ready' OR (status = 'todo' AND NOT EXISTS ("
+            "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = tasks.id AND p.status NOT IN ('done', 'archived')"
+            "))) ORDER BY priority DESC, created_at ASC"
+        ).fetchall()
+    else:
+        ready_rows = conn.execute(
+            "SELECT id, assignee FROM tasks "
+            "WHERE status = 'ready' AND claim_lock IS NULL "
+            "ORDER BY priority DESC, created_at ASC"
+        ).fetchall()
     # Honour kanban.max_in_progress: if the board already has enough running
     # tasks, skip spawning this tick so slow workers (local LLMs,
     # resource-constrained hosts) can finish what they have before more tasks
@@ -9135,6 +9204,11 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
+        # A pending review handoff with no compatible reviewer is fail-closed.
+        # Never fall through to a programmer spawn, in either mode.
+        if pending_review_handoff(conn, row["id"]) and row["id"] not in _review_plan:
+            result.respawn_guarded.append((row["id"], "reviewer_unavailable"))
+            continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
