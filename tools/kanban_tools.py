@@ -859,6 +859,14 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"scratch workspace was kept. Fix the artifact path or "
                     f"storage error, then retry kanban_complete with the same handoff."
                 )
+            except kb.MergeProofRequiredError as proof_err:
+                return tool_error(
+                    f"kanban_complete blocked: {proof_err}. "
+                    f"Your task is still in-flight (no state change). "
+                    f"Retry kanban_complete with metadata={{'merged_sha': '<commit>'}} "
+                    f"(or metadata={{'pr_resolution': 'closed_without_merge'}}) once the "
+                    f"change has landed."
+                )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
                 # worker can retry with a corrected list or drop the

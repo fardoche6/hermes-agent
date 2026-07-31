@@ -5237,6 +5237,141 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+# ---------------------------------------------------------------------------
+# Merge-proof gate — mechanically prevent premature completion of repo cards
+# ---------------------------------------------------------------------------
+#
+# "Implementation is finished" and "a reviewer said APPROVE" are both claims
+# about intent, not about the repository. A card whose deliverable is a change
+# to a git repo is only actually done once that change landed (or the PR was
+# explicitly resolved another way). This gate refuses ``-> done`` for such a
+# card until *durable structured* proof exists. Proof is never parsed out of
+# free-text comments: it comes from ``kanban_complete(metadata=...)`` keys or
+# from a recorded merge event on the card.
+
+# Structured metadata keys carrying the landed commit.
+MERGE_PROOF_SHA_KEYS = ("merged_sha", "merge_commit_sha")
+# Optional nested container: metadata["merge_proof"] = {"merged_sha": ...}.
+MERGE_PROOF_CONTAINER_KEY = "merge_proof"
+# Explicit non-merge resolutions. ``merged`` additionally requires a sha.
+MERGE_PROOF_RESOLUTION_KEY = "pr_resolution"
+MERGE_PROOF_RESOLUTIONS = {
+    "merged", "closed_without_merge", "superseded", "no_code_change",
+}
+_MERGE_SHA_RE = re.compile(r"\A[0-9a-fA-F]{7,40}\Z")
+
+# Durable card state that already proves the landing, appended out of band
+# (e.g. by a PR watcher) rather than by the completing worker.
+MERGE_PROOF_EVENT_KINDS = ("pr_merged", "merge_recorded")
+
+# Durable provenance that this card actually produced a PR / went through the
+# review lane, i.e. that merge proof is applicable at all. Free-text PR URLs in
+# comments only ever *raise* the bar (fail closed), never satisfy it.
+_PR_PROVENANCE_EVENT_KINDS = ("submitted_for_review", "changes_requested")
+
+
+class MergeProofRequiredError(ValueError):
+    """Raised by :func:`complete_task` when a repository card tries to reach
+    ``done`` without durable proof that its change actually landed.
+
+    ``ValueError`` subclass so existing tool-error handlers treat it as a
+    recoverable user error (the card is NOT mutated — the worker can retry
+    the same completion once it has the merge commit).
+    """
+
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        super().__init__(
+            f"completion blocked: {task_id} is a repository card with an open "
+            f"pull request and no durable merge proof. Pass "
+            f"metadata={{'merged_sha': '<commit>'}} (or "
+            f"metadata={{'pr_resolution': 'closed_without_merge'}}) once the "
+            f"change has actually landed."
+        )
+
+
+def _extract_merge_proof(metadata: Optional[dict]) -> Optional[dict]:
+    """Return normalised merge proof from ``metadata``, or None.
+
+    Accepts the sha keys at the top level or inside ``merge_proof``, plus an
+    explicit ``pr_resolution``. Anything malformed/ambiguous yields None (fail
+    closed) rather than a guess.
+    """
+    if not isinstance(metadata, dict):
+        return None
+    sources: list[dict] = [metadata]
+    container = metadata.get(MERGE_PROOF_CONTAINER_KEY)
+    if isinstance(container, dict):
+        sources.append(container)
+
+    sha: Optional[str] = None
+    for source in sources:
+        for key in MERGE_PROOF_SHA_KEYS:
+            value = source.get(key)
+            if isinstance(value, str) and _MERGE_SHA_RE.match(value.strip()):
+                sha = value.strip().lower()
+                break
+        if sha:
+            break
+
+    resolution: Optional[str] = None
+    for source in sources:
+        value = source.get(MERGE_PROOF_RESOLUTION_KEY)
+        if isinstance(value, str) and value.strip().lower() in MERGE_PROOF_RESOLUTIONS:
+            resolution = value.strip().lower()
+            break
+
+    if sha:
+        return {"merged_sha": sha, "pr_resolution": resolution or "merged"}
+    if resolution and resolution != "merged":
+        # An explicit non-merge resolution is durable proof on its own.
+        return {"merged_sha": None, "pr_resolution": resolution}
+    # ``pr_resolution="merged"`` without a sha is exactly the ambiguous claim
+    # this gate exists to reject.
+    return None
+
+
+def _recorded_merge_proof(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the card already carries a durable merge event."""
+    return _latest_event_id(conn, task_id, MERGE_PROOF_EVENT_KINDS) > 0
+
+
+def _requires_merge_proof(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when this card's completion must be backed by merge proof.
+
+    Proportional by design — both conditions must hold:
+
+    1. it is a *repository* card (a git worktree / a named branch), so its
+       deliverable is a repo change rather than prose or coordination, and
+    2. it has durable provenance that a PR/review cycle actually happened
+       (``submitted_for_review`` / ``changes_requested``) or a PR URL was
+       posted on the card.
+
+    A scratch/research card, or a repo card that never opened a PR, is
+    unaffected: no new proof requirement.
+    """
+    row = conn.execute(
+        "SELECT workspace_kind, branch_name FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    is_repo_card = (
+        row["workspace_kind"] == "worktree"
+        or bool(row["branch_name"])
+    )
+    if not is_repo_card:
+        return False
+    if _latest_event_id(conn, task_id, _PR_PROVENANCE_EVENT_KINDS) > 0:
+        return True
+    for c in conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ?", (task_id,),
+    ):
+        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+            return True
+    return False
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5303,6 +5438,27 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    # Gate: a repository card with an open PR may not reach ``done`` on
+    # implementation or reviewer approval alone. Runs before the write txn,
+    # same shape as the created_cards gate: audit event, no state mutation,
+    # raise for the caller to surface. Fails CLOSED when proof is absent or
+    # ambiguous.
+    merge_proof = _extract_merge_proof(metadata)
+    if merge_proof is None and _requires_merge_proof(conn, task_id):
+        if not _recorded_merge_proof(conn, task_id):
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_blocked_missing_merge_proof",
+                    {
+                        "summary_preview": (
+                            (summary or result or "").strip().splitlines()[0][:200]
+                            if (summary or result)
+                            else None
+                        ),
+                    },
+                )
+            raise MergeProofRequiredError(task_id)
 
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
