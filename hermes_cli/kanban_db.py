@@ -4073,6 +4073,21 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+def _has_unfinished_parents(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when any linked parent of ``task_id`` is not yet done/archived.
+
+    Single source of truth for the dependency invariant: no task may leave
+    ``ready`` (to ``running`` via :func:`claim_task`, or to ``review`` via a
+    parked ``review-required:`` handoff) while a parent is still open.
+    """
+    return conn.execute(
+        "SELECT 1 FROM task_links l "
+        "JOIN tasks p ON p.id = l.parent_id "
+        "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+        (task_id,),
+    ).fetchone() is not None
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4106,12 +4121,7 @@ def claim_task(
         # 'todo' here — recompute_ready will re-promote when the parents
         # actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone = conn.execute(
-            "SELECT 1 FROM task_links l "
-            "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
-            (task_id,),
-        ).fetchone()
+        undone = _has_unfinished_parents(conn, task_id)
         if undone:
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -4420,6 +4430,23 @@ def submit_task_for_review(
                 raise RuntimeError(
                     f"cannot submit {task_id} for review: task is claimed"
                 )
+            # Same structural invariant claim_task enforces for ready ->
+            # running: a parked handoff must not carry the card out of
+            # ``ready`` while a parent is still open. Without this the
+            # review handoff is a hole straight through the dependency
+            # graph. Demote back to 'todo' (recompute_ready re-promotes
+            # once the parents actually finish) and refuse the transition.
+            if _has_unfinished_parents(conn, task_id):
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo' "
+                    "WHERE id = ? AND status = 'ready'",
+                    (task_id,),
+                )
+                _append_event(
+                    conn, task_id, "review_submit_rejected",
+                    {"reason": "parents_not_done"},
+                )
+                return None
         if row["status"] == "running" and row["claim_lock"] is None:
             raise RuntimeError(f"cannot submit {task_id}: running task is unclaimed")
         old_run_id = _end_run(
@@ -8409,6 +8436,49 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+def _plan_review_handoffs(
+    conn: sqlite3.Connection,
+) -> list[tuple[str, str]]:
+    """Read-only plan of ``(task_id, reviewer)`` review handoffs to apply.
+
+    Pure: performs no writes, so a dry-run tick can compute exactly the same
+    routing decision as a real tick without mutating the board. The applier
+    (:func:`reconcile_review_handoffs`) executes this plan verbatim.
+    """
+    plan: list[tuple[str, str]] = []
+    try:
+        rows = conn.execute(
+            "SELECT id, assignee FROM tasks "
+            "WHERE status = 'ready' AND claim_lock IS NULL "
+            "ORDER BY priority DESC, created_at ASC"
+        ).fetchall()
+    except sqlite3.Error:
+        return plan
+    for row in rows:
+        task_id = row["id"]
+        try:
+            if not pending_review_handoff(conn, task_id):
+                continue
+            # Dependency invariant (mirrors submit_task_for_review and
+            # claim_task): never plan a card whose parents are still open.
+            if _has_unfinished_parents(conn, task_id):
+                continue
+            candidates, _preflight = _reviewer_candidates(row["assignee"])
+            reviewer = next(
+                (name for name in candidates if name != row["assignee"]),
+                None,
+            ) or row["assignee"]
+            if not reviewer:
+                continue
+            plan.append((task_id, reviewer))
+        except Exception:
+            _log.debug(
+                "kanban dispatch: review handoff planning failed for %s",
+                task_id, exc_info=True,
+            )
+    return plan
+
+
 def reconcile_review_handoffs(conn: sqlite3.Connection) -> list[str]:
     """Move parked ``review-required:`` handoffs into the reviewer lane.
 
@@ -8435,26 +8505,8 @@ def reconcile_review_handoffs(conn: sqlite3.Connection) -> list[str]:
     Returns the list of reconciled task ids.
     """
     moved: list[str] = []
-    try:
-        rows = conn.execute(
-            "SELECT id, assignee FROM tasks "
-            "WHERE status = 'ready' AND claim_lock IS NULL "
-            "ORDER BY priority DESC, created_at ASC"
-        ).fetchall()
-    except sqlite3.Error:
-        return moved
-    for row in rows:
-        task_id = row["id"]
+    for task_id, reviewer in _plan_review_handoffs(conn):
         try:
-            if not pending_review_handoff(conn, task_id):
-                continue
-            candidates, _preflight = _reviewer_candidates(row["assignee"])
-            reviewer = next(
-                (name for name in candidates if name != row["assignee"]),
-                None,
-            ) or row["assignee"]
-            if not reviewer:
-                continue
             if submit_task_for_review(conn, task_id, reviewer) is not None:
                 moved.append(task_id)
         except Exception:
@@ -8815,8 +8867,15 @@ def _dispatch_once_locked(
     # into generic ``ready`` back into the reviewer lane on the SAME card,
     # before the ready loop can hand them to a programmer (or the respawn
     # guard can strand them). See reconcile_review_handoffs().
+    # Dry run computes the SAME plan read-only so the reported (task,
+    # profile, action) matches the real tick without any durable mutation.
+    _review_plan: dict[str, str] = {}
     if not dry_run:
         result.review_reconciled = reconcile_review_handoffs(conn)
+    else:
+        _plan = _plan_review_handoffs(conn)
+        _review_plan = dict(_plan)
+        result.review_reconciled = [task_id for task_id, _ in _plan]
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -8994,14 +9053,19 @@ def _dispatch_once_locked(
                     )
             continue
         if dry_run:
-            result.spawned.append((row["id"], row_assignee, ""))
+            # A card the review planner claimed would be reconciled this
+            # tick is spawned against the RESOLVED REVIEWER profile, not
+            # the programmer assignee — otherwise dry-run reports a lane
+            # the real tick never uses.
+            _dry_assignee = _review_plan.get(row["id"], row_assignee)
+            result.spawned.append((row["id"], _dry_assignee, ""))
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
             # under-reports the capped subset (#21582).
-            if _per_profile_cap is not None and row_assignee:
-                _per_profile_running[row_assignee] = (
-                    _per_profile_running.get(row_assignee, 0) + 1
+            if _per_profile_cap is not None and _dry_assignee:
+                _per_profile_running[_dry_assignee] = (
+                    _per_profile_running.get(_dry_assignee, 0) + 1
                 )
             continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)

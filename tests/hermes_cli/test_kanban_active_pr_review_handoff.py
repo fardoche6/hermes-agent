@@ -211,3 +211,102 @@ def test_completed_review_cycle_does_not_re_enter_review_lane(
         task = kb.get_task(conn, task_id)
         assert task is not None and task.assignee == "programmer"
         assert spawned == [(task_id, "programmer")]
+
+
+# ---------------------------------------------------------------------------
+# Invariant 4 — the ready->review handoff must respect parent dependencies
+# ---------------------------------------------------------------------------
+
+def test_review_handoff_does_not_bypass_unfinished_parents(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """A ``review-required:`` child whose parent is still open must NOT be
+    reconciled into the review lane.  ``claim_task`` enforces this invariant
+    for ready->running; the ready->review path must enforce it too, otherwise
+    the handoff is a hole straight through the dependency graph."""
+    monkeypatch.setattr(
+        kb, "_reviewer_candidates", lambda current: (["code-reviewer"], []),
+    )
+    host = kb._claimer_id().split(":", 1)[0]
+    spawned = []
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="parent work", assignee="programmer")
+        child_id = kb.create_task(conn, title="child work", assignee="programmer")
+        assert kb.claim_task(conn, child_id, claimer=f"{host}:impl") is not None
+        assert kb.block_task(
+            conn, child_id, kind="dependency",
+            reason="review-required: needs sign-off",
+        ) is True
+        kb.link_tasks(conn, parent_id, child_id)
+        # Racy writer / recompute promoted the child to generic ready while
+        # the parent is still open (the production shape).
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child_id,))
+        conn.commit()
+        assert kb.get_task(conn, parent_id).status not in ("done", "archived")
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawned.append(
+                (task.id, task.assignee)
+            ),
+        )
+
+        child = kb.get_task(conn, child_id)
+        assert child is not None
+        assert child.status == "todo", f"status={child.status!r}"
+        assert child.assignee == "programmer"
+        assert child_id not in result.review_reconciled
+        assert child_id not in [t for t, *_ in spawned]
+
+
+# ---------------------------------------------------------------------------
+# Invariant 5 — dry-run must agree with the real tick and mutate nothing
+# ---------------------------------------------------------------------------
+
+def test_dry_run_agrees_with_real_dispatch_for_review_handoff(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    monkeypatch.setattr(
+        kb, "_reviewer_candidates", lambda current: (["code-reviewer"], []),
+    )
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="coding card", assignee="programmer")
+        assert kb.claim_task(conn, task_id, claimer=f"{host}:impl") is not None
+        kb.add_comment(conn, task_id, "programmer", f"PR opened: {PR_URL}")
+        assert kb.block_task(
+            conn, task_id, kind="dependency",
+            reason="review-required: needs sign-off",
+        ) is True
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+        conn.commit()
+
+        before_status = kb.get_task(conn, task_id).status
+        before_assignee = kb.get_task(conn, task_id).assignee
+        before_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=?", (task_id,),
+        ).fetchone()[0]
+
+        dry = kb.dispatch_once(conn, spawn_fn=lambda task, workspace: 99, dry_run=True)
+
+        # Dry run must plan the same decision as the real tick.
+        assert task_id in dry.review_reconciled
+        assert (task_id, "code-reviewer", "") in dry.spawned, dry.spawned
+        # ...and must not mutate anything durable.
+        after = kb.get_task(conn, task_id)
+        assert after.status == before_status
+        assert after.assignee == before_assignee
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=?", (task_id,),
+        ).fetchone()[0] == before_events
+
+        # The real tick agrees with the dry run.
+        real_spawned = []
+        real = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: real_spawned.append(
+                (task.id, task.assignee, "")
+            ),
+        )
+        assert real.review_reconciled == dry.review_reconciled
+        assert real_spawned == [(task_id, "code-reviewer", "")]
