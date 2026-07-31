@@ -4284,6 +4284,100 @@ def claim_review_task(
         return get_task(conn, task_id)
 
 
+REVIEW_HANDOFF_PREFIX = "review-required:"
+
+# Event kinds that carry a worker/operator block directive with a ``reason``
+# payload. ``dependency_wait`` is the one the documented
+# ``kanban_block(kind="dependency", reason="review-required: ...")`` handoff
+# emits (that kind routes to ``todo``, never to ``blocked``); ``blocked`` is
+# the legacy/untyped handoff.
+_REVIEW_DIRECTIVE_EVENT_KINDS = ("dependency_wait", "blocked")
+
+# Event kinds that prove a pending review handoff has already been consumed:
+# the card entered the reviewer lane (``submitted_for_review``) or reached a
+# terminal state. Anything later than the directive closes it.
+_REVIEW_HANDOFF_CONSUMED_KINDS = ("submitted_for_review", "completed", "archived")
+
+
+def _latest_event_id(
+    conn: sqlite3.Connection, task_id: str, kinds: tuple[str, ...],
+) -> int:
+    """Return the id of the most recent event of ``kinds`` (0 when none).
+
+    ``task_events.id`` is monotonic per board, so comparing ids gives a
+    durable happened-before ordering that does not depend on wall-clock
+    timestamps (several lifecycle writes share the same ``created_at``).
+    """
+    if not kinds:
+        return 0
+    placeholders = ",".join("?" for _ in kinds)
+    row = conn.execute(
+        f"SELECT id FROM task_events WHERE task_id = ? AND kind IN ({placeholders}) "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, *kinds),
+    ).fetchone()
+    return int(row["id"]) if row else 0
+
+
+def _latest_review_directive_id(conn: sqlite3.Connection, task_id: str) -> int:
+    """Return the id of the newest un-consumed ``review-required:`` directive.
+
+    Returns 0 when the task has no such directive.  Only the documented
+    contract prefix is honoured — no other comment/reason wording is
+    interpreted.
+    """
+    for row in conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id = ? AND kind IN "
+        f"({','.join('?' for _ in _REVIEW_DIRECTIVE_EVENT_KINDS)}) "
+        "ORDER BY id DESC",
+        (task_id, *_REVIEW_DIRECTIVE_EVENT_KINDS),
+    ):
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("reason") or "").startswith(REVIEW_HANDOFF_PREFIX):
+            return int(row["id"])
+    return 0
+
+
+def pending_review_handoff(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the card carries an un-consumed ``review-required:`` handoff.
+
+    This is the durable provenance for "the worker finished and asked for
+    independent review on THIS card".  It stays true until the card actually
+    enters the reviewer lane (``submitted_for_review``) or reaches a terminal
+    state — so a handoff that got promoted into generic ``ready`` (the
+    ``kind="dependency"`` routing goes ``todo`` -> ``ready``) is still
+    recognisable on any later dispatcher tick and can be reconciled.
+    """
+    directive_id = _latest_review_directive_id(conn, task_id)
+    if not directive_id:
+        return False
+    consumed_id = _latest_event_id(conn, task_id, _REVIEW_HANDOFF_CONSUMED_KINDS)
+    return consumed_id < directive_id
+
+
+def in_correction_lane(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the card's newest review decision is ``changes_requested``.
+
+    A same-card correction (reviewer -> programmer) that crashed or timed out
+    lands back in ``ready``.  Such a respawn continues work on the PR that is
+    already open; it must not be mistaken for "a worker is about to open a
+    duplicate PR".  Provenance comes from the review state machine's own
+    events, not from comment wording.
+    """
+    changes_id = _latest_event_id(conn, task_id, ("changes_requested",))
+    if not changes_id:
+        return False
+    settled_id = _latest_event_id(
+        conn, task_id, _REVIEW_HANDOFF_CONSUMED_KINDS,
+    )
+    return settled_id < changes_id
+
+
 def submit_task_for_review(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4307,22 +4401,24 @@ def submit_task_for_review(
         ).fetchone()
         if not row:
             return None
-        if row["status"] not in {"running", "blocked"}:
+        if row["status"] not in {"running", "blocked", "ready"}:
             raise RuntimeError(
                 f"cannot submit {task_id} for review from status {row['status']!r}"
             )
-        if row["status"] == "blocked":
-            legacy = conn.execute(
-                "SELECT payload FROM task_events WHERE task_id=? "
-                "AND kind='blocked' ORDER BY id DESC LIMIT 1", (task_id,),
-            ).fetchone()
-            try:
-                blocked_payload = json.loads(legacy["payload"]) if legacy and legacy["payload"] else {}
-            except (TypeError, ValueError):
-                blocked_payload = {}
-            if not str(blocked_payload.get("reason") or "").startswith("review-required:"):
+        if row["status"] in {"blocked", "ready"}:
+            # Parked review handoff. ``blocked`` is the legacy shape;
+            # ``ready`` is what the documented ``kind="dependency"`` handoff
+            # becomes after ``recompute_ready`` promotes it out of ``todo``.
+            # Both require the same durable ``review-required:`` provenance,
+            # and neither may be holding a live claim.
+            if not pending_review_handoff(conn, task_id):
                 raise RuntimeError(
-                    f"cannot submit {task_id} for review from unrelated blocked state"
+                    f"cannot submit {task_id} for review from unrelated "
+                    f"{row['status']} state"
+                )
+            if row["claim_lock"] is not None:
+                raise RuntimeError(
+                    f"cannot submit {task_id} for review: task is claimed"
                 )
         if row["status"] == "running" and row["claim_lock"] is None:
             raise RuntimeError(f"cannot submit {task_id}: running task is unclaimed")
@@ -7094,6 +7190,10 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    review_reconciled: list[str] = field(default_factory=list)
+    """Task ids moved from ``ready`` into the reviewer lane this tick because
+    they carry an un-consumed documented ``review-required:`` handoff. Same
+    card — no child, no duplicate. See ``reconcile_review_handoffs``."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -8309,6 +8409,64 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 _clear_spawn_failures = _clear_failure_counter
 
 
+def reconcile_review_handoffs(conn: sqlite3.Connection) -> list[str]:
+    """Move parked ``review-required:`` handoffs into the reviewer lane.
+
+    The documented worker handoff is
+    ``kanban_block(kind="dependency", reason="review-required: ...")``.
+    ``kind="dependency"`` deliberately routes to ``todo`` (never to the human
+    ``blocked`` bucket), and ``recompute_ready`` then promotes the card to
+    generic ``ready`` as soon as its parents are done. At that point the card
+    looks exactly like fresh implementation work: the dispatcher would hand it
+    back to the programmer, or (with a PR already open) the ``active_pr``
+    respawn guard would sit on it until the PR window elapsed. Either way the
+    review never happens.
+
+    This pass reconciles that state on every tick: an unclaimed ``ready`` card
+    with an un-consumed handoff is submitted for review on the SAME card id,
+    with the same head evidence, via the normal
+    :func:`submit_task_for_review` transition (one writer, one txn, standard
+    events). The reviewer is picked from the configured compatible
+    ``code-reviewer*`` lanes. When no compatible lane exists the card is still
+    moved into ``review`` under its current assignee so the review-dispatch
+    loop's existing fail-closed failover (``failover_review_task``) reports and
+    blocks it, rather than silently looping through the programmer lane.
+
+    Returns the list of reconciled task ids.
+    """
+    moved: list[str] = []
+    try:
+        rows = conn.execute(
+            "SELECT id, assignee FROM tasks "
+            "WHERE status = 'ready' AND claim_lock IS NULL "
+            "ORDER BY priority DESC, created_at ASC"
+        ).fetchall()
+    except sqlite3.Error:
+        return moved
+    for row in rows:
+        task_id = row["id"]
+        try:
+            if not pending_review_handoff(conn, task_id):
+                continue
+            candidates, _preflight = _reviewer_candidates(row["assignee"])
+            reviewer = next(
+                (name for name in candidates if name != row["assignee"]),
+                None,
+            ) or row["assignee"]
+            if not reviewer:
+                continue
+            if submit_task_for_review(conn, task_id, reviewer) is not None:
+                moved.append(task_id)
+        except Exception:
+            # Never let one malformed card take down the tick; the card stays
+            # in ready and the next tick retries.
+            _log.debug(
+                "kanban dispatch: review handoff reconciliation failed for %s",
+                task_id, exc_info=True,
+            )
+    return moved
+
+
 def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
@@ -8433,6 +8591,18 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #
+    #    The point of this guard is "do not let a fresh worker open a SECOND
+    #    PR for work that already has one". It is NOT a veto on the review
+    #    state machine: when the card carries durable provenance that it is
+    #    continuing the SAME PR (a reviewer ``changes_requested`` correction
+    #    whose run crashed / timed out back to ready, or an un-consumed
+    #    ``review-required:`` handoff awaiting reconciliation into the
+    #    reviewer lane), respawning continues existing work rather than
+    #    duplicating it. Without this carve-out the card is stranded in
+    #    ``ready`` for the full 24h PR window.
+    if in_correction_lane(conn, task_id) or pending_review_handoff(conn, task_id):
+        return None
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
         "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
@@ -8641,6 +8811,12 @@ def _dispatch_once_locked(
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    # Reconcile documented ``review-required:`` handoffs that were promoted
+    # into generic ``ready`` back into the reviewer lane on the SAME card,
+    # before the ready loop can hand them to a programmer (or the respawn
+    # guard can strand them). See reconcile_review_handoffs().
+    if not dry_run:
+        result.review_reconciled = reconcile_review_handoffs(conn)
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
