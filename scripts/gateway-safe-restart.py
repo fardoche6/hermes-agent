@@ -24,6 +24,10 @@ DEFAULT_SERVICES = (
     "hermes-gateway-secretary.service",
 )
 MAX_WAIT_SECONDS = 24 * 60 * 60
+# Paths whose content is loaded into the running gateway process.  A code-change
+# restart is only allowed when every one of these is clean and at the reviewed
+# commit; docs/website churn must never be able to unblock an activation.
+RUNTIME_MATERIAL_PATHS = ("agent", "hermes_cli", "tui_gateway", "plugins", "scripts")
 
 
 def run(*argv: str, check: bool = True) -> str:
@@ -77,6 +81,91 @@ def _parse_realtime_usec(raw: str) -> int:
         except ValueError:
             pass
     return 0
+
+
+def proof(gate: str, ok: bool, detail: str = "") -> str:
+    """Emit one machine-readable gate result and return the line."""
+    line = f"RESTART-PROOF: {'PASS' if ok else 'FAIL'} gate={gate}" + (f" {detail}" if detail else "")
+    print(line, flush=True)
+    return line
+
+
+def git_head(repo: Path) -> str:
+    return run("git", "-C", str(repo), "rev-parse", "HEAD")
+
+
+def resolve_commit(repo: Path, ref: str) -> str | None:
+    try:
+        return run("git", "-C", str(repo), "rev-parse", "--verify", f"{ref}^{{commit}}")
+    except RuntimeError:
+        return None
+
+
+def runtime_dirty_paths(repo: Path, paths: Iterable[str]) -> list[str]:
+    """Return porcelain entries for runtime-material paths (including untracked)."""
+    output = run("git", "-C", str(repo), "status", "--porcelain", "--", *paths)
+    # run() strips the output, so the porcelain XY prefix is not a fixed width
+    # on the first line; take the path as the last whitespace-delimited field.
+    return [line.strip().split(maxsplit=1)[-1] for line in output.splitlines() if line.strip()]
+
+
+def code_change_gate(repo: Path, expected_commit: str | None, paths: Iterable[str]) -> dict:
+    """Fail-closed identity gate for activating an exact reviewed commit.
+
+    No timestamps, no file mtimes, no drop-in probing: the only question is
+    whether the checkout is exactly the reviewed commit with a clean
+    runtime-material tree.
+    """
+    paths = list(paths)
+    lines: list[str] = []
+    if not expected_commit:
+        return {"ok": False, "expected": None, "head": None, "dirty": [],
+                "proof": [proof("expected_commit", False, "reason=missing --expected-commit")]}
+    expected = resolve_commit(repo, expected_commit)
+    if not expected:
+        return {"ok": False, "expected": None, "head": None, "dirty": [],
+                "proof": [proof("expected_commit", False, f"reason=unknown-commit ref={expected_commit}")]}
+    lines.append(proof("expected_commit", True, f"expected={expected}"))
+    head = git_head(repo)
+    head_ok = head == expected
+    lines.append(proof("head_matches_expected", head_ok, f"head={head} expected={expected}"))
+    dirty = runtime_dirty_paths(repo, paths)
+    lines.append(proof("runtime_source_clean", not dirty,
+                       f"paths={','.join(paths)} dirty={','.join(dirty) or 'none'}"))
+    return {"ok": head_ok and not dirty, "expected": expected, "head": head, "dirty": dirty, "proof": lines}
+
+
+def health_ok(command: str | None) -> bool:
+    if not command:
+        return True
+    return subprocess.run(shlex.split(command), text=True, capture_output=True).returncode == 0
+
+
+def verify_replacement(
+    before: dict[str, int],
+    after: dict[str, dict[str, str]],
+    repo: Path,
+    expected: str,
+    health_command: str | None = None,
+) -> dict:
+    """Verify the fleet really is a new process tree running ``expected``."""
+    lines: list[str] = []
+    replaced = []
+    for service, state in after.items():
+        pid = int(state.get("MainPID", "0") or 0)
+        old = int(before.get(service, 0) or 0)
+        ok = pid > 0 and pid != old
+        replaced.append(ok)
+        lines.append(proof("pid_replaced", ok, f"service={service} old_pid={old} new_pid={pid}"))
+    active = all(state.get("ActiveState") == "active" for state in after.values()) and bool(after)
+    lines.append(proof("services_active", active, f"services={','.join(sorted(after))}"))
+    healthy = health_ok(health_command)
+    lines.append(proof("runtime_healthy", healthy, f"command={health_command or 'none'}"))
+    head = git_head(repo)
+    commit_ok = head == expected
+    lines.append(proof("running_commit_matches", commit_ok, f"head={head} expected={expected}"))
+    ok = all(replaced) and bool(replaced) and active and healthy and commit_ok
+    return {"ok": ok, "proof": lines}
 
 
 def board_paths(explicit: str | None) -> list[Path]:
@@ -226,7 +315,10 @@ def wait_for_idle(args: argparse.Namespace, services: tuple[str, ...], databases
         if args.once:
             print(json.dumps(snapshot, indent=2, sort_keys=True))
             return snapshot
-        if any(state["newer"] for state in pending.values()) and true_idle_window(
+        # A code-change activation is triggered by the reviewed commit itself,
+        # never by config-file timestamps; the idle guard below is unchanged.
+        triggered = args.reason == "code-change" or any(state["newer"] for state in pending.values())
+        if triggered and true_idle_window(
             databases,
             args.task_id,
             [state["pid"] for state in pending.values() if state["pid"]],
@@ -245,9 +337,20 @@ def wait_for_idle(args: argparse.Namespace, services: tuple[str, ...], databases
 def perform(args: argparse.Namespace) -> int:
     services = tuple(filter(None, args.services.split(",")))
     databases = board_paths(args.board)
+    gate = None
+    if args.reason == "code-change":
+        # Gate before the idle wait: never park a 24h wait on a checkout that
+        # can already be proven wrong.
+        gate = code_change_gate(args.repo, args.expected_commit, args.runtime_paths.split(","))
+        if not gate["ok"] and not args.once:
+            append_comment(databases, args.task_id,
+                           "SAFE_RESTART=FAIL\nreason=code-change gate\n" + "\n".join(gate["proof"]))
+            return 5
     snapshot = wait_for_idle(args, services, databases)
     if args.once:
         return 0
+    proof("idle_guard", True, "running_claimed_cards=0 live_worker_children=0")
+    before_pids = {service: int(state.get("pid", 0) or 0) for service, state in snapshot["pending"].items()}
     run("systemctl", "--user", "restart", *services)
     deadline = time.monotonic() + args.verify_timeout
     states = {}
@@ -262,8 +365,15 @@ def perform(args: argparse.Namespace) -> int:
     if args.verify_env:
         key, sep, expected = args.verify_env.partition("=")
         env_ok = bool(sep and all(f"{key}={expected}".encode() in (Path(f"/proc/{int(state['MainPID'])}/environ").read_bytes().split(b"\0")) for state in states.values()))
+    identity = None
+    if gate is not None:
+        identity = verify_replacement(before_pids, states, args.repo, gate["expected"], args.health_command)
+    ok = env_ok and (identity is None or identity["ok"])
+    proof_lines = (gate["proof"] if gate else []) + (identity["proof"] if identity else [])
+    proof_lines.append(proof("restart", ok, f"services={','.join(services)} reason={args.reason}"))
     body = (
-        "SAFE_RESTART=" + ("PASS" if env_ok else "FAIL") + "\n"
+        "SAFE_RESTART=" + ("PASS" if ok else "FAIL") + "\n"
+        + "\n".join(proof_lines) + "\n"
         f"services={','.join(services)}\n"
         "pending_config=PASS\nidle_guard=PASS (zero running/claimed cards, zero live worker children)\n"
         "active=PASS\n"
@@ -271,7 +381,9 @@ def perform(args: argparse.Namespace) -> int:
         + json.dumps({"before": snapshot, "after": states}, sort_keys=True)
     )
     append_comment(databases, args.task_id, body)
-    return 0 if env_ok else 4
+    if not env_ok:
+        return 4
+    return 0 if ok else 6
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -283,6 +395,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--poll", type=int, default=30)
     parser.add_argument("--verify-timeout", type=int, default=90)
     parser.add_argument("--verify-env")
+    parser.add_argument("--reason", choices=("config", "code-change"), default="config")
+    parser.add_argument("--expected-commit", help="exact reviewed commit to activate (--reason code-change)")
+    parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--runtime-paths", default=",".join(RUNTIME_MATERIAL_PATHS))
+    parser.add_argument("--health-command", help="post-restart health probe; non-zero exit fails the gate")
     parser.add_argument("--notify-command", default=os.environ.get("HERMES_SAFE_RESTART_NOTIFY_COMMAND"))
     parser.add_argument("--hermes-home", type=Path, default=Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")))
     parser.add_argument("--once", action="store_true")

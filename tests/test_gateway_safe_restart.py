@@ -106,6 +106,158 @@ def test_timeout_notifies_command_and_comments(tmp_path):
         assert db.execute("select body from task_comments").fetchone()[0] == "SAFE_RESTART=BLOCKED"
 
 
+def make_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    (repo / "agent").mkdir(parents=True)
+    (repo / "agent" / "main.py").write_text("print('v1')\n")
+    for argv in (
+        ["init", "-q", "-b", "main"],
+        ["config", "user.email", "t@example.com"],
+        ["config", "user.name", "t"],
+        ["add", "-A"],
+        ["commit", "-qm", "init"],
+    ):
+        subprocess.run(["git", "-C", str(repo), *argv], check=True, capture_output=True)
+    return repo
+
+
+def head_of(repo: Path) -> str:
+    return subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                          check=True, capture_output=True, text=True).stdout.strip()
+
+
+def test_code_change_gate_passes_on_clean_expected_commit(tmp_path, capsys):
+    repo = make_repo(tmp_path)
+    gate = MOD.code_change_gate(repo, head_of(repo), MOD.RUNTIME_MATERIAL_PATHS)
+    assert gate["ok"] is True
+    out = capsys.readouterr().out
+    assert "RESTART-PROOF: PASS gate=head_matches_expected" in out
+    assert "RESTART-PROOF: PASS gate=runtime_source_clean" in out
+
+
+def test_code_change_gate_blocks_dirty_runtime_source(tmp_path, capsys):
+    repo = make_repo(tmp_path)
+    (repo / "agent" / "main.py").write_text("print('dirty')\n")
+    gate = MOD.code_change_gate(repo, head_of(repo), MOD.RUNTIME_MATERIAL_PATHS)
+    assert gate["ok"] is False
+    assert gate["dirty"] == ["agent/main.py"]
+    assert "RESTART-PROOF: FAIL gate=runtime_source_clean" in capsys.readouterr().out
+
+
+def test_code_change_gate_ignores_non_runtime_dirt(tmp_path):
+    repo = make_repo(tmp_path)
+    (repo / "README.md").write_text("docs churn\n")
+    assert MOD.code_change_gate(repo, head_of(repo), MOD.RUNTIME_MATERIAL_PATHS)["ok"] is True
+
+
+def test_code_change_gate_blocks_unexpected_head(tmp_path, capsys):
+    repo = make_repo(tmp_path)
+    reviewed = head_of(repo)
+    (repo / "agent" / "main.py").write_text("print('v2')\n")
+    subprocess.run(["git", "-C", str(repo), "commit", "-qam", "v2"], check=True, capture_output=True)
+    gate = MOD.code_change_gate(repo, reviewed, MOD.RUNTIME_MATERIAL_PATHS)
+    assert gate["ok"] is False
+    assert "RESTART-PROOF: FAIL gate=head_matches_expected" in capsys.readouterr().out
+
+
+def test_code_change_gate_blocks_unknown_or_missing_commit(tmp_path, capsys):
+    repo = make_repo(tmp_path)
+    assert MOD.code_change_gate(repo, None, MOD.RUNTIME_MATERIAL_PATHS)["ok"] is False
+    assert MOD.code_change_gate(repo, "0" * 40, MOD.RUNTIME_MATERIAL_PATHS)["ok"] is False
+    assert capsys.readouterr().out.count("RESTART-PROOF: FAIL gate=expected_commit") == 2
+
+
+def test_verify_replacement_requires_new_pid_health_and_commit(tmp_path, capsys):
+    repo = make_repo(tmp_path)
+    expected = head_of(repo)
+    after = {"demo.service": {"ActiveState": "active", "MainPID": "222"}}
+    result = MOD.verify_replacement({"demo.service": 111}, after, repo, expected,
+                                    health_command=f"{sys.executable} -c pass")
+    assert result["ok"] is True
+    out = capsys.readouterr().out
+    for gate in ("pid_replaced", "services_active", "runtime_healthy", "running_commit_matches"):
+        assert f"RESTART-PROOF: PASS gate={gate}" in out
+
+
+def test_verify_replacement_fails_when_pid_unchanged(tmp_path, capsys):
+    repo = make_repo(tmp_path)
+    after = {"demo.service": {"ActiveState": "active", "MainPID": "111"}}
+    result = MOD.verify_replacement({"demo.service": 111}, after, repo, head_of(repo))
+    assert result["ok"] is False
+    assert "RESTART-PROOF: FAIL gate=pid_replaced" in capsys.readouterr().out
+
+
+def test_verify_replacement_fails_on_unhealthy_runtime(tmp_path, capsys):
+    repo = make_repo(tmp_path)
+    after = {"demo.service": {"ActiveState": "active", "MainPID": "222"}}
+    result = MOD.verify_replacement({"demo.service": 111}, after, repo, head_of(repo),
+                                    health_command=f"{sys.executable} -c 'raise SystemExit(1)'")
+    assert result["ok"] is False
+    assert "RESTART-PROOF: FAIL gate=runtime_healthy" in capsys.readouterr().out
+
+
+def test_verify_replacement_fails_on_wrong_running_commit(tmp_path, capsys):
+    repo = make_repo(tmp_path)
+    after = {"demo.service": {"ActiveState": "active", "MainPID": "222"}}
+    result = MOD.verify_replacement({"demo.service": 111}, after, repo, "0" * 40)
+    assert result["ok"] is False
+    assert "RESTART-PROOF: FAIL gate=running_commit_matches" in capsys.readouterr().out
+
+
+def test_code_change_reason_refuses_restart_on_dirty_source(monkeypatch, tmp_path, capsys):
+    board = tmp_path / "kanban.db"
+    make_board(board)
+    repo = make_repo(tmp_path)
+    (repo / "agent" / "main.py").write_text("print('dirty')\n")
+    monkeypatch.setenv("SAFE_RESTART_NO_DETACH", "1")
+    monkeypatch.setattr(MOD, "wait_for_idle", lambda *a, **k: (_ for _ in ()).throw(AssertionError("waited")))
+    result = MOD.main([
+        "--task-id", "restart", "--board", str(board), "--services", "demo.service",
+        "--reason", "code-change", "--expected-commit", head_of(repo), "--repo", str(repo),
+    ])
+    assert result == 5
+    assert "RESTART-PROOF: FAIL gate=runtime_source_clean" in capsys.readouterr().out
+    with sqlite3.connect(board) as db:
+        assert "SAFE_RESTART=FAIL" in db.execute("select body from task_comments").fetchone()[0]
+
+
+def test_code_change_reason_still_blocks_on_busy_board(monkeypatch, tmp_path):
+    """The idle guard is unchanged: a reviewed commit never bypasses live work."""
+    board = tmp_path / "kanban.db"
+    make_board(board)
+    with sqlite3.connect(board) as db:
+        db.execute("INSERT INTO tasks VALUES ('other', 'running', NULL, NULL)")
+    repo = make_repo(tmp_path)
+    monkeypatch.setattr(MOD, "pending_state", lambda _services: {
+        "demo.service": {"pid": 7, "newer": []}
+    })
+    monkeypatch.setenv("SAFE_RESTART_NO_DETACH", "1")
+    monkeypatch.setattr(MOD, "gateway_worker_descendants", lambda *_args: [])
+    monkeypatch.setattr(MOD, "notify_owner", lambda *a, **k: "marker")
+    monkeypatch.setattr(MOD.time, "sleep", lambda _s: None)
+    try:
+        MOD.main([
+            "--task-id", "restart", "--board", str(board), "--services", "demo.service",
+            "--reason", "code-change", "--expected-commit", head_of(repo), "--repo", str(repo),
+            "--max-wait", "0",
+        ])
+        raise AssertionError("expected SystemExit(3)")
+    except SystemExit as exc:
+        assert exc.code == 3
+
+
+def test_code_change_reason_detaches_by_default(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(MOD, "run", lambda *args, **kwargs: calls.append(args) or "")
+    monkeypatch.setattr(MOD, "perform", lambda _args: (_ for _ in ()).throw(AssertionError("ran inline")))
+    repo = make_repo(tmp_path)
+    assert MOD.main([
+        "--task-id", "restart", "--reason", "code-change",
+        "--expected-commit", head_of(repo), "--repo", str(repo),
+    ]) == 0
+    assert calls and calls[0][0] == "systemd-run"
+
+
 def test_once_inspection_never_restarts(monkeypatch, tmp_path, capsys):
     board = tmp_path / "kanban.db"
     make_board(board)
