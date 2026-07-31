@@ -2897,6 +2897,18 @@ def create_task(
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
 
+    from hermes_cli.kanban_direct_route_guard import guard_direct_route_repair
+
+    resolved_board = board if board else get_current_board()
+    guard_direct_route_repair(
+        board=resolved_board,
+        assignee=assignee,
+        workspace_path=workspace_path,
+        branch_name=branch_name,
+        project_id=project_id,
+        tenant=tenant,
+    )
+
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
     # can be named deterministically (project slug + task id) instead of the
