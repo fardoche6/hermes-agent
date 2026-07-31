@@ -20,6 +20,7 @@ Production sequence reproduced here (SubsidySmart coding card):
 from __future__ import annotations
 
 import time
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -409,3 +410,44 @@ def test_review_reconciliation_cas_does_not_touch_a_racing_claim(
         ).fetchone()
         assert run["status"] == "running"
         assert run["ended_at"] is None
+
+
+def test_fresh_board_dry_run_has_no_physical_persistence_changes(
+    kanban_home, all_assignees_spawnable,
+):
+    """Dry-run must not create locks or alter SQLite sidecar bytes."""
+    with kb.connect() as conn:
+        db_path = kb.kanban_db_path()
+        paths = [
+            db_path,
+            Path(f"{db_path}-wal"),
+            Path(f"{db_path}-shm"),
+            db_path.with_name(db_path.name + ".dispatch.lock"),
+        ]
+
+        def snapshot():
+            out = {}
+            for path in paths:
+                if path.exists():
+                    out[path] = (True, path.stat().st_size, hashlib.sha256(path.read_bytes()).hexdigest())
+                else:
+                    out[path] = (False, None, None)
+            return out
+
+        before = snapshot()
+        kb.dispatch_once(conn, dry_run=True)
+        after = snapshot()
+
+        assert after == before
+
+
+def test_dry_run_does_not_leak_stale_recovery_side_channels(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    monkeypatch.setattr(kb.detect_crashed_workers, "_last_auto_blocked", ["old-block"], raising=False)
+    monkeypatch.setattr(kb.detect_crashed_workers, "_last_rate_limited", ["old-rate"], raising=False)
+    with kb.connect() as conn:
+        result = kb.dispatch_once(conn, dry_run=True)
+
+    assert result.auto_blocked == []
+    assert result.rate_limited == []

@@ -8532,10 +8532,10 @@ def reconcile_review_handoffs(conn: sqlite3.Connection) -> list[str]:
     with the same head evidence, via the normal
     :func:`submit_task_for_review` transition (one writer, one txn, standard
     events). The reviewer is picked from the configured compatible
-    ``code-reviewer*`` lanes. When no compatible lane exists the card is still
-    moved into ``review`` under its current assignee so the review-dispatch
-    loop's existing fail-closed failover (``failover_review_task``) reports and
-    blocks it, rather than silently looping through the programmer lane.
+    ``code-reviewer*`` lanes. When no compatible lane exists, the handoff
+    remains in its current unclaimed state and the dispatcher fails closed
+    (guarded, with no programmer or reviewer spawn) until a compatible lane
+    becomes available.
 
     Returns the list of reconciled task ids.
     """
@@ -8792,6 +8792,22 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
+    # Dry-run is a read-only prediction. Avoid the persistent dispatch flock:
+    # opening the sibling lock path is itself a filesystem mutation.
+    if dry_run:
+        return _dispatch_once_locked(
+            conn,
+            spawn_fn=spawn_fn,
+            ttl_seconds=ttl_seconds,
+            dry_run=True,
+            max_spawn=max_spawn,
+            max_in_progress=max_in_progress,
+            failure_limit=failure_limit,
+            stale_timeout_seconds=stale_timeout_seconds,
+            board=board,
+            default_assignee=default_assignee,
+            max_in_progress_per_profile=max_in_progress_per_profile,
+        )
     try:
         db_path = kanban_db_path(board=board)
     except Exception:
@@ -8886,22 +8902,23 @@ def _dispatch_once_locked(
             conn, stale_timeout_seconds=stale_timeout_seconds,
         )
         result.crashed = detect_crashed_workers(conn)
-    # detect_crashed_workers stashes protocol-violation auto-blocks on
-    # itself so the public list-return stays stable. Pull them into the
-    # DispatchResult here so telemetry / tests see the trip.
-    _crash_auto_blocked = getattr(
-        detect_crashed_workers, "_last_auto_blocked", []
-    )
-    if _crash_auto_blocked:
-        result.auto_blocked.extend(_crash_auto_blocked)
-    # Rate-limited requeues (quota wall, no failure counted) — surface for
-    # telemetry / tests. These tasks went back to ``ready`` and the respawn
-    # guard will defer them until the quota window clears.
-    _crash_rate_limited = getattr(
-        detect_crashed_workers, "_last_rate_limited", []
-    )
-    if _crash_rate_limited:
-        result.rate_limited.extend(_crash_rate_limited)
+    if not dry_run:
+        # detect_crashed_workers stashes protocol-violation auto-blocks on
+        # itself so the public list-return stays stable. Pull them into the
+        # DispatchResult here so telemetry / tests see the trip.
+        _crash_auto_blocked = getattr(
+            detect_crashed_workers, "_last_auto_blocked", []
+        )
+        if _crash_auto_blocked:
+            result.auto_blocked.extend(_crash_auto_blocked)
+        # Rate-limited requeues (quota wall, no failure counted) — surface for
+        # telemetry / tests. These tasks went back to ``ready`` and the respawn
+        # guard will defer them until the quota window clears.
+        _crash_rate_limited = getattr(
+            detect_crashed_workers, "_last_rate_limited", []
+        )
+        if _crash_rate_limited:
+            result.rate_limited.extend(_crash_rate_limited)
     if not dry_run:
         result.timed_out = enforce_max_runtime(conn)
         result.promoted = recompute_ready(conn, failure_limit=failure_limit)
