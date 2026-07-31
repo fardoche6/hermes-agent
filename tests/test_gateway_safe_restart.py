@@ -177,12 +177,14 @@ def test_verify_replacement_requires_new_pid_health_and_commit(tmp_path, capsys)
     out = capsys.readouterr().out
     for gate in ("pid_replaced", "services_active", "runtime_healthy", "running_commit_matches"):
         assert f"RESTART-PROOF: PASS gate={gate}" in out
+    assert "source=override" in out
 
 
 def test_verify_replacement_fails_when_pid_unchanged(tmp_path, capsys):
     repo = make_repo(tmp_path)
     after = {"demo.service": {"ActiveState": "active", "MainPID": "111"}}
-    result = MOD.verify_replacement({"demo.service": 111}, after, repo, head_of(repo))
+    result = MOD.verify_replacement({"demo.service": 111}, after, repo, head_of(repo),
+                                    health_command=f"{sys.executable} -c pass")
     assert result["ok"] is False
     assert "RESTART-PROOF: FAIL gate=pid_replaced" in capsys.readouterr().out
 
@@ -199,9 +201,30 @@ def test_verify_replacement_fails_on_unhealthy_runtime(tmp_path, capsys):
 def test_verify_replacement_fails_on_wrong_running_commit(tmp_path, capsys):
     repo = make_repo(tmp_path)
     after = {"demo.service": {"ActiveState": "active", "MainPID": "222"}}
-    result = MOD.verify_replacement({"demo.service": 111}, after, repo, "0" * 40)
+    result = MOD.verify_replacement({"demo.service": 111}, after, repo, "0" * 40,
+                                    health_command=f"{sys.executable} -c pass")
     assert result["ok"] is False
     assert "RESTART-PROOF: FAIL gate=running_commit_matches" in capsys.readouterr().out
+
+
+def test_default_health_command_fails_without_live_gateway(tmp_path, capsys):
+    repo = make_repo(tmp_path)
+    after = {"demo.service": {"ActiveState": "active", "MainPID": "222"}}
+    # Default health probe runs without health_command parameter.
+    # Reverting default health probe to a no-op PASS would make this test fail.
+    result = MOD.verify_replacement({"demo.service": 111}, after, repo, head_of(repo))
+    assert result["ok"] is False
+    out = capsys.readouterr().out
+    assert "RESTART-PROOF: FAIL gate=runtime_healthy" in out
+    assert "source=default" in out
+
+
+def test_health_ok_handles_timeout_and_invalid_commands():
+    assert MOD.health_ok("", timeout=1) is False
+    assert MOD.health_ok("   ", timeout=1) is False
+    assert MOD.health_ok("non_existent_command_123456789", timeout=1) is False
+    assert MOD.health_ok(f"{sys.executable} -c 'import time; time.sleep(5)'", timeout=0.1) is False
+
 
 
 def test_code_change_reason_refuses_restart_on_dirty_source(monkeypatch, tmp_path, capsys):

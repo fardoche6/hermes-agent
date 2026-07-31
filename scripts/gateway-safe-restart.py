@@ -135,10 +135,64 @@ def code_change_gate(repo: Path, expected_commit: str | None, paths: Iterable[st
     return {"ok": head_ok and not dirty, "expected": expected, "head": head, "dirty": dirty, "proof": lines}
 
 
-def health_ok(command: str | None) -> bool:
-    if not command:
-        return True
-    return subprocess.run(shlex.split(command), text=True, capture_output=True).returncode == 0
+# Real, bounded post-restart health probe.  It reuses the repository's own
+# runtime-status mechanism (``gateway.status``): the gateway PID file must
+# resolve to a live process, the persisted ``gateway_state.json`` snapshot must
+# be fresh (not stale), and the recorded gateway state must be serving.  There
+# is deliberately no "no probe" mode: a code-change activation without a real
+# health answer must fail closed.
+HEALTH_PROBE_SOURCE = (
+    "import sys;"
+    "from gateway.status import is_gateway_running, read_runtime_status, runtime_status_is_stale;"
+    "rec = read_runtime_status() or {};"
+    "sys.exit(0 if ("
+    "is_gateway_running()"
+    " and not runtime_status_is_stale(rec)"
+    " and str(rec.get('gateway_state') or '') in ('running', 'draining')"
+    ") else 1)"
+)
+HEALTH_TIMEOUT_SECONDS = 30
+
+
+def default_health_command(repo: Path) -> str:
+    """The auditable default runtime health probe (bounded, fail-closed)."""
+    return shlex.join([sys.executable, "-c", HEALTH_PROBE_SOURCE])
+
+
+def resolve_health_command(repo: Path, override: str | None) -> tuple[str, str]:
+    """Return ``(command, source)`` where source is ``default`` or ``override``.
+
+    An override must be an explicit, non-empty command so the audit record can
+    always name the exact probe that was run.
+    """
+    if override and override.strip():
+        return override.strip(), "override"
+    return default_health_command(repo), "default"
+
+
+def health_ok(command: str, repo: Path | None = None, timeout: int = HEALTH_TIMEOUT_SECONDS) -> bool:
+    """Run the health probe; anything other than a clean exit 0 is a FAIL."""
+    if not command or not command.strip():
+        return False
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    if not argv:
+        return False
+    try:
+        completed = subprocess.run(
+            argv,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            cwd=str(repo) if repo else None,
+        )
+    except subprocess.TimeoutExpired:
+        return False
+    except OSError:
+        return False
+    return completed.returncode == 0
 
 
 def verify_replacement(
@@ -147,6 +201,7 @@ def verify_replacement(
     repo: Path,
     expected: str,
     health_command: str | None = None,
+    health_timeout: int = HEALTH_TIMEOUT_SECONDS,
 ) -> dict:
     """Verify the fleet really is a new process tree running ``expected``."""
     lines: list[str] = []
@@ -159,8 +214,9 @@ def verify_replacement(
         lines.append(proof("pid_replaced", ok, f"service={service} old_pid={old} new_pid={pid}"))
     active = all(state.get("ActiveState") == "active" for state in after.values()) and bool(after)
     lines.append(proof("services_active", active, f"services={','.join(sorted(after))}"))
-    healthy = health_ok(health_command)
-    lines.append(proof("runtime_healthy", healthy, f"command={health_command or 'none'}"))
+    health_cmd, health_source = resolve_health_command(repo, health_command)
+    healthy = health_ok(health_cmd, repo=repo, timeout=health_timeout)
+    lines.append(proof("runtime_healthy", healthy, f"source={health_source} command={health_cmd}"))
     head = git_head(repo)
     commit_ok = head == expected
     lines.append(proof("running_commit_matches", commit_ok, f"head={head} expected={expected}"))
