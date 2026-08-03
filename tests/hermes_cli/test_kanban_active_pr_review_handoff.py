@@ -99,9 +99,12 @@ def test_correction_recovery_after_crash_is_not_pr_guarded(
         assert kb.claim_task(conn, task_id, claimer=f"{host}:impl") is not None
         kb.add_comment(conn, task_id, "programmer", f"PR opened: {PR_URL}")
         assert kb.submit_task_for_review(conn, task_id, "code-reviewer") is not None
-        assert kb.claim_review_task(conn, task_id, claimer=f"{host}:review") is not None
+        review = kb.claim_review_task(conn, task_id, claimer=f"{host}:review")
+        assert review is not None
         corrected = kb.request_changes(
             conn, task_id, "programmer", reason="tighten error handling",
+            reviewer="code-reviewer", expected_claim=f"{host}:review",
+            expected_run_id=review.current_run_id,
         )
         # The correction lands in the ready lane with no phantom claim.
         assert corrected is not None and corrected.status == "ready"
@@ -218,10 +221,12 @@ def test_completed_review_cycle_does_not_re_enter_review_lane(
         kb.dispatch_once(conn, spawn_fn=lambda task, workspace: 99)
         assert kb.get_task(conn, task_id).status == "review"
 
-        # The dispatcher already claimed + spawned the reviewer above.
-        # Reviewer requests changes -> programmer correction -> crash.
+        review = kb.get_task(conn, task_id)
+        assert review is not None
         assert kb.request_changes(
             conn, task_id, "programmer", reason="fix tests",
+            reviewer="code-reviewer", expected_claim=review.claim_lock,
+            expected_run_id=review.current_run_id,
         ) is not None
         spawned = []
         kb.dispatch_once(conn, spawn_fn=_spawn_recorder(spawned, pid=4243))
@@ -682,6 +687,54 @@ def test_approve_clears_the_review_required_sticky_block(kanban_home):
         assert "unblocked" in _events(conn, task_id)
 
 
+def test_request_changes_requires_live_owned_review_run(kanban_home):
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = _approved_card(conn, host=host)
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        run_id = task.current_run_id
+        claim = task.claim_lock
+        assert run_id is not None
+        assert claim is not None
+        for reviewer, expected_claim, expected_run_id, reason in [
+            ("programmer", claim, run_id, "programmer cannot request"),
+            ("code-reviewer", "wrong-claim", run_id, "wrong claim"),
+            ("code-reviewer", claim, run_id + 1, "wrong run"),
+            ("code-reviewer", claim, run_id, ""),
+        ]:
+            with pytest.raises((RuntimeError, ValueError)):
+                kb.request_changes(
+                    conn, task_id, "programmer", reason=reason,
+                    reviewer=reviewer, expected_claim=expected_claim,
+                    expected_run_id=expected_run_id,
+                )
+            current = kb.get_task(conn, task_id)
+            assert current.status == "review"
+            assert current.claim_lock == claim
+            assert current.current_run_id == run_id
+            assert conn.execute(
+                "SELECT ended_at FROM task_runs WHERE id=?", (run_id,)
+            ).fetchone()["ended_at"] is None
+
+
+def test_request_changes_rejects_unclaimed_card(kanban_home):
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = _approved_card(conn, host=host)
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        conn.execute("UPDATE tasks SET claim_lock=NULL WHERE id=?", (task_id,))
+        conn.commit()
+        with pytest.raises(RuntimeError):
+            kb.request_changes(
+                conn, task_id, "programmer", reason="fix", reviewer="code-reviewer",
+                expected_claim=task.claim_lock, expected_run_id=task.current_run_id,
+            )
+        current = kb.get_task(conn, task_id)
+        assert current is not None and current.status == "review"
+
+
 def test_approved_card_does_not_respawn_a_reviewer(
     kanban_home, monkeypatch, all_assignees_spawnable,
 ):
@@ -806,9 +859,12 @@ def test_request_changes_still_returns_one_bundled_correction_packet(kanban_home
     host = kb._claimer_id().split(":", 1)[0]
     with kb.connect() as conn:
         task_id = _approved_card(conn, host=host)
+        review = kb.get_task(conn, task_id)
+        assert review is not None
         task = kb.request_changes(
             conn, task_id, "programmer",
-            reason="tighten error handling", claimer=f"{host}:impl2",
+            reason="tighten error handling", reviewer="code-reviewer",
+            expected_claim=review.claim_lock, expected_run_id=review.current_run_id,
         )
         assert task is not None
         # Ready lane, not a fabricated claim: identical shape to approval.
@@ -901,7 +957,12 @@ def test_request_changes_leaves_no_dead_pid_for_the_crash_reaper(
         kb._set_worker_pid(conn, task_id, reviewer_pid)
         _reviewer_exits_clean(monkeypatch, reviewer_pid)
 
-        task = kb.request_changes(conn, task_id, "programmer", reason="fix it")
+        review = kb.get_task(conn, task_id)
+        assert review is not None
+        task = kb.request_changes(
+            conn, task_id, "programmer", reason="fix it", reviewer="code-reviewer",
+            expected_claim=review.claim_lock, expected_run_id=review.current_run_id,
+        )
         assert task.worker_pid is None
         assert task.claim_lock is None
 
@@ -975,17 +1036,18 @@ def test_changes_requested_after_approval_closes_the_finalization_lane(
         assert kb.in_finalization_lane(conn, task_id) is True
         assert kb.in_correction_lane(conn, task_id) is False
 
-        # The finalizer's merge run is claimed, then sent back for changes
-        # with NO intervening ``submitted_for_review``.
+        # A finalizer cannot emit a reviewer-only change request.
         assert kb.claim_task(conn, task_id, claimer=f"{host}:merge") is not None
-        assert kb.request_changes(
-            conn, task_id, "programmer", reason="merge broke main",
-        ) is not None
-
-        kinds = _events(conn, task_id)
-        assert kinds.index("changes_requested") > kinds.index("review_approved")
-        assert kb.in_correction_lane(conn, task_id) is True
-        assert kb.in_finalization_lane(conn, task_id) is False
+        finalizer = kb.get_task(conn, task_id)
+        assert finalizer is not None
+        with pytest.raises(RuntimeError):
+            kb.request_changes(
+                conn, task_id, "programmer", reason="merge broke main",
+                reviewer="code-reviewer", expected_claim=finalizer.claim_lock,
+                expected_run_id=finalizer.current_run_id,
+            )
+        assert kb.get_task(conn, task_id) is not None
+        assert kb.get_task(conn, task_id).status == "running"
 
 
 def test_approval_after_changes_requested_closes_the_correction_lane(
@@ -995,8 +1057,12 @@ def test_approval_after_changes_requested_closes_the_correction_lane(
     host = kb._claimer_id().split(":", 1)[0]
     with kb.connect() as conn:
         task_id = _approved_card(conn, host=host)
+        review = kb.get_task(conn, task_id)
+        assert review is not None
         assert kb.request_changes(
             conn, task_id, "programmer", reason="fix tests",
+            reviewer="code-reviewer", expected_claim=review.claim_lock,
+            expected_run_id=review.current_run_id,
         ) is not None
         assert kb.in_correction_lane(conn, task_id) is True
 

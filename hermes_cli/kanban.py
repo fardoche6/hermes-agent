@@ -2283,10 +2283,14 @@ def _cmd_review(args: argparse.Namespace) -> int:
 
 def _cmd_request_changes(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
-    with kb.connect_closing() as conn:
-        task = kb.request_changes(
-            conn, args.task_id, args.programmer, reason=reason,
-        )
+    try:
+        with kb.connect_closing() as conn:
+            task = kb.request_changes(
+                conn, args.task_id, args.programmer, reason=reason,
+            )
+    except (RuntimeError, ValueError) as exc:
+        print(f"cannot request changes for {args.task_id}: {exc}", file=sys.stderr)
+        return 1
     if task is None:
         print(f"cannot request changes for {args.task_id}: task not found", file=sys.stderr)
         return 1

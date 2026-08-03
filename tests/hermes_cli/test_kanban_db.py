@@ -392,7 +392,9 @@ def test_explicit_review_lifecycle_reuses_same_card(kanban_home):
         reviewer = kb.claim_review_task(conn, task_id, claimer="review:1")
         assert reviewer and reviewer.status == "review"
         corrected = kb.request_changes(
-            conn, task_id, "programmer", reason="add regression coverage", claimer="impl:2"
+            conn, task_id, "programmer", reason="add regression coverage",
+            reviewer="code-reviewer", expected_claim="review:1",
+            expected_run_id=reviewer.current_run_id,
         )
         # The correction is handed back on the SAME card via the ready lane:
         # no fabricated claim, so the dispatcher can actually pick it up.

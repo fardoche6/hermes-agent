@@ -3068,6 +3068,11 @@ def test_kanban_request_changes_handler_returns_to_programmer(monkeypatch, tmp_p
         task_id = kb.create_task(conn, title="changes handler", assignee="programmer")
         assert kb.claim_task(conn, task_id) is not None
         assert kb.submit_task_for_review(conn, task_id, "code-reviewer") is not None
+        review = kb.claim_review_task(conn, task_id)
+        assert review is not None
+        monkeypatch.setenv("HERMES_PROFILE", "code-reviewer")
+        monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", review.claim_lock)
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
     monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
     result = json.loads(kt._handle_request_changes({
         "programmer": "programmer", "reason": "add coverage",

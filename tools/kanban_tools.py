@@ -1010,18 +1010,41 @@ def _handle_request_changes(args: dict, **kw) -> str:
     programmer = args.get("programmer")
     if not tid or not programmer:
         return tool_error("task_id and programmer are required")
+    reason = args.get("reason")
+    if not reason or not str(reason).strip():
+        return tool_error("reason is required")
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
     try:
         kb, conn = _connect(board=args.get("board"))
         try:
+            reviewer = _normalize_profile(os.environ.get("HERMES_PROFILE"))
+            if not reviewer:
+                return tool_error(
+                    "kanban_request_changes: caller reviewer identity is unavailable; "
+                    "dispatcher workers must run with HERMES_PROFILE set"
+                )
+            expected_claim = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+            if os.environ.get("HERMES_KANBAN_TASK") and not expected_claim:
+                return tool_error(
+                    "kanban_request_changes: reviewer claim identity is unavailable; "
+                    "refusing request without HERMES_KANBAN_CLAIM_LOCK"
+                )
+            expected_run_id = _worker_run_id(tid)
+            if os.environ.get("HERMES_KANBAN_TASK") and expected_run_id is None:
+                return tool_error(
+                    "kanban_request_changes: reviewer run identity is unavailable; "
+                    "refusing request without HERMES_KANBAN_RUN_ID"
+                )
             # No ``claimer``: the correction lands in ``ready`` and the
             # dispatcher takes the claim on its next tick. Passing this
             # worker's lock would fabricate a claim with no process behind it.
             task = kb.request_changes(
                 conn, tid, programmer,
-                reason=args.get("reason"),
+                reason=str(reason), reviewer=reviewer,
+                expected_claim=expected_claim,
+                expected_run_id=expected_run_id,
             )
             if task is None:
                 return tool_error(f"could not request changes for {tid}")

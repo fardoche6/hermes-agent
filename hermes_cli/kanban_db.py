@@ -4554,6 +4554,9 @@ def request_changes(
     reason: Optional[str] = None,
     claimer: Optional[str] = None,
     ttl_seconds: Optional[int] = None,
+    reviewer: Optional[str] = None,
+    expected_claim: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
 ) -> Optional[Task]:
     """Return a review to the programmer on the SAME card, via the ready lane.
 
@@ -4585,21 +4588,57 @@ def request_changes(
     longer affect the card: the claim is the dispatcher's to take.
     """
     programmer = _canonical_assignee(programmer)
+    reviewer = _canonical_assignee(reviewer)
     if not programmer:
         raise ValueError("programmer is required")
+    if not reviewer:
+        raise ValueError("reviewer is required")
+    if not reason or not str(reason).strip():
+        raise ValueError("reason is required")
+    if not expected_claim:
+        raise ValueError("expected_claim is required")
+    if expected_run_id is None:
+        raise ValueError("expected_run_id is required")
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id=?",
+            "SELECT status, claim_lock, assignee, current_run_id FROM tasks WHERE id=?",
             (task_id,),
         ).fetchone()
         if not row:
             return None
-        if row["status"] not in {"review", "running"}:
+        if row["status"] != "review":
             raise RuntimeError(
                 f"cannot request changes for {task_id} from status {row['status']!r}"
             )
-        if row["status"] == "running" and row["claim_lock"] is None:
-            raise RuntimeError(f"cannot request changes for {task_id}: unclaimed run")
+        if row["claim_lock"] != expected_claim:
+            raise RuntimeError(
+                f"cannot request changes for {task_id}: this run no longer holds "
+                "the review claim"
+            )
+        if row["current_run_id"] != expected_run_id:
+            raise RuntimeError(
+                f"cannot request changes for {task_id}: this run is no longer "
+                "the active review run"
+            )
+        submitted = None
+        for event in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='submitted_for_review' ORDER BY id DESC",
+            (task_id,),
+        ):
+            try:
+                payload = json.loads(event["payload"]) if event["payload"] else {}
+            except (TypeError, ValueError):
+                payload = {}
+            if isinstance(payload, dict):
+                submitted = _canonical_assignee(payload.get("reviewer"))
+                if submitted:
+                    break
+        if submitted != reviewer:
+            raise RuntimeError(
+                f"cannot request changes for {task_id}: caller {reviewer!r} "
+                "does not own the current reviewer lane"
+            )
         reviewer_run_id = _end_run(
             conn, task_id, outcome="changes_requested", status="running",
             summary=reason,
