@@ -905,6 +905,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                         conn, task_id, programmer,
                         reason=payload.review_reason or payload.block_reason,
                         claimer=payload.claimer,
+                        trusted_operator=True,
                     )
                 except (RuntimeError, ValueError) as e:
                     raise HTTPException(status_code=409, detail=str(e))

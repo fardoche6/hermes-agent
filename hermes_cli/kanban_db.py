@@ -4557,6 +4557,7 @@ def request_changes(
     reviewer: Optional[str] = None,
     expected_claim: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    trusted_operator: bool = False,
 ) -> Optional[Task]:
     """Return a review to the programmer on the SAME card, via the ready lane.
 
@@ -4585,19 +4586,22 @@ def request_changes(
 
     ``claimer`` and ``ttl_seconds`` are accepted for backwards compatibility
     with existing callers (the dashboard plugin passes ``claimer``) but no
-    longer affect the card: the claim is the dispatcher's to take.
+    longer affect the card: the claim is the dispatcher's to take.  The
+    explicit ``trusted_operator`` mode is reserved for the interactive CLI
+    and dashboard control plane; worker tools never pass it and must provide
+    reviewer, claim, and run identity.
     """
     programmer = _canonical_assignee(programmer)
     reviewer = _canonical_assignee(reviewer)
     if not programmer:
         raise ValueError("programmer is required")
-    if not reviewer:
+    if not reviewer and not trusted_operator:
         raise ValueError("reviewer is required")
     if not reason or not str(reason).strip():
         raise ValueError("reason is required")
-    if not expected_claim:
+    if not expected_claim and not trusted_operator:
         raise ValueError("expected_claim is required")
-    if expected_run_id is None:
+    if expected_run_id is None and not trusted_operator:
         raise ValueError("expected_run_id is required")
     with write_txn(conn):
         row = conn.execute(
@@ -4610,12 +4614,12 @@ def request_changes(
             raise RuntimeError(
                 f"cannot request changes for {task_id} from status {row['status']!r}"
             )
-        if row["claim_lock"] != expected_claim:
+        if not trusted_operator and row["claim_lock"] != expected_claim:
             raise RuntimeError(
                 f"cannot request changes for {task_id}: this run no longer holds "
                 "the review claim"
             )
-        if row["current_run_id"] != expected_run_id:
+        if not trusted_operator and row["current_run_id"] != expected_run_id:
             raise RuntimeError(
                 f"cannot request changes for {task_id}: this run is no longer "
                 "the active review run"
@@ -4623,7 +4627,8 @@ def request_changes(
         submitted = None
         for event in conn.execute(
             "SELECT payload FROM task_events WHERE task_id=? "
-            "AND kind='submitted_for_review' ORDER BY id DESC",
+            "AND kind IN ('submitted_for_review', 'review_failover') "
+            "ORDER BY id DESC",
             (task_id,),
         ):
             try:
@@ -4634,7 +4639,7 @@ def request_changes(
                 submitted = _canonical_assignee(payload.get("reviewer"))
                 if submitted:
                     break
-        if submitted != reviewer:
+        if not trusted_operator and submitted != reviewer:
             raise RuntimeError(
                 f"cannot request changes for {task_id}: caller {reviewer!r} "
                 "does not own the current reviewer lane"
@@ -4813,7 +4818,8 @@ def approve_review(
         submitted = None
         for event in conn.execute(
             "SELECT payload FROM task_events WHERE task_id=? "
-            "AND kind='submitted_for_review' ORDER BY id DESC",
+            "AND kind IN ('submitted_for_review', 'review_failover') "
+            "ORDER BY id DESC",
             (task_id,),
         ):
             try:

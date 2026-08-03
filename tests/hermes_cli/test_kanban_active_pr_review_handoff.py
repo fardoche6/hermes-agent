@@ -718,6 +718,55 @@ def test_request_changes_requires_live_owned_review_run(kanban_home):
             ).fetchone()["ended_at"] is None
 
 
+def test_request_changes_accepts_current_reviewer_after_real_failover(kanban_home):
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="failover card", assignee="programmer")
+        assert kb.claim_task(conn, task_id, claimer=f"{host}:impl") is not None
+        assert kb.submit_task_for_review(conn, task_id, "reviewer-a") is not None
+        first = kb.claim_review_task(conn, task_id, claimer=f"{host}:review-a")
+        assert first is not None
+        old_claim, old_run = first.claim_lock, first.current_run_id
+
+        assert kb.failover_review_task(
+            conn, task_id, "reviewer-b", error="reviewer-a unavailable",
+        ) is not None
+        replacement = kb.claim_review_task(
+            conn, task_id, claimer=f"{host}:review-b",
+        )
+        assert replacement is not None
+
+        with pytest.raises(RuntimeError):
+            kb.request_changes(
+                conn, task_id, "programmer", reason="stale reviewer",
+                reviewer="reviewer-a", expected_claim=old_claim,
+                expected_run_id=old_run,
+            )
+        after = kb.get_task(conn, task_id)
+        assert after is not None
+        assert after.status == "review"
+        assert after.assignee == "reviewer-b"
+        assert after.claim_lock == replacement.claim_lock
+        assert after.current_run_id == replacement.current_run_id
+        assert conn.execute(
+            "SELECT ended_at FROM task_runs WHERE id=?",
+            (replacement.current_run_id,),
+        ).fetchone()["ended_at"] is None
+
+        corrected = kb.request_changes(
+            conn, task_id, "programmer", reason="current reviewer feedback",
+            reviewer="reviewer-b", expected_claim=replacement.claim_lock,
+            expected_run_id=replacement.current_run_id,
+        )
+        assert corrected is not None
+        assert corrected.status == "ready"
+        assert corrected.assignee == "programmer"
+        assert conn.execute(
+            "SELECT outcome FROM task_runs WHERE id=?",
+            (replacement.current_run_id,),
+        ).fetchone()["outcome"] == "changes_requested"
+
+
 def test_request_changes_rejects_unclaimed_card(kanban_home):
     host = kb._claimer_id().split(":", 1)[0]
     with kb.connect() as conn:

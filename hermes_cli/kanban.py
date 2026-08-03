@@ -2287,6 +2287,7 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
         with kb.connect_closing() as conn:
             task = kb.request_changes(
                 conn, args.task_id, args.programmer, reason=reason,
+                trusted_operator=True,
             )
     except (RuntimeError, ValueError) as exc:
         print(f"cannot request changes for {args.task_id}: {exc}", file=sys.stderr)

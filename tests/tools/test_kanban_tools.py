@@ -3085,6 +3085,48 @@ def test_kanban_request_changes_handler_returns_to_programmer(monkeypatch, tmp_p
     }
 
 
+@pytest.mark.parametrize("missing", [
+    "HERMES_PROFILE", "HERMES_KANBAN_CLAIM_LOCK", "HERMES_KANBAN_RUN_ID",
+])
+def test_request_changes_handler_rejects_missing_worker_authorization(
+    monkeypatch, tmp_path, missing,
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import kanban_db as kb
+    import tools.kanban_tools as kt
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="auth handler", assignee="programmer")
+        assert kb.claim_task(conn, task_id) is not None
+        assert kb.submit_task_for_review(conn, task_id, "code-reviewer") is not None
+        review = kb.claim_review_task(conn, task_id)
+        assert review is not None
+        monkeypatch.setenv("HERMES_PROFILE", "code-reviewer")
+        monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", review.claim_lock)
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.delenv(missing, raising=False)
+
+    result = json.loads(kt._handle_request_changes({
+        "programmer": "programmer", "reason": "must not bypass auth",
+        "trusted_operator": True,
+    }))
+    assert result.get("ok") is not True
+    conn = kb.connect()
+    try:
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.status == "review"
+        assert conn.execute(
+            "SELECT ended_at FROM task_runs WHERE id=?",
+            (current.current_run_id,),
+        ).fetchone()["ended_at"] is None
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Run 728 repro — a dispatcher-spawned reviewer must have a valid terminal
 # transition for an APPROVE.
