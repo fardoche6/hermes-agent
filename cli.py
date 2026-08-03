@@ -17016,7 +17016,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 # Main Entry Point
 # ============================================================================
 
-def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
+def _run_kanban_goal_loop_q(
+    cli: "HermesCLI",
+    first_response: str,
+    first_result: "dict | None" = None,
+) -> None:
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
     Called from the quiet single-query path AFTER the worker's first turn,
@@ -17025,6 +17029,10 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     DB into ``goals.run_kanban_goal_loop``. All errors are swallowed by the
     caller — a broken goal loop must never wedge a worker, the dispatcher's
     claim TTL / crash detection is the backstop.
+
+    ``first_result`` is the first turn's ``run_conversation`` result; its
+    ``messages`` are what the loop's review-transition guard inspects (the
+    quiet path does not write them back to ``cli.conversation_history``).
     """
     import os as _os
 
@@ -17057,11 +17065,33 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
 
     max_turns = task.goal_max_turns or _DEF_TURNS
 
+    # Latest known message list for this session, used by the loop's
+    # review-transition guard. Seeded with the first turn's messages and
+    # refreshed after every continuation turn.
+    _messages: "list[dict]" = []
+    if isinstance(first_result, dict):
+        _msgs = first_result.get("messages")
+        if isinstance(_msgs, list):
+            _messages = _msgs
+
+    def _goal_loop_messages() -> "list[dict]":
+        if _messages:
+            return _messages
+        # Fallbacks: the agent's live message list, then the CLI history (the
+        # quiet path never writes turn results back into the latter).
+        live = getattr(cli.agent, "_session_messages", None)
+        if isinstance(live, list) and live:
+            return live
+        return list(getattr(cli, "conversation_history", None) or [])
+
     def _run_turn(prompt: str) -> str:
+        nonlocal _messages
         result = cli.agent.run_conversation(
             user_message=prompt,
             conversation_history=cli.conversation_history,
         )
+        if isinstance(result, dict) and isinstance(result.get("messages"), list):
+            _messages = result["messages"]
         # Keep session_id in sync if mid-run compression rotated it.
         if (
             getattr(cli.agent, "session_id", None)
@@ -17102,6 +17132,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         block_fn=_block,
         max_turns=max_turns,
         first_response=first_response or "",
+        messages_fn=_goal_loop_messages,
         log=lambda m: logger.info("%s", m),
     )
 
@@ -17559,7 +17590,7 @@ def main(
                         # normal worker and every non-kanban `-q` run.
                         if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
                             try:
-                                _run_kanban_goal_loop_q(cli, response)
+                                _run_kanban_goal_loop_q(cli, response, result)
                             except Exception as _goal_exc:
                                 logger.debug("kanban goal loop failed: %s", _goal_exc)
 

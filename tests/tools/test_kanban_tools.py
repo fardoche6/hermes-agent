@@ -58,6 +58,7 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     expected = {
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
+        "kanban_review", "kanban_approve", "kanban_request_changes",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
@@ -140,6 +141,7 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
         "kanban_unblock",
+        "kanban_review", "kanban_approve", "kanban_request_changes",
         "kanban_attach", "kanban_attach_url", "kanban_attachments",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
@@ -3070,7 +3072,148 @@ def test_kanban_request_changes_handler_returns_to_programmer(monkeypatch, tmp_p
     result = json.loads(kt._handle_request_changes({
         "programmer": "programmer", "reason": "add coverage",
     }))
+    # Ready lane: the correction is handed back on the same card without a
+    # fabricated claim, so the dispatcher spawns the programmer next tick.
     assert result == {
-        "ok": True, "task_id": task_id, "status": "running",
+        "ok": True, "task_id": task_id, "status": "ready",
         "assignee": "programmer",
     }
+
+
+# ---------------------------------------------------------------------------
+# Run 728 repro — a dispatcher-spawned reviewer must have a valid terminal
+# transition for an APPROVE.
+# ---------------------------------------------------------------------------
+
+def test_reviewer_gets_kanban_approve_and_never_kanban_unblock(monkeypatch, tmp_path):
+    """The exact run-728 shape: HERMES_KANBAN_TASK set (dispatcher-spawned
+    reviewer). ``kanban_unblock`` must stay orchestrator-only and refuse at
+    runtime, while ``kanban_approve`` is exposed and actually works."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import tools.kanban_tools as kt
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
+    names = {s["function"].get("name") for s in schema if "function" in s}
+
+    assert "kanban_approve" in names
+    assert "kanban_unblock" not in names
+
+    # And the runtime guard refuses unblock with a pointer to the real
+    # reviewer transitions.
+    refusal = json.loads(kt._handle_unblock({"task_id": "t_fake"}))
+    assert refusal.get("ok") is not True
+    assert "kanban_approve" in json.dumps(refusal)
+
+
+def test_kanban_approve_handler_hands_card_to_finalizer(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import kanban_db as kb
+    import tools.kanban_tools as kt
+
+    head = "93ac74f13911542446b63ffc526736fed754ae6a"
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approve handler", assignee="programmer")
+        assert kb.claim_task(conn, task_id) is not None
+        assert kb.submit_task_for_review(conn, task_id, "code-reviewer") is not None
+        assert kb.claim_review_task(conn, task_id) is not None
+        review_claim = kb.get_task(conn, task_id).claim_lock
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_PROFILE", "code-reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", review_claim)
+
+    result = json.loads(kt._handle_approve({
+        "summary": "67/67 focused tests, CI green", "head_sha": head,
+    }))
+    assert result["ok"] is True
+    assert result["task_id"] == task_id
+    # Ready lane: the finalizer picks the card up on the dispatcher's next
+    # tick instead of inheriting a claim no process holds.
+    assert result["status"] == "ready"
+    assert result["assignee"] == "programmer"
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task.status != "done"
+        assert task.completed_at is None
+        assert task.claim_lock is None
+        assert task.worker_pid is None
+        assert task.current_run_id is None
+        payload = json.loads(conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND "
+            "kind='review_approved' ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()["payload"])
+        assert payload["head_sha"] == head
+        kinds = {r["kind"] for r in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id=?", (task_id,),
+        )}
+        assert "changes_requested" not in kinds
+
+
+def test_kanban_approve_refuses_delegated_child_context(monkeypatch, tmp_path):
+    """``kanban_approve`` is a board mutation, so it carries the same
+    delegate_task-child guard as complete/block. A delegated child is not a
+    Kanban run owner and must not sign off a review."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import kanban_db as kb
+    import tools.kanban_tools as kt
+    from agent.delegation_context import delegated_child_context
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approve guard", assignee="programmer")
+        assert kb.claim_task(conn, task_id) is not None
+        assert kb.submit_task_for_review(conn, task_id, "code-reviewer") is not None
+        assert kb.claim_review_task(conn, task_id) is not None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+
+    with delegated_child_context():
+        payload = json.loads(kt._handle_approve({
+            "summary": "looks fine",
+            "head_sha": "93ac74f13911542446b63ffc526736fed754ae6a",
+        }))
+
+    assert payload.get("ok") is not True
+    assert "delegate_task child" in json.dumps(payload)
+    with kb.connect() as conn:
+        # Nothing was recorded on the board.
+        assert kb.get_task(conn, task_id).status == "review"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='review_approved'",
+            (task_id,),
+        ).fetchone()[0] == 0
+
+
+def test_kanban_approve_requires_a_summary(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_fake")
+    import tools.kanban_tools as kt
+
+    result = json.loads(kt._handle_approve({}))
+    assert result.get("ok") is not True
+
+
+def test_kanban_approve_refuses_foreign_task(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_mine")
+    import tools.kanban_tools as kt
+
+    result = json.loads(kt._handle_approve({
+        "task_id": "t_someone_else", "summary": "looks fine",
+        "head_sha": "93ac74f13911542446b63ffc526736fed754ae6a",
+    }))
+    assert result.get("ok") is not True
+    assert "t_mine" in json.dumps(result)

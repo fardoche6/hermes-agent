@@ -4304,9 +4304,42 @@ REVIEW_HANDOFF_PREFIX = "review-required:"
 _REVIEW_DIRECTIVE_EVENT_KINDS = ("dependency_wait", "blocked")
 
 # Event kinds that prove a pending review handoff has already been consumed:
-# the card entered the reviewer lane (``submitted_for_review``) or reached a
+# the card entered the reviewer lane (``submitted_for_review``), the reviewer
+# reached a durable decision (``review_approved``), or the card reached a
 # terminal state. Anything later than the directive closes it.
-_REVIEW_HANDOFF_CONSUMED_KINDS = ("submitted_for_review", "completed", "archived")
+#
+# ``review_approved`` belongs here because an approval is the review actually
+# happening: after it, the card is in the finalization/merge lane on the SAME
+# id, and a crashed finalizer must NOT be shoved back into the reviewer lane
+# by ``reconcile_review_handoffs``.
+_REVIEW_HANDOFF_CONSUMED_KINDS = (
+    "submitted_for_review", "review_approved", "completed", "archived",
+)
+
+# Event kinds that settle a *finalization* lane. Deliberately excludes
+# ``review_approved`` itself — an approval cannot settle its own lane — but is
+# otherwise the same "the card moved on" set used by ``in_correction_lane``,
+# plus ``changes_requested``.
+#
+# ``changes_requested`` is what makes the two lanes mutually exclusive: a
+# reviewer that approves and later (on a re-review) asks for changes has moved
+# the card OUT of finalization and back into correction. Without it both
+# ``in_correction_lane`` and ``in_finalization_lane`` would report True and the
+# card would look like it is being merged and corrected at the same time.
+#
+# Stated as an explicit literal rather than derived from
+# ``_REVIEW_HANDOFF_CONSUMED_KINDS`` by subtraction (the same philosophy
+# ``agent/kanban_stop.py`` states for its board-tool sets): a set built by
+# removing one member silently absorbs every kind added to the source tuple
+# later, and "settles a finalization lane" is a decision each new kind has to
+# make deliberately. The intended relationship is:
+# ``_REVIEW_HANDOFF_CONSUMED_KINDS`` minus ``review_approved`` (an approval
+# cannot settle its own lane), plus ``changes_requested``.
+_FINALIZATION_SETTLED_KINDS = (
+    "submitted_for_review", "completed", "archived", "changes_requested",
+)
+
+_FULL_COMMIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 
 
 def _latest_event_id(
@@ -4386,6 +4419,23 @@ def in_correction_lane(conn: sqlite3.Connection, task_id: str) -> bool:
         conn, task_id, _REVIEW_HANDOFF_CONSUMED_KINDS,
     )
     return settled_id < changes_id
+
+
+def in_finalization_lane(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the card's newest review decision is ``review_approved``.
+
+    Mirror image of :func:`in_correction_lane`: an approved card is handed
+    back to a finalizer (the profile that opened the PR) on the SAME card so
+    it can land the merge. If that finalization run crashes or times out the
+    card returns to ``ready`` — and, exactly like a correction, that respawn
+    continues the PR that is already open. It must not be mistaken for "a
+    worker is about to open a duplicate PR".
+    """
+    approved_id = _latest_event_id(conn, task_id, ("review_approved",))
+    if not approved_id:
+        return False
+    settled_id = _latest_event_id(conn, task_id, _FINALIZATION_SETTLED_KINDS)
+    return settled_id < approved_id
 
 
 def submit_task_for_review(
@@ -4505,22 +4555,42 @@ def request_changes(
     claimer: Optional[str] = None,
     ttl_seconds: Optional[int] = None,
 ) -> Optional[Task]:
-    """Return a review directly to a claimed programmer implementation run.
+    """Return a review to the programmer on the SAME card, via the ready lane.
 
-    The same card is reused and is never parked in ``blocked``, ``todo``, or
-    ``triage``.  The reviewer run is closed, the programmer is assigned, and a
-    fresh claim/run is created in one transaction.
+    One bundled correction packet: the reviewer's run is closed with the
+    ``changes_requested`` outcome, a single ``changes_requested`` event records
+    the decision, and the same card id is re-assigned to ``programmer``.  The
+    card is never parked in ``blocked``, ``todo``, or ``triage`` and no child
+    card is created.
+
+    The card lands in ``ready`` with **no** claim, **no** worker pid and **no**
+    active run — the canonical shape every other recovery path in this module
+    converges on (``release_stale_claims``, ``detect_crashed_workers``,
+    ``enforce_max_runtime``, ``_record_task_failure``).  Fabricating a claim +
+    ``task_runs`` row here would be a lie: no process exists behind it.  The
+    consequences were real — the dead reviewer's ``worker_pid`` survived on the
+    card, so ``detect_crashed_workers`` reaped the fresh "run" as a
+    ``protocol_violation`` one tick later, while the held claim made the card
+    invisible to BOTH dispatcher lanes (ready wants ``claim_lock IS NULL``,
+    review wants ``status='review'``).
+
+    Leaving the card ``ready`` lets the dispatcher's normal
+    ``claim_task`` + ``_set_worker_pid`` establish the correction run against a
+    process that actually exists.  ``in_correction_lane`` carries the durable
+    provenance that this respawn continues the PR that is already open, so the
+    ``active_pr`` respawn guard does not strand it.
+
+    ``claimer`` and ``ttl_seconds`` are accepted for backwards compatibility
+    with existing callers (the dashboard plugin passes ``claimer``) but no
+    longer affect the card: the claim is the dispatcher's to take.
     """
     programmer = _canonical_assignee(programmer)
     if not programmer:
         raise ValueError("programmer is required")
-    now = int(time.time())
-    lock = claimer or _claimer_id()
-    expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee, max_runtime_seconds, "
-            "current_step_key FROM tasks WHERE id=?", (task_id,),
+            "SELECT status, claim_lock, assignee FROM tasks WHERE id=?",
+            (task_id,),
         ).fetchone()
         if not row:
             return None
@@ -4535,31 +4605,247 @@ def request_changes(
             summary=reason,
         )
         conn.execute(
-            "UPDATE tasks SET status='running', assignee=?, claim_lock=?, "
-            "claim_expires=?, started_at=COALESCE(started_at, ?), "
+            "UPDATE tasks SET status='ready', assignee=?, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, current_run_id=NULL, "
             "completed_at=NULL, block_kind=NULL WHERE id=?",
-            (programmer, lock, expires, now, task_id),
+            (programmer, task_id),
         )
-        run_cur = conn.execute(
-            "INSERT INTO task_runs (task_id, profile, step_key, status, "
-            "claim_lock, claim_expires, max_runtime_seconds, started_at) "
-            "VALUES (?, ?, ?, 'running', ?, ?, ?, ?)",
-            (task_id, programmer, row["current_step_key"], lock, expires,
-             row["max_runtime_seconds"], now),
-        )
-        run_id = int(run_cur.lastrowid)
-        conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, task_id))
         _append_event(
             conn, task_id, "changes_requested",
-            {"programmer": programmer, "reason": reason, "run_id": run_id},
+            {"programmer": programmer, "reason": reason},
             run_id=reviewer_run_id,
         )
-        _append_event(
-            conn, task_id, "claimed",
-            {"lock": lock, "expires": expires, "run_id": run_id,
-             "source_status": "review_changes_requested"},
-            run_id=run_id,
+        if _has_sticky_block(conn, task_id):
+            # Mirror of ``approve_review``: the documented handoff into the
+            # reviewer lane is a worker-initiated sticky block
+            # (``kanban_block(reason="review-required: ...")``), and BOTH
+            # halves of the review decision resolve it. Leaving it set is not
+            # cosmetic — the correction run can trip the failure circuit
+            # breaker into ``blocked``, and ``recompute_ready`` refuses to
+            # auto-recover a card whose latest block event is still a sticky
+            # ``blocked``, so the card would need a manual orchestrator-only
+            # ``kanban_unblock`` forever. Emit the same ``unblocked`` marker
+            # ``unblock_task`` writes so ``_has_sticky_block`` agrees.
+            _append_event(
+                conn, task_id, "unblocked", {"source": "changes_requested"},
+            )
+        return get_task(conn, task_id)
+
+
+def _resolve_finalizer(
+    conn: sqlite3.Connection, task_id: str, *, reviewer: Optional[str],
+) -> Optional[str]:
+    """Best-effort resolution of the profile that must finalize/merge the PR.
+
+    Order (first hit wins):
+
+    1. the ``previous_assignee`` recorded on the most recent
+       ``submitted_for_review`` event — the durable, purpose-built record of
+       "who owned this card right before the reviewer did";
+    2. the most recent ``task_runs.profile`` that is not the reviewer — the
+       card's pre-reviewer assignee as observed by the run ledger.
+
+    Both sources are filtered against ``reviewer``. The card assignee is
+    mutable, and malformed or legacy event history must never route a merge
+    back to the reviewer who just approved it.
+
+    Returns ``None`` when neither source yields a usable profile; callers must
+    fail closed rather than guessing.
+    """
+    for row in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND "
+        "kind = 'submitted_for_review' ORDER BY id DESC",
+        (task_id,),
+    ):
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            continue
+        candidate = _canonical_assignee(payload.get("previous_assignee"))
+        if candidate and candidate != reviewer:
+            return candidate
+    for row in conn.execute(
+        "SELECT profile FROM task_runs WHERE task_id = ? ORDER BY id DESC",
+        (task_id,),
+    ):
+        candidate = _canonical_assignee(row["profile"])
+        if candidate and candidate != reviewer:
+            return candidate
+    return None
+
+
+def approve_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reviewer: Optional[str] = None,
+    summary: Optional[str] = None,
+    head_sha: Optional[str] = None,
+    expected_claim: Optional[str] = None,
+) -> Optional[Task]:
+    """Record a durable review APPROVAL and hand the card to its finalizer.
+
+    The exact mirror of :func:`request_changes`, for the other half of the
+    review decision.  Before this existed a reviewer that approved had no
+    valid terminal transition at all: ``kanban_unblock`` is orchestrator-only,
+    ``kanban_complete`` would lie (nothing is merged yet), and
+    ``kanban_block`` is not a routine approval — so the run exited clean and
+    the dispatcher recorded a ``protocol_violation``, cycled the card back
+    through ``ready`` and spawned redundant reviewers.
+
+    Semantics:
+
+    * the reviewer's run is closed with the ``approved`` outcome;
+    * approval becomes machine-readable for the first time via a
+      ``review_approved`` event carrying reviewer / head_sha / summary;
+    * the SAME card is routed to the finalization (merge) lane exactly the
+      way ``request_changes`` routes it to the programmer — same card id, new
+      assignee, no child card;
+    * a sticky ``review-required:`` block is cleared with an ``unblocked``
+      event so approving never needs the orchestrator-only unblock tool.
+
+    The card lands in ``ready`` with **no** claim, **no** worker pid and **no**
+    active run. This is the canonical hand-off shape in this module: the
+    dispatcher's normal ``claim_task`` + ``_set_worker_pid`` establish the
+    finalization run on the next tick, against a process that actually exists.
+    Synthesizing a claim + ``task_runs`` row here instead would (a) leave the
+    dead reviewer's ``worker_pid`` on the card, so ``detect_crashed_workers``
+    reaps the phantom run as a ``protocol_violation`` one tick after approval —
+    the very bug this transition exists to eliminate — and (b) make the card
+    invisible to both dispatcher lanes (the ready lane requires
+    ``claim_lock IS NULL``, the review lane requires ``status='review'``), so
+    no fresh finalizer could ever pick it up. ``in_finalization_lane`` carries
+    the durable provenance that this respawn continues the PR that is already
+    open, so the ``active_pr`` respawn guard does not strand it.
+
+    Approval is explicitly **not** completion: the card goes back to ``ready``
+    for its finalizer, ``completed_at`` is untouched, and reaching ``done``
+    still requires the normal completion path with merged durable-tree proof.
+
+    Only a card actually sitting in the reviewer lane (``status='review'``)
+    can be approved. ``claim_review_task`` — the one path that puts a
+    dispatcher-spawned reviewer on a card — leaves the card at
+    ``status='review'`` with the reviewer's claim held, so this costs a
+    legitimate reviewer nothing. Accepting ``running`` as well used to let a
+    PROGRAMMER approve its own in-flight card: ``reviewer`` defaults to the
+    card's assignee, so on a card that had already been through review the
+    "reviewer" resolved to the programmer, ``_resolve_finalizer`` then handed
+    the merge to the reviewer profile, and the programmer's own run was
+    abandoned mid-flight.
+
+    ``expected_claim``, when given, is a compare-and-swap against the card's
+    current ``claim_lock``: only the process that still holds the review claim
+    may approve. A reviewer whose claim already expired and failed over to a
+    fresh reviewer would otherwise close the NEW reviewer's run. ``None``
+    means "caller does not know the claim" (operator-only callers) and
+    skips the check; dispatcher worker tools require the claim explicitly.
+    """
+    expected_claim = (expected_claim or "").strip() or None
+    reviewer_name = _canonical_assignee(reviewer)
+    if not reviewer_name:
+        raise ValueError("reviewer is required and must identify the calling reviewer")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, claim_lock, assignee FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        if not row:
+            return None
+        if row["status"] != "review":
+            raise RuntimeError(
+                f"cannot approve {task_id} from status {row['status']!r}: "
+                "approval is the reviewer lane's terminal transition and is "
+                "only valid while the card is in 'review'"
+            )
+        if not head_sha or not _FULL_COMMIT_SHA_RE.fullmatch(str(head_sha).strip()):
+            raise ValueError("head_sha must be the full 40- or 64-character commit sha")
+        head_sha = str(head_sha).strip().lower()
+        if expected_claim is not None and row["claim_lock"] != expected_claim:
+            raise RuntimeError(
+                f"cannot approve {task_id}: this run no longer holds the "
+                "review claim (it expired, was released, or failed over to "
+                "another reviewer); do not approve on behalf of the run that "
+                "replaced you"
+            )
+        # The card assignee is mutable state and is not caller identity.  Only
+        # the durable submission event proves which reviewer owns this lane.
+        submitted = None
+        for event in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='submitted_for_review' ORDER BY id DESC",
+            (task_id,),
+        ):
+            try:
+                payload = json.loads(event["payload"]) if event["payload"] else {}
+            except (TypeError, ValueError):
+                payload = {}
+            if isinstance(payload, dict):
+                submitted = _canonical_assignee(payload.get("reviewer"))
+                if submitted:
+                    break
+        if submitted != reviewer_name:
+            raise RuntimeError(
+                f"cannot approve {task_id}: caller {reviewer_name!r} does not "
+                "own the current reviewer lane"
+            )
+        finalizer_name = _resolve_finalizer(conn, task_id, reviewer=reviewer_name)
+        if not finalizer_name:
+            # Fail closed. Guessing an owner here would silently reassign the
+            # merge to whoever happened to be on the card.
+            raise RuntimeError(
+                "cannot approve {task_id}: no finalizer profile could be "
+                "resolved from the card's history"
+            )
+        if finalizer_name == reviewer_name:
+            raise RuntimeError(
+                f"cannot approve {task_id}: reviewer cannot be its own finalizer"
+            )
+        reviewer_run_id = _end_run(
+            conn, task_id, outcome="approved", summary=summary,
         )
+        # Re-assert both gates as a CAS on the write itself. ``write_txn`` is
+        # BEGIN IMMEDIATE so the read above cannot be raced, but stating the
+        # predicates here means a future refactor that moves the read out of
+        # the txn still cannot approve a card that has since left the reviewer
+        # lane or changed hands.
+        predicates = ["id = ?", "status = 'review'"]
+        params: list[object] = [task_id]
+        if expected_claim is not None:
+            predicates.append("claim_lock = ?")
+            params.append(expected_claim)
+        cur = conn.execute(
+            "UPDATE tasks SET status='ready', assignee=?, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, current_run_id=NULL, "
+            "completed_at=NULL, block_kind=NULL WHERE "
+            + " AND ".join(predicates),
+            (finalizer_name, *params),
+        )
+        if cur.rowcount != 1:
+            # Raise (not ``return None``) so ``write_txn`` rolls back the run
+            # closure above; a half-applied approval would leave the reviewer
+            # run ended with the card still in the review lane.
+            raise RuntimeError(
+                f"cannot approve {task_id}: the card left the reviewer lane "
+                "while the approval was being recorded"
+            )
+        _append_event(
+            conn, task_id, "review_approved",
+            {"reviewer": reviewer_name, "head_sha": head_sha,
+             "summary": summary, "finalizer": finalizer_name},
+            run_id=reviewer_run_id,
+        )
+        if _has_sticky_block(conn, task_id):
+            # The documented handoff is a worker-initiated sticky block
+            # (``kanban_block(reason="review-required: ...")``). Approval is
+            # the event that resolves it; emit the same ``unblocked`` marker
+            # ``unblock_task`` writes so ``_has_sticky_block`` and
+            # ``recompute_ready`` agree, without needing the orchestrator-only
+            # unblock tool.
+            _append_event(
+                conn, task_id, "unblocked", {"source": "review_approved"},
+            )
         return get_task(conn, task_id)
 
 
@@ -7968,9 +8254,13 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     review_crashes: dict[str, str] = {}
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, status, current_run_id, assignee "
-            "FROM tasks "
-            "WHERE status IN ('running', 'review') AND worker_pid IS NOT NULL"
+            "SELECT t.id, t.worker_pid, t.claim_lock, t.status, "
+            "       t.current_run_id, t.assignee, "
+            "       COALESCE(r.started_at, t.started_at) AS active_started_at "
+            "FROM tasks t "
+            "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE t.status IN ('running', 'review') "
+            "  AND t.worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
@@ -7981,7 +8271,19 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             # Skip liveness check inside the launch-window grace period
             # so a freshly-spawned worker isn't reclaimed before its PID
             # is visible on /proc.
-            started_at = row["started_at"] if "started_at" in row.keys() else None
+            #
+            # The window is per ATTEMPT, measured from the active run's
+            # ``started_at`` (falling back to the task's, as
+            # ``enforce_max_runtime`` and ``detect_stale_running`` do).
+            # ``tasks.started_at`` records the first time the card ever
+            # started and every re-claim preserves it via COALESCE, so
+            # keying off it would give any re-claimed card — a correction, a
+            # finalization, a crash retry — ZERO launch grace and let a
+            # freshly spawned worker be reaped as a protocol violation.
+            started_at = (
+                row["active_started_at"]
+                if "active_started_at" in row.keys() else None
+            )
             if started_at is not None:
                 grace = _resolve_crash_grace_seconds()
                 if time.time() - started_at < grace:
@@ -8688,12 +8990,17 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     #    PR for work that already has one". It is NOT a veto on the review
     #    state machine: when the card carries durable provenance that it is
     #    continuing the SAME PR (a reviewer ``changes_requested`` correction
-    #    whose run crashed / timed out back to ready, or an un-consumed
-    #    ``review-required:`` handoff awaiting reconciliation into the
-    #    reviewer lane), respawning continues existing work rather than
-    #    duplicating it. Without this carve-out the card is stranded in
-    #    ``ready`` for the full 24h PR window.
-    if in_correction_lane(conn, task_id) or pending_review_handoff(conn, task_id):
+    #    whose run crashed / timed out back to ready, a reviewer
+    #    ``review_approved`` finalization whose merge run crashed the same
+    #    way, or an un-consumed ``review-required:`` handoff awaiting
+    #    reconciliation into the reviewer lane), respawning continues existing
+    #    work rather than duplicating it. Without this carve-out the card is
+    #    stranded in ``ready`` for the full 24h PR window.
+    if (
+        in_correction_lane(conn, task_id)
+        or in_finalization_lane(conn, task_id)
+        or pending_review_handoff(conn, task_id)
+    ):
         return None
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
@@ -9888,6 +10195,31 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     lines.append("")
     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
     lines.append(f"Status:   {task.status}")
+    if in_finalization_lane(conn, task_id):
+        approval = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind='review_approved' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        try:
+            approval_payload = json.loads(approval["payload"]) if approval else {}
+        except (TypeError, ValueError):
+            approval_payload = {}
+        approved_head = (
+            approval_payload.get("head_sha")
+            if isinstance(approval_payload, dict) else None
+        )
+        lines.extend([
+            "",
+            "## Finalization directive",
+            "A fresh reviewer approved this same card. You are the finalizer/merge "
+            "worker, not a reviewer retry and not the old reviewer process.",
+            f"Approved exact head: `{approved_head or '(missing — fail closed)'}`",
+            "Verify the durable tree is still exactly that head, perform the merge "
+            "through the repository's supported method, and call kanban_complete "
+            "only after the merge is durably verified. Never claim completion for "
+            "an unmerged task.",
+        ])
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")

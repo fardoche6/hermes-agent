@@ -75,6 +75,12 @@ _HERMES_CORE_TOOLS = [
     "kanban_complete", "kanban_block", "kanban_heartbeat",
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
+    # Review state machine. These are terminal transitions for a reviewer run,
+    # so they must be first-class core tools: anything outside this list is
+    # deferrable by tools/tool_search.py, and a reviewer whose only valid
+    # ending is hidden behind tool_search exits clean into a protocol
+    # violation.
+    "kanban_review", "kanban_approve", "kanban_request_changes",
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
@@ -275,6 +281,7 @@ TOOLSETS = {
             "kanban_heartbeat", "kanban_comment",
             "kanban_create", "kanban_link",
             "kanban_unblock",
+            "kanban_review", "kanban_approve", "kanban_request_changes",
             "kanban_attach", "kanban_attach_url", "kanban_attachments",
         ],
         "includes": [],

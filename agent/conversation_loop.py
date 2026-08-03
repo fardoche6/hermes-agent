@@ -6881,8 +6881,10 @@ def run_conversation(
                         os.environ.get("HERMES_KANBAN_TASK", ""),
                     )
                     agent._emit_status(
-                        "⚠️ Kanban worker tried to exit without "
-                        "kanban_complete/kanban_block — nudging to finish"
+                        "⚠️ Kanban worker tried to exit without a terminal "
+                        "board transition (kanban_complete/kanban_block, or "
+                        "kanban_approve/kanban_request_changes for a review) "
+                        "— nudging to finish"
                     )
                     # Same finalizer contract as verify-on-stop: clear
                     # final_response while continuing so a later budget

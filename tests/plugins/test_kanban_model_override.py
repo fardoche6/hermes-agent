@@ -325,5 +325,11 @@ def test_patch_request_change_branch(client):
     )
     assert response.status_code == 200, response.text
     updated = response.json()["task"]
-    assert updated["status"] == "running"
+    # The card is handed back on the SAME id via the ready lane, with no
+    # fabricated claim: the dispatcher's own claim_task establishes the
+    # correction run against a process that actually exists.
+    assert updated["status"] == "ready"
     assert updated["assignee"] == "programmer"
+    assert updated["claim_lock"] is None
+    assert updated["worker_pid"] is None
+    assert updated["current_run_id"] is None

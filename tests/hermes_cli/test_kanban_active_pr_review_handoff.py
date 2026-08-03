@@ -43,12 +43,32 @@ def kanban_home(tmp_path, monkeypatch):
 
 
 def _crash_current_worker(conn, task_id: str, pid: int = 987654) -> None:
-    """Kill the live claim the way production did: a dead worker PID."""
+    """Kill the live claim the way production did: a dead worker PID.
+
+    Backdates the ACTIVE RUN's ``started_at`` as well as the task's: the
+    crash-detection launch grace window is measured per attempt, from the
+    active run, so a run that started "now" is inside the grace window and is
+    deliberately not reaped.
+    """
+    stamp = int(time.time()) - 600
     conn.execute(
         "UPDATE tasks SET worker_pid=?, started_at=? WHERE id=?",
-        (pid, int(time.time()) - 600, task_id),
+        (pid, stamp, task_id),
+    )
+    conn.execute(
+        "UPDATE task_runs SET started_at=? "
+        "WHERE id = (SELECT current_run_id FROM tasks WHERE id=?)",
+        (stamp, task_id),
     )
     conn.commit()
+
+
+def _spawn_recorder(sink, pid=None):
+    """spawn_fn stub that records ``(task_id, assignee)`` and returns ``pid``."""
+    def _spawn(task, workspace):
+        sink.append((task.id, task.assignee))
+        return pid
+    return _spawn
 
 
 # ---------------------------------------------------------------------------
@@ -81,25 +101,29 @@ def test_correction_recovery_after_crash_is_not_pr_guarded(
         assert kb.submit_task_for_review(conn, task_id, "code-reviewer") is not None
         assert kb.claim_review_task(conn, task_id, claimer=f"{host}:review") is not None
         corrected = kb.request_changes(
-            conn, task_id, "programmer",
-            reason="tighten error handling", claimer=f"{host}:impl2",
+            conn, task_id, "programmer", reason="tighten error handling",
         )
-        assert corrected is not None and corrected.status == "running"
+        # The correction lands in the ready lane with no phantom claim.
+        assert corrected is not None and corrected.status == "ready"
+        assert corrected.claim_lock is None
+        assert corrected.worker_pid is None
+
+        # The PR URL must NOT suppress the correction spawn.
+        assert kb.check_respawn_guard(conn, task_id) is None
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=_spawn_recorder(spawned, pid=4242))
+        assert spawned == [(task_id, "programmer")]
 
         # The correction run crashes: pid not alive -> back to ready.
-        _crash_current_worker(conn, task_id)
+        _crash_current_worker(conn, task_id, pid=4242)
         assert task_id in kb.detect_crashed_workers(conn)
         assert kb.get_task(conn, task_id).status == "ready"
 
-        # The PR URL must NOT suppress the correction respawn.
+        # ...and the PR URL must not suppress the correction RESPAWN either.
         assert kb.check_respawn_guard(conn, task_id) is None
 
-        spawned = []
-        result = kb.dispatch_once(
-            conn, spawn_fn=lambda task, workspace: spawned.append(
-                (task.id, task.assignee)
-            ),
-        )
+        spawned.clear()
+        result = kb.dispatch_once(conn, spawn_fn=_spawn_recorder(spawned))
         assert (task_id, "active_pr") not in result.respawn_guarded
         assert spawned == [(task_id, "programmer")]
 
@@ -197,18 +221,16 @@ def test_completed_review_cycle_does_not_re_enter_review_lane(
         # The dispatcher already claimed + spawned the reviewer above.
         # Reviewer requests changes -> programmer correction -> crash.
         assert kb.request_changes(
-            conn, task_id, "programmer", reason="fix tests", claimer=f"{host}:impl2",
+            conn, task_id, "programmer", reason="fix tests",
         ) is not None
-        _crash_current_worker(conn, task_id)
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=_spawn_recorder(spawned, pid=4243))
+        assert spawned == [(task_id, "programmer")]
+        _crash_current_worker(conn, task_id, pid=4243)
         assert task_id in kb.detect_crashed_workers(conn)
 
-        spawned = []
-        kb.dispatch_once(
-            conn,
-            spawn_fn=lambda task, workspace: spawned.append(
-                (task.id, task.assignee)
-            ),
-        )
+        spawned.clear()
+        kb.dispatch_once(conn, spawn_fn=_spawn_recorder(spawned))
         task = kb.get_task(conn, task_id)
         assert task is not None and task.assignee == "programmer"
         assert spawned == [(task_id, "programmer")]
@@ -451,3 +473,546 @@ def test_dry_run_does_not_leak_stale_recovery_side_channels(
 
     assert result.auto_blocked == []
     assert result.rate_limited == []
+
+
+# ---------------------------------------------------------------------------
+# Invariant 6 — a reviewer that APPROVES has a valid terminal transition
+#
+# Production failure (run 728): a dispatcher-spawned reviewer verified the
+# work and posted an exact-head APPROVE, but had nowhere to put it —
+# ``kanban_unblock`` is orchestrator-only, ``kanban_complete`` would claim a
+# merge that had not happened, ``kanban_block`` is not a routine approval. The
+# run exited clean, the dispatcher recorded ``protocol_violation``, the card
+# cycled back through ``ready`` and two redundant reviewers were spawned.
+# ---------------------------------------------------------------------------
+
+HEAD_SHA = "93ac74f13911542446b63ffc526736fed754ae6a"
+
+
+def _approved_card(conn, *, host, comment_pr=True):
+    """Build a card sitting in the reviewer lane with a claimed review run."""
+    task_id = kb.create_task(conn, title="coding card", assignee="programmer")
+    assert kb.claim_task(conn, task_id, claimer=f"{host}:impl") is not None
+    if comment_pr:
+        kb.add_comment(conn, task_id, "programmer", f"PR opened: {PR_URL}")
+    assert kb.submit_task_for_review(conn, task_id, "code-reviewer") is not None
+    assert kb.claim_review_task(conn, task_id, claimer=f"{host}:review") is not None
+    return task_id
+
+
+def _events(conn, task_id):
+    return [
+        r["kind"] for r in conn.execute(
+            "SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (task_id,),
+        )
+    ]
+
+
+def _event_payload(conn, task_id, kind):
+    import json as _json
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind=? "
+        "ORDER BY id DESC LIMIT 1", (task_id, kind),
+    ).fetchone()
+    assert row is not None, f"no {kind} event on {task_id}"
+    return _json.loads(row["payload"]) if row["payload"] else {}
+
+
+def test_approve_records_durable_exact_head_evidence(kanban_home):
+    """Approval is machine-readable: reviewer + head sha + summary land in a
+    ``review_approved`` event, and the reviewer's run closes successfully."""
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = _approved_card(conn, host=host)
+        reviewer_run_id = kb.get_task(conn, task_id).current_run_id
+
+        task = kb.approve_review(
+            conn, task_id,
+            reviewer="code-reviewer",
+            summary="67/67 focused tests, CI green",
+            head_sha=HEAD_SHA,
+            expected_claim=f"{host}:review",
+        )
+
+        assert task is not None
+        payload = _event_payload(conn, task_id, "review_approved")
+        assert payload["head_sha"] == HEAD_SHA
+        assert payload["reviewer"] == "code-reviewer"
+        assert payload["summary"] == "67/67 focused tests, CI green"
+
+        run = conn.execute(
+            "SELECT outcome, summary, ended_at FROM task_runs WHERE id=?",
+            (reviewer_run_id,),
+        ).fetchone()
+        assert run["outcome"] == "approved"
+        assert run["summary"] == "67/67 focused tests, CI green"
+        assert run["ended_at"] is not None
+
+
+def test_approve_requires_full_exact_head(kanban_home):
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = _approved_card(conn, host=host)
+        with pytest.raises(ValueError, match="full 40- or 64-character"):
+            kb.approve_review(
+                conn, task_id, reviewer="code-reviewer", summary="approved",
+                head_sha="deadbeef",
+            )
+        assert kb.get_task(conn, task_id).status == "review"
+
+
+def test_programmer_cannot_self_approve_reviewer_lane(kanban_home):
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = _approved_card(conn, host=host)
+        with pytest.raises(RuntimeError, match="does not own the current reviewer lane"):
+            kb.approve_review(
+                conn, task_id, reviewer="programmer", summary="approved",
+                head_sha=HEAD_SHA, expected_claim=f"{host}:review",
+            )
+        assert kb.get_task(conn, task_id).status == "review"
+
+
+def test_stale_reviewer_claim_cannot_close_replacement_run(kanban_home):
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = _approved_card(conn, host=host)
+        with pytest.raises(RuntimeError, match="no longer holds"):
+            kb.approve_review(
+                conn, task_id, reviewer="code-reviewer", summary="approved",
+                head_sha=HEAD_SHA, expected_claim=f"{host}:stale-review",
+            )
+        assert kb.get_task(conn, task_id).status == "review"
+
+
+def test_approve_hands_same_card_to_the_finalization_lane(kanban_home):
+    """No child card and no phantom claim: the approved card is handed to the
+    profile that submitted it for review, in the canonical ready-lane shape
+    every other recovery path in the module produces."""
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = _approved_card(conn, host=host)
+
+        task = kb.approve_review(
+            conn, task_id, reviewer="code-reviewer",
+            summary="approved", head_sha=HEAD_SHA,
+        )
+
+        assert task.status == "ready"
+        assert task.assignee == "programmer"
+        assert task.claim_lock is None
+        assert task.claim_expires is None
+        assert task.worker_pid is None
+        assert task.current_run_id is None
+        assert _event_payload(
+            conn, task_id, "review_approved",
+        )["finalizer"] == "programmer"
+        # No fabricated run row: nothing is left open behind a claim that no
+        # process holds.
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=? AND ended_at IS NULL",
+            (task_id,),
+        ).fetchone()[0] == 0
+        # ...and no synthetic ``claimed`` event either.
+        kinds = _events(conn, task_id)
+        assert "claimed" not in kinds[kinds.index("review_approved"):]
+        assert kb.in_finalization_lane(conn, task_id) is True
+        assert kb.in_correction_lane(conn, task_id) is False
+        context = kb.build_worker_context(conn, task_id)
+        assert "## Finalization directive" in context
+        assert f"Approved exact head: `{HEAD_SHA}`" in context
+        assert "call kanban_complete only after the merge is durably verified" in context
+        # One canonical card.
+        assert len(kb.list_tasks(conn)) == 1
+
+
+def test_approve_is_not_completion(kanban_home):
+    """Approval must never mark the card done or stamp a completion time."""
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = _approved_card(conn, host=host)
+        task = kb.approve_review(
+            conn, task_id, reviewer="code-reviewer",
+            summary="approved", head_sha=HEAD_SHA, expected_claim=f"{host}:review",
+        )
+        assert task.status != "done"
+        assert task.completed_at is None
+        assert "completed" not in _events(conn, task_id)
+
+
+def test_approve_does_not_fake_a_change_request(kanban_home):
+    """The approve path must not borrow ``request_changes`` — the manual
+    recovery workaround ('finalization-only / no code change') must not
+    become the design."""
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = _approved_card(conn, host=host)
+        kb.approve_review(
+            conn, task_id, reviewer="code-reviewer",
+            summary="approved", head_sha=HEAD_SHA, expected_claim=f"{host}:review",
+        )
+        assert "changes_requested" not in _events(conn, task_id)
+
+
+def test_approve_clears_the_review_required_sticky_block(kanban_home):
+    """The legacy handoff is an untyped sticky ``kanban_block``. Approving
+    must resolve it without the orchestrator-only unblock tool — that dead
+    end is exactly what stranded run 728."""
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="coding card", assignee="programmer")
+        assert kb.claim_task(conn, task_id, claimer=f"{host}:impl") is not None
+        assert kb.block_task(
+            conn, task_id, reason="review-required: PR ready",
+        ) is True
+        assert kb._has_sticky_block(conn, task_id) is True
+        assert kb.submit_task_for_review(conn, task_id, "code-reviewer") is not None
+        assert kb.claim_review_task(
+            conn, task_id, claimer=f"{host}:review",
+        ) is not None
+
+        kb.approve_review(
+            conn, task_id, reviewer="code-reviewer",
+            summary="approved", head_sha=HEAD_SHA, expected_claim=f"{host}:review",
+        )
+
+        assert kb._has_sticky_block(conn, task_id) is False
+        assert kb.get_task(conn, task_id).block_kind is None
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert "unblocked" in _events(conn, task_id)
+
+
+def test_approved_card_does_not_respawn_a_reviewer(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """No duplicate reviewer, no failover, no second review lane after
+    approval — the only spawn is the finalizer."""
+    monkeypatch.setattr(
+        kb, "_reviewer_candidates", lambda current: (["code-reviewer"], []),
+    )
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = _approved_card(conn, host=host)
+        kb.approve_review(
+            conn, task_id, reviewer="code-reviewer",
+            summary="approved", head_sha=HEAD_SHA,
+        )
+
+        spawned = []
+        result = kb.dispatch_once(conn, spawn_fn=_spawn_recorder(spawned))
+
+        assert spawned == [(task_id, "programmer")]
+        assert [(t, a) for t, a, *_ in result.spawned] == [
+            (task_id, "programmer")
+        ]
+        assert task_id not in result.review_reconciled
+        kinds = _events(conn, task_id)
+        assert "review_failover" not in kinds
+        assert "review_lanes_failed" not in kinds
+        # Exactly one trip through the reviewer lane, ever.
+        assert kinds.count("submitted_for_review") == 1
+        assert kb.get_task(conn, task_id).status == "running"
+        assert kb.get_task(conn, task_id).assignee == "programmer"
+        assert len(kb.list_tasks(conn)) == 1
+
+
+def test_crashed_finalizer_resumes_the_same_pr(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """After approval, a crashed merge run must NOT be shoved back into the
+    review lane, and the ``active_pr`` guard must not strand it."""
+    monkeypatch.setattr(
+        kb, "_reviewer_candidates", lambda current: (["code-reviewer"], []),
+    )
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = _approved_card(conn, host=host)
+        kb.approve_review(
+            conn, task_id, reviewer="code-reviewer",
+            summary="approved", head_sha=HEAD_SHA,
+        )
+
+        # The dispatcher claims the approved card for the finalizer...
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=_spawn_recorder(spawned, pid=5150))
+        assert spawned == [(task_id, "programmer")]
+        assert kb.get_task(conn, task_id).status == "running"
+
+        # ...and that merge run crashes.
+        _crash_current_worker(conn, task_id, pid=5150)
+        assert task_id in kb.detect_crashed_workers(conn)
+        assert kb.get_task(conn, task_id).status == "ready"
+
+        # A recent PR comment exists, but the card is durably in the
+        # finalization lane — continuing, not duplicating.
+        assert kb.check_respawn_guard(conn, task_id) is None
+        assert kb.in_finalization_lane(conn, task_id) is True
+        assert kb.pending_review_handoff(conn, task_id) is False
+
+        spawned.clear()
+        result = kb.dispatch_once(conn, spawn_fn=_spawn_recorder(spawned))
+
+        assert (task_id, "active_pr") not in result.respawn_guarded
+        assert spawned == [(task_id, "programmer")]
+        assert task_id not in result.review_reconciled
+        assert kb.get_task(conn, task_id).assignee == "programmer"
+
+
+@pytest.mark.parametrize(
+    "bad_status", ["ready", "todo", "done", "blocked", "running"],
+)
+def test_approve_from_invalid_status_is_rejected(kanban_home, bad_status):
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="coding card", assignee="programmer")
+        conn.execute(
+            "UPDATE tasks SET status=?, claim_lock=NULL WHERE id=?",
+            (bad_status, task_id),
+        )
+        conn.commit()
+        with pytest.raises(RuntimeError):
+            kb.approve_review(
+                conn, task_id, reviewer="code-reviewer",
+                summary="approved",
+            )
+        assert kb.get_task(conn, task_id).status == bad_status
+
+
+def test_approve_fails_closed_without_a_resolvable_finalizer(kanban_home):
+    """No submitted_for_review provenance and no prior run: refuse rather
+    than guessing who should land the merge."""
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="orphan card", assignee="code-reviewer")
+        conn.execute(
+            "UPDATE tasks SET status='review' WHERE id=?", (task_id,),
+        )
+        conn.commit()
+        with pytest.raises(RuntimeError):
+            kb.approve_review(
+                conn, task_id, reviewer="code-reviewer",
+                summary="approved", head_sha=HEAD_SHA,
+            )
+        assert kb.get_task(conn, task_id).status == "review"
+
+        # No caller can bypass the durable reviewer-lane provenance by choosing
+        # an explicit finalizer; the new API has no such override.
+
+
+def test_request_changes_still_returns_one_bundled_correction_packet(kanban_home):
+    """Regression: the correction half of the review decision is still ONE
+    bundled same-card packet — one event, one card, no child."""
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = _approved_card(conn, host=host)
+        task = kb.request_changes(
+            conn, task_id, "programmer",
+            reason="tighten error handling", claimer=f"{host}:impl2",
+        )
+        assert task is not None
+        # Ready lane, not a fabricated claim: identical shape to approval.
+        assert task.status == "ready"
+        assert task.assignee == "programmer"
+        assert task.claim_lock is None
+        assert task.worker_pid is None
+        assert task.current_run_id is None
+        assert task.completed_at is None
+        payload = _event_payload(conn, task_id, "changes_requested")
+        assert payload["reason"] == "tighten error handling"
+        assert payload["programmer"] == "programmer"
+        kinds = _events(conn, task_id)
+        assert kinds.count("changes_requested") == 1
+        assert "review_approved" not in kinds
+        assert "claimed" not in kinds[kinds.index("changes_requested"):]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=? AND ended_at IS NULL",
+            (task_id,),
+        ).fetchone()[0] == 0
+        # Same card, one packet, no child.
+        assert len(kb.list_tasks(conn)) == 1
+        assert kb.in_correction_lane(conn, task_id) is True
+        assert kb.in_finalization_lane(conn, task_id) is False
+
+
+# ---------------------------------------------------------------------------
+# Invariant 7 — the review decision must not manufacture a phantom worker
+#
+# Both halves of the decision used to end with a NEW claim, a NEW task_runs
+# row and a synthetic ``claimed`` event, while the DEAD reviewer's
+# ``worker_pid`` stayed on the card. One tick later ``detect_crashed_workers``
+# found that pid dead, saw it had exited cleanly (rc=0), and recorded the
+# spurious ``protocol_violation`` this whole transition exists to eliminate —
+# and the held claim made the card invisible to both dispatcher lanes.
+# ---------------------------------------------------------------------------
+
+def _reviewer_exits_clean(monkeypatch, pid: int) -> None:
+    """Register a clean (rc=0) exit for ``pid`` in the reap registry."""
+    monkeypatch.setitem(kb._recent_worker_exits, pid, (0, time.time()))
+
+
+def test_approval_leaves_no_dead_pid_for_the_crash_reaper(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """Core regression: the next tick must record NO ``protocol_violation``
+    and must not touch the approved card."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    host = kb._claimer_id().split(":", 1)[0]
+    reviewer_pid = 555001
+    with kb.connect() as conn:
+        task_id = _approved_card(conn, host=host)
+        # The dispatcher stamped the reviewer's pid on the card...
+        kb._set_worker_pid(conn, task_id, reviewer_pid)
+        # ...and the reviewer process approves, then exits cleanly (rc=0).
+        _reviewer_exits_clean(monkeypatch, reviewer_pid)
+
+        task = kb.approve_review(
+            conn, task_id, reviewer="code-reviewer",
+            summary="approved", head_sha=HEAD_SHA,
+        )
+        assert task.worker_pid is None
+        assert task.claim_lock is None
+
+        before = _events(conn, task_id)
+        assert kb.detect_crashed_workers(conn) == []
+        after = _events(conn, task_id)
+
+        assert after == before, "crash reaper must not touch an approved card"
+        assert "protocol_violation" not in after
+        assert "crashed" not in after
+        current = kb.get_task(conn, task_id)
+        assert current.status == "ready"
+        assert current.assignee == "programmer"
+        assert current.last_failure_error is None
+        assert current.consecutive_failures == 0
+
+
+def test_request_changes_leaves_no_dead_pid_for_the_crash_reaper(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """The correction half had the identical defect."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    host = kb._claimer_id().split(":", 1)[0]
+    reviewer_pid = 555002
+    with kb.connect() as conn:
+        task_id = _approved_card(conn, host=host)
+        kb._set_worker_pid(conn, task_id, reviewer_pid)
+        _reviewer_exits_clean(monkeypatch, reviewer_pid)
+
+        task = kb.request_changes(conn, task_id, "programmer", reason="fix it")
+        assert task.worker_pid is None
+        assert task.claim_lock is None
+
+        before = _events(conn, task_id)
+        assert kb.detect_crashed_workers(conn) == []
+        assert _events(conn, task_id) == before
+        assert "protocol_violation" not in _events(conn, task_id)
+        assert kb.get_task(conn, task_id).status == "ready"
+        assert kb.get_task(conn, task_id).last_failure_error is None
+
+
+def test_approved_card_is_claimable_by_a_fresh_finalizer(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """The approved card must be visible to the ready lane so the NEXT tick
+    establishes a real run behind a real pid."""
+    monkeypatch.setattr(
+        kb, "_reviewer_candidates", lambda current: (["code-reviewer"], []),
+    )
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = _approved_card(conn, host=host)
+        kb._set_worker_pid(conn, task_id, 555003)
+        reviewer_run_id = kb.get_task(conn, task_id).current_run_id
+        kb.approve_review(
+            conn, task_id, reviewer="code-reviewer",
+            summary="approved", head_sha=HEAD_SHA,
+        )
+
+        spawned = []
+        result = kb.dispatch_once(
+            conn, spawn_fn=_spawn_recorder(spawned, pid=777001),
+        )
+
+        assert spawned == [(task_id, "programmer")]
+        assert [(t, a) for t, a, *_ in result.spawned] == [
+            (task_id, "programmer")
+        ]
+        task = kb.get_task(conn, task_id)
+        assert task.status == "running"
+        assert task.assignee == "programmer"
+        assert task.worker_pid == 777001
+        assert task.claim_lock is not None
+        # A genuinely NEW run, not the reviewer's.
+        assert task.current_run_id is not None
+        assert task.current_run_id != reviewer_run_id
+        run = conn.execute(
+            "SELECT profile, status, ended_at, worker_pid FROM task_runs WHERE id=?",
+            (task.current_run_id,),
+        ).fetchone()
+        assert run["profile"] == "programmer"
+        assert run["status"] == "running"
+        assert run["ended_at"] is None
+        assert run["worker_pid"] == 777001
+
+
+def test_changes_requested_after_approval_closes_the_finalization_lane(
+    kanban_home,
+):
+    """The two review lanes are mutually exclusive. A ``changes_requested``
+    that lands after a ``review_approved`` moves the card OUT of finalization
+    and back into correction — otherwise the card looks like it is being
+    merged and corrected at the same time."""
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = _approved_card(conn, host=host)
+        kb.approve_review(
+            conn, task_id, reviewer="code-reviewer",
+            summary="approved", head_sha=HEAD_SHA,
+        )
+        assert kb.in_finalization_lane(conn, task_id) is True
+        assert kb.in_correction_lane(conn, task_id) is False
+
+        # The finalizer's merge run is claimed, then sent back for changes
+        # with NO intervening ``submitted_for_review``.
+        assert kb.claim_task(conn, task_id, claimer=f"{host}:merge") is not None
+        assert kb.request_changes(
+            conn, task_id, "programmer", reason="merge broke main",
+        ) is not None
+
+        kinds = _events(conn, task_id)
+        assert kinds.index("changes_requested") > kinds.index("review_approved")
+        assert kb.in_correction_lane(conn, task_id) is True
+        assert kb.in_finalization_lane(conn, task_id) is False
+
+
+def test_approval_after_changes_requested_closes_the_correction_lane(
+    kanban_home,
+):
+    """The mirror ordering: an approval settles a prior correction lane."""
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = _approved_card(conn, host=host)
+        assert kb.request_changes(
+            conn, task_id, "programmer", reason="fix tests",
+        ) is not None
+        assert kb.in_correction_lane(conn, task_id) is True
+
+        # The correction run lands, goes back through the reviewer lane, and
+        # THAT reviewer approves. The programmer never approves its own
+        # running card — approval is only reachable from ``status='review'``.
+        assert kb.claim_task(conn, task_id, claimer=f"{host}:impl2") is not None
+        assert kb.submit_task_for_review(conn, task_id, "code-reviewer") is not None
+        assert kb.claim_review_task(
+            conn, task_id, claimer=f"{host}:review2",
+        ) is not None
+        kb.approve_review(
+            conn, task_id, reviewer="code-reviewer",
+            summary="approved", head_sha=HEAD_SHA,
+            expected_claim=f"{host}:review2",
+        )
+
+        assert kb.in_finalization_lane(conn, task_id) is True
+        assert kb.in_correction_lane(conn, task_id) is False

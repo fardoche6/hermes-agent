@@ -12,6 +12,7 @@ Covers three layers:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -296,6 +297,216 @@ def test_loop_stops_if_task_reclaimed(monkeypatch):
         first_response="x",
     )
     assert res["outcome"] == "stopped"
+
+
+# ---------------------------------------------------------------------------
+# Review-lane handoff: goal_mode is a per-CARD flag, so a code reviewer
+# spawned on a goal-mode card runs this loop too. Once it has approved /
+# requested changes the card belongs to another lane — the reviewer session
+# must never be fed a continuation turn (which would push it toward
+# kanban_complete, falsely claiming a merge) nor sticky-blocked on budget.
+# ---------------------------------------------------------------------------
+
+def _session_with_tool(name, result=None):
+    """A conversation history where the session called ``name``.
+
+    ``result`` is the tool message content; it defaults to the shape
+    ``tools.kanban_tools._ok`` actually returns, because the guard only
+    treats a call that LANDED as a lane handoff.
+    """
+    if result is None:
+        result = json.dumps({"ok": True, "task_id": "t9", "status": "ready"})
+    return [
+        {"role": "user", "content": "review kanban task t9"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "c1", "function": {"name": name, "arguments": "{}"}}],
+        },
+        {"role": "tool", "name": name, "tool_call_id": "c1", "content": result},
+        {"role": "assistant", "content": "Approved."},
+    ]
+
+
+@pytest.mark.parametrize("tool", ["kanban_approve", "kanban_request_changes"])
+def test_loop_exits_after_review_transition(monkeypatch, tool):
+    # After the transition the card is ready/running again (handed to the
+    # finalizer / back to the programmer) — which used to pass the loop's
+    # terminality check and drag the reviewer into another turn.
+    _patch_judge(monkeypatch, ["continue"] * 5)  # judge would say "keep going"
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t7",
+        goal_text="implement the feature",
+        run_turn=lambda p: pytest.fail(f"fed a continuation turn to a reviewer: {p!r}"),
+        task_status_fn=lambda: "ready",
+        block_fn=lambda r: pytest.fail(f"blocked an approved card: {r!r}"),
+        max_turns=10,
+        first_response="Reviewed the diff; approving.",
+        messages_fn=lambda: _session_with_tool(tool),
+    )
+
+    assert res["outcome"] == "review_transition"
+    assert tool in res["reason"]
+    assert res["turns_used"] == 1  # only the reviewer's own first turn
+
+
+def test_loop_exits_after_review_transition_while_running(monkeypatch):
+    # Same guard when the sibling lane has already claimed the card.
+    _patch_judge(monkeypatch, ["continue"] * 5)
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t8",
+        goal_text="implement the feature",
+        run_turn=lambda p: pytest.fail("should not run a turn"),
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: pytest.fail("should not block"),
+        max_turns=10,
+        first_response="Requested changes.",
+        messages_fn=lambda: _session_with_tool("kanban_request_changes"),
+    )
+    assert res["outcome"] == "review_transition"
+
+
+def test_loop_unaffected_by_review_guard_for_plain_worker(monkeypatch):
+    # Regression guard: an implementation session with no review transition
+    # keeps looping exactly as before, even with messages_fn wired.
+    _patch_judge(monkeypatch, ["continue", "continue"])
+    statuses = iter(["running", "running", "done"])
+    turns = []
+    history = [
+        {"role": "user", "content": "work kanban task t9"},
+        {"role": "assistant", "content": "Working on it."},
+    ]
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t9",
+        goal_text="ship feature",
+        run_turn=lambda p: turns.append(p) or f"turn{len(turns)}",
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda r: pytest.fail("should not block"),
+        max_turns=10,
+        first_response="started",
+        messages_fn=lambda: history,
+    )
+    assert res["outcome"] == "completed_by_worker"
+    assert len(turns) == 2
+
+
+def test_loop_ignores_rejected_kanban_complete(monkeypatch):
+    # kanban_complete is terminal for the stop-guard, but the goal loop
+    # observes it through the card status. A completion the judge gate
+    # REJECTED leaves the card running — the loop must keep pushing.
+    _patch_judge(monkeypatch, ["continue"])
+    statuses = iter(["running", "done"])
+    turns = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t10",
+        goal_text="ship feature",
+        run_turn=lambda p: turns.append(p) or "retrying",
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda r: pytest.fail("should not block"),
+        max_turns=10,
+        first_response="tried to complete",
+        messages_fn=lambda: _session_with_tool("kanban_complete"),
+    )
+    assert res["outcome"] == "completed_by_worker"
+    assert len(turns) == 1
+
+
+@pytest.mark.parametrize("tool", ["kanban_approve", "kanban_request_changes"])
+def test_loop_keeps_driving_after_a_FAILED_review_transition(monkeypatch, tool):
+    """THE regression: ``kanban_approve`` refused (missing summary/head_sha,
+    wrong status, lost claim) changed NOTHING on the board. Reading the call
+    name alone made the loop exit, the run finished clean with the card still
+    in ``review`` behind a live worker_pid, and the reaper logged a
+    ``protocol_violation`` + spawned a failover reviewer — the exact bug this
+    branch exists to remove, reached through a failed approve."""
+    _patch_judge(monkeypatch, ["continue"])
+    # The card never left the reviewer's hands, because the call bounced.
+    statuses = iter(["running", "running", "done"])
+    turns = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t12",
+        goal_text="review the diff",
+        run_turn=lambda p: turns.append(p) or "retrying the approval",
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda r: pytest.fail(f"should not block: {r!r}"),
+        max_turns=10,
+        first_response="Approving.",
+        messages_fn=lambda: _session_with_tool(
+            tool, result=json.dumps({"error": "summary is required"}),
+        ),
+    )
+
+    assert res["outcome"] != "review_transition"
+    assert turns, "a refused review call must not stop the loop"
+    assert res["outcome"] == "completed_by_worker"
+
+
+def test_loop_exits_once_the_retried_approval_lands(monkeypatch):
+    """The retry the loop drives toward is honoured as soon as it succeeds."""
+    _patch_judge(monkeypatch, ["continue"] * 5)
+    history = _session_with_tool(
+        "kanban_approve", result=json.dumps({"error": "head_sha is required"}),
+    )
+    history[2]["tool_call_id"] = "c1"
+    landed = _session_with_tool("kanban_approve")
+    landed[1]["tool_calls"][0]["id"] = "c2"
+    landed[2]["tool_call_id"] = "c2"
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t13",
+        goal_text="review the diff",
+        run_turn=lambda p: history.extend(landed) or "approved for real",
+        task_status_fn=lambda: "ready",
+        block_fn=lambda r: pytest.fail(f"should not block: {r!r}"),
+        max_turns=10,
+        first_response="Approving.",
+        messages_fn=lambda: history,
+    )
+
+    assert res["outcome"] == "review_transition"
+    assert "kanban_approve" in res["reason"]
+    assert res["turns_used"] == 2  # first turn bounced, second one landed
+
+
+def test_review_guard_fails_open_when_messages_unavailable(monkeypatch):
+    # A broken message source must never wedge the loop.
+    _patch_judge(monkeypatch, ["continue"])
+    statuses = iter(["running", "done"])
+    turns = []
+
+    def _boom():
+        raise RuntimeError("no messages")
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t11",
+        goal_text="ship feature",
+        run_turn=lambda p: turns.append(p) or "ok",
+        task_status_fn=lambda: next(statuses),
+        block_fn=lambda r: pytest.fail("should not block"),
+        max_turns=10,
+        first_response="started",
+        messages_fn=_boom,
+    )
+    assert res["outcome"] == "completed_by_worker"
+    assert len(turns) == 1
+
+
+def test_continuation_templates_are_role_aware():
+    # The reviewer's endings must be reachable from the prompts the loop
+    # feeds; kanban_unblock is orchestrator-only and must never appear.
+    for tpl in (
+        goals.KANBAN_GOAL_CONTINUATION_TEMPLATE,
+        goals.KANBAN_GOAL_FINALIZE_TEMPLATE,
+    ):
+        text = tpl.format(reason="because")
+        assert "kanban_approve" in text
+        assert "kanban_request_changes" in text
+        assert "kanban_unblock" not in text
 
 
 # ---------------------------------------------------------------------------

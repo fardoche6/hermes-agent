@@ -306,7 +306,12 @@ class _ConnProxy:
 
 def test_dispatch_tick_runs_wal_checkpoint_at_interval(tmp_path, monkeypatch):
     """First tick checkpoints; ticks inside the interval don't; after the
-    interval elapses the next tick checkpoints again."""
+    interval elapses the next tick checkpoints again.
+
+    Driven through REAL (non-dry-run) ticks with a no-op ``spawn_fn``: WAL
+    checkpointing is a *physical* hygiene step, and ``dry_run`` is specified
+    to be physically pure (see ``test_dry_run_tick_never_checkpoints``).
+    """
     db_path = tmp_path / "kanban.db"
     _build_board_db(db_path, tasks=1)
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
@@ -317,11 +322,11 @@ def test_dispatch_tick_runs_wal_checkpoint_at_interval(tmp_path, monkeypatch):
     conn = kb.connect(db_path=db_path)
     proxy = _ConnProxy(conn, executed)
     try:
-        kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None, dry_run=True)
+        kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None)
         assert len(executed) == 1, "first tick should checkpoint"
 
-        kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None, dry_run=True)
-        kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None, dry_run=True)
+        kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None)
+        kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None)
         assert len(executed) == 1, "ticks inside the interval must not checkpoint"
 
         # Age the per-path timestamp past the interval → next tick fires.
@@ -329,7 +334,7 @@ def test_dispatch_tick_runs_wal_checkpoint_at_interval(tmp_path, monkeypatch):
         kb._LAST_WAL_CHECKPOINT[key] -= (
             kb._WAL_CHECKPOINT_INTERVAL_SECONDS + 1.0
         )
-        kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None, dry_run=True)
+        kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None)
         assert len(executed) == 2, "tick after the interval should checkpoint"
         assert all("TRUNCATE" in sql.upper() for sql in executed)
     finally:
@@ -347,11 +352,41 @@ def test_wal_checkpoint_failure_never_fails_the_tick(tmp_path, monkeypatch):
     conn = kb.connect(db_path=db_path)
     proxy = _ConnProxy(conn, executed, fail_checkpoint=True)
     try:
-        result = kb.dispatch_once(
-            proxy, spawn_fn=lambda *a, **k: None, dry_run=True,
-        )
+        # A real tick: the checkpoint raises inside it and must be swallowed.
+        result = kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None)
         assert not result.skipped_locked
         assert executed, "checkpoint was attempted (and failed) this tick"
+    finally:
+        conn.close()
+
+
+def test_dry_run_tick_never_checkpoints(tmp_path, monkeypatch):
+    """A dry-run tick is a physically pure prediction — no WAL checkpoint.
+
+    Pins the guarantee introduced when ``dispatch_once`` grew its dry-run
+    early return: a prediction must not write, checkpoint, or otherwise
+    mutate the board (not even the sibling dispatch-lock file). Without this
+    test the purity property is unpinned and a future refactor could quietly
+    reintroduce a physical side effect on the read-only path.
+    """
+    db_path = tmp_path / "kanban.db"
+    _build_board_db(db_path, tasks=1)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setattr(kb, "_LAST_WAL_CHECKPOINT", {})
+
+    executed: list[str] = []
+    conn = kb.connect(db_path=db_path)
+    proxy = _ConnProxy(conn, executed)
+    try:
+        for _ in range(3):
+            kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None, dry_run=True)
+        assert executed == [], "dry-run must not issue a wal_checkpoint"
+        # The per-path checkpoint clock was never even claimed, so a real
+        # tick right after a dry-run still checkpoints on schedule.
+        assert kb._LAST_WAL_CHECKPOINT == {}
+
+        kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None)
+        assert len(executed) == 1, "the following real tick must checkpoint"
     finally:
         conn.close()
 
@@ -372,7 +407,7 @@ def test_wal_checkpoint_truncates_wal_file(tmp_path, monkeypatch):
         wal = tmp_path / "kanban.db-wal"
         assert wal.exists() and wal.stat().st_size > 0
 
-        kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None, dry_run=True)
+        kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
         assert wal.stat().st_size == 0, (
             "wal_checkpoint(TRUNCATE) should reset the -wal file to 0 bytes"
         )

@@ -394,9 +394,13 @@ def test_explicit_review_lifecycle_reuses_same_card(kanban_home):
         corrected = kb.request_changes(
             conn, task_id, "programmer", reason="add regression coverage", claimer="impl:2"
         )
-        assert corrected and corrected.status == "running"
+        # The correction is handed back on the SAME card via the ready lane:
+        # no fabricated claim, so the dispatcher can actually pick it up.
+        assert corrected and corrected.status == "ready"
         assert corrected.assignee == "programmer"
-        assert corrected.claim_lock == "impl:2"
+        assert corrected.claim_lock is None
+        assert corrected.worker_pid is None
+        assert corrected.current_run_id is None
         assert kb.get_task(conn, task_id).status not in {"blocked", "todo", "triage"}
 
         events = [event.kind for event in kb.list_events(conn, task_id)]
@@ -498,6 +502,28 @@ def test_review_dispatch_all_lanes_failed_blocks_with_bounded_diagnostics(
         assert any(e.kind == "review_lanes_failed" for e in kb.list_events(conn, task_id))
 
 
+def _stamp_dead_worker(conn, task_id: str, pid: int, *, age_seconds: int = 60) -> None:
+    """Test helper: put a dead worker pid on a card, launched ``age_seconds`` ago.
+
+    Backdates the ACTIVE RUN as well as the task. ``detect_crashed_workers``
+    measures its launch-grace window per attempt — from the active run's
+    ``started_at``, falling back to the task's — exactly like
+    ``enforce_max_runtime`` and ``detect_stale_running``. A run that started
+    "now" is deliberately inside the grace window and is not reaped.
+    """
+    stamp = int(time.time()) - age_seconds
+    conn.execute(
+        "UPDATE tasks SET worker_pid=?, started_at=? WHERE id=?",
+        (pid, stamp, task_id),
+    )
+    conn.execute(
+        "UPDATE task_runs SET started_at=? "
+        "WHERE id = (SELECT current_run_id FROM tasks WHERE id=?)",
+        (stamp, task_id),
+    )
+    conn.commit()
+
+
 def test_review_crash_failover_keeps_same_card_in_review(kanban_home, monkeypatch):
     """A dead reviewer process is replaced without a Ready/Blocked hop."""
     monkeypatch.setattr(
@@ -512,11 +538,7 @@ def test_review_crash_failover_keeps_same_card_in_review(kanban_home, monkeypatc
         claimed = kb.claim_review_task(conn, task_id, claimer=f"{host}:review")
         assert claimed is not None
         pid = 98766
-        conn.execute(
-            "UPDATE tasks SET worker_pid=?, started_at=? WHERE id=?",
-            (pid, int(time.time()) - 60, task_id),
-        )
-        conn.commit()
+        _stamp_dead_worker(conn, task_id, pid)
         kb._record_worker_exit(pid, _exited_status(1))
 
         assert task_id in kb.detect_crashed_workers(conn)
@@ -557,11 +579,7 @@ def test_review_crash_uses_bounded_board_scoped_worker_log(kanban_home, monkeypa
         host = kb._claimer_id().split(":", 1)[0]
         assert kb.claim_review_task(conn, task_id, claimer=f"{host}:review") is not None
         pid = 98767
-        conn.execute(
-            "UPDATE tasks SET worker_pid=?, started_at=? WHERE id=?",
-            (pid, int(time.time()) - 60, task_id),
-        )
-        conn.commit()
+        _stamp_dead_worker(conn, task_id, pid)
         board_seen = []
         monkeypatch.setattr(
             kb, "read_worker_log",
@@ -4344,11 +4362,7 @@ def test_review_claim_crash_returns_to_review(kanban_home, monkeypatch):
         host = _kb._claimer_id().split(":", 1)[0]
         claimed = kb.claim_review_task(conn, task_id, claimer=f"{host}:review")
         assert claimed is not None
-        conn.execute(
-            "UPDATE tasks SET worker_pid=?, started_at=? WHERE id=?",
-            (pid, int(time.time()) - 60, task_id),
-        )
-        conn.commit()
+        _stamp_dead_worker(conn, task_id, pid)
         _kb._record_worker_exit(pid, _exited_status(1))
 
         assert task_id in kb.detect_crashed_workers(conn)

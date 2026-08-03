@@ -139,6 +139,13 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "kanban_heartbeat",
     "kanban_show",
     "kanban_list",
+    # Review state machine. A dispatcher-spawned reviewer on the codex runtime
+    # needs these for the same reason it needs kanban_complete: without them
+    # an approval has no valid terminal transition and the run exits clean into
+    # a protocol violation. kanban_unblock stays orchestrator-only.
+    "kanban_review",
+    "kanban_approve",
+    "kanban_request_changes",
     # NOTE: kanban_create / kanban_unblock / kanban_link are orchestrator-
     # only — the kanban tool gates them on HERMES_KANBAN_TASK being unset.
     # They're exposed here for orchestrator agents running on the codex

@@ -1641,9 +1641,11 @@ class GoalManager:
 KANBAN_GOAL_CONTINUATION_TEMPLATE = (
     "[Continuing toward this kanban task — judge says it is not done yet]\n"
     "Reason: {reason}\n\n"
-    "Take the next concrete step toward completing the task. When the work "
-    "is genuinely finished, call kanban_complete with a summary. If you are "
-    "blocked and need human input, call kanban_block with a reason. Do not "
+    "Take the next concrete step, then end with the terminal board tool for "
+    "YOUR role. Implementation run: kanban_complete with a summary when the "
+    "work is genuinely finished, or kanban_block with a reason if you need "
+    "human input. Code review run: kanban_approve or kanban_request_changes "
+    "— never kanban_complete, that would falsely claim the merge. Do not "
     "stop without calling one of them."
 )
 
@@ -1653,10 +1655,47 @@ KANBAN_GOAL_CONTINUATION_TEMPLATE = (
 KANBAN_GOAL_FINALIZE_TEMPLATE = (
     "[The work looks complete, but the task is still open]\n"
     "Reason: {reason}\n\n"
-    "If the task is genuinely done, call kanban_complete now with a short "
-    "summary of what you did. If something still blocks completion, call "
-    "kanban_block with the reason instead."
+    "End it now with the terminal board tool for YOUR role. Implementation "
+    "run: kanban_complete with a short summary of what you did, or "
+    "kanban_block with the reason if something still blocks completion. "
+    "Code review run: kanban_approve or kanban_request_changes — never "
+    "kanban_complete, that would falsely claim the merge."
 )
+
+
+def review_transition_called(messages) -> Optional[str]:
+    """Name the review-lane board transition this session made, if any.
+
+    ``agent.kanban_stop`` owns the definition of the review lane — this is a
+    thin delegation to its ``session_review_transition`` so there is exactly
+    one source of truth for which board tools hand a card to another lane.
+
+    The implementation-side pair (``kanban_complete`` / ``kanban_block``) is
+    deliberately excluded there: the goal loop already observes those through
+    the card's status, and a *rejected* completion attempt (the judge gate can
+    refuse a premature ``kanban_complete``) must not end the loop. What is
+    left — ``kanban_review`` / ``kanban_approve`` / ``kanban_request_changes``
+    — hands the SAME card to a different lane, so the current session has no
+    business being driven any further.
+
+    Only a transition that actually LANDED counts. ``kanban_approve`` has many
+    refusal paths (missing summary or head_sha, foreign task id, wrong status,
+    lost claim); a refused call leaves the card in ``review`` with this run
+    still owning it, so the loop must keep driving instead of exiting into a
+    dispatcher ``protocol_violation``.
+
+    Returns the tool name (last one that landed) or ``None``. Fails open
+    (``None``) if the guard cannot be evaluated, leaving the loop's legacy
+    behaviour.
+    """
+    if not messages:
+        return None
+    try:
+        from agent.kanban_stop import session_review_transition
+
+        return session_review_transition(messages)
+    except Exception:
+        return None
 
 
 def run_kanban_goal_loop(
@@ -1668,6 +1707,7 @@ def run_kanban_goal_loop(
     block_fn,
     max_turns: int = DEFAULT_MAX_TURNS,
     first_response: str = "",
+    messages_fn=None,
     log=None,
 ) -> Dict[str, Any]:
     """Drive a kanban worker through a Ralph-style goal loop.
@@ -1679,6 +1719,14 @@ def run_kanban_goal_loop(
 
     1. Check whether the worker already terminated the task (called
        ``kanban_complete`` / ``kanban_block``). If so, stop — nothing to do.
+    1b. Check whether the session handed the card to another lane via a review
+       transition (``kanban_review`` / ``kanban_approve`` /
+       ``kanban_request_changes``). Goal mode is a per-CARD flag, so a code
+       reviewer spawned on a goal-mode card runs this loop too — but once it
+       has approved (card → ``ready`` for the finalizer) it must NOT be fed a
+       continuation turn or blocked. Requires the optional ``messages_fn``
+       (() -> list[dict] of this session's messages); omit it and the guard is
+       simply inert.
     2. Otherwise judge the latest response against ``goal_text`` (the card's
        title + body). ``continue`` → feed a continuation prompt and run
        another turn IN THE SAME SESSION via ``run_turn``. ``done`` but the
@@ -1695,7 +1743,7 @@ def run_kanban_goal_loop(
 
     Returns a decision dict: ``{"outcome", "turns_used", "reason"}`` where
     outcome is one of ``"completed_by_worker"``, ``"blocked_budget"``,
-    ``"blocked_by_worker"``, or ``"stopped"``.
+    ``"blocked_by_worker"``, ``"review_transition"``, or ``"stopped"``.
     """
 
     def _log(msg: str) -> None:
@@ -1732,6 +1780,29 @@ def run_kanban_goal_loop(
             # Reclaimed / archived / unexpected — let the dispatcher own it.
             _log(f"kanban goal loop: task {task_id} status={status!r}; stopping")
             return {"outcome": "stopped", "turns_used": turns_used, "reason": f"status={status}"}
+
+        # Did THIS session already hand the card to another lane? A code
+        # reviewer on a goal-mode card lands here with status ready/running
+        # right after kanban_approve / kanban_request_changes — which used to
+        # look exactly like "worker still owes work" and got fed a
+        # "call kanban_complete" continuation, then sticky-blocked on budget
+        # exhaustion. The review process is done: exit clean, never block.
+        if messages_fn is not None:
+            try:
+                transition = review_transition_called(messages_fn())
+            except Exception as exc:
+                _log(f"kanban goal loop: review-transition check failed ({exc}); continuing")
+                transition = None
+            if transition:
+                _log(
+                    f"kanban goal loop: task {task_id} handed off via {transition} "
+                    f"after {turns_used} turn(s); stopping"
+                )
+                return {
+                    "outcome": "review_transition",
+                    "turns_used": turns_used,
+                    "reason": f"session called {transition}",
+                }
 
         # Still open — judge whether the latest response satisfies the card.
         # The kanban worker loop has no wait-barrier concept (workers finish
@@ -1803,5 +1874,6 @@ __all__ = [
     "clear_goal",
     "migrate_goal_to_session",
     "judge_goal",
+    "review_transition_called",
     "run_kanban_goal_loop",
 ]

@@ -491,7 +491,10 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
         return tool_error(
             f"{tool_name} is orchestrator-only; dispatcher-spawned workers "
             "must use kanban_complete, kanban_block, kanban_heartbeat, or "
-            "kanban_comment for their assigned task."
+            "kanban_comment for their assigned task. Reviewers close a review "
+            "with kanban_approve (approved — hands the same card to the "
+            "finalizer, does NOT mark it done) or kanban_request_changes "
+            "(returns it to the programmer); neither needs kanban_unblock."
         )
     return None
 
@@ -1013,10 +1016,12 @@ def _handle_request_changes(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=args.get("board"))
         try:
+            # No ``claimer``: the correction lands in ``ready`` and the
+            # dispatcher takes the claim on its next tick. Passing this
+            # worker's lock would fabricate a claim with no process behind it.
             task = kb.request_changes(
                 conn, tid, programmer,
                 reason=args.get("reason"),
-                claimer=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"),
             )
             if task is None:
                 return tool_error(f"could not request changes for {tid}")
@@ -1025,6 +1030,80 @@ def _handle_request_changes(args: dict, **kw) -> str:
             conn.close()
     except (RuntimeError, ValueError) as exc:
         return tool_error(f"kanban_request_changes: {exc}")
+
+
+def _handle_approve(args: dict, **kw) -> str:
+    """Record a durable review APPROVAL on the reviewer's own card.
+
+    The approving half of the review decision, mirroring
+    ``kanban_request_changes``. Approval is NOT completion: the card is
+    handed to the finalizer on the same id so the merge can land, and only
+    the normal completion path can move it to ``done``.
+    """
+    delegated_err = _reject_delegated_child_mutation("kanban_approve")
+    if delegated_err:
+        return delegated_err
+    tid = _default_task_id(args.get("task_id"))
+    summary = args.get("summary") or args.get("reason")
+    head_sha = args.get("head_sha")
+    if not tid:
+        return tool_error("task_id is required")
+    if not summary or not str(summary).strip():
+        return tool_error("summary is required")
+    if not head_sha or not str(head_sha).strip():
+        return tool_error(
+            "head_sha is required — pass the exact commit sha you reviewed "
+            "(e.g. `git rev-parse HEAD` in the reviewed worktree). An "
+            "approval pinned to a moving branch instead of an exact head "
+            "does not say what was actually approved."
+        )
+    head_sha = str(head_sha).strip()
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    # The reviewer is THIS process, not whoever happens to be on the card.
+    # The dispatcher pins HERMES_PROFILE to the spawned profile (see
+    # ``_default_spawn`` in kanban_db.py), so this is the calling worker's own
+    # identity; letting ``approve_review`` fall back to the card's assignee
+    # would record the approval under the wrong profile.
+    reviewer = _normalize_profile(os.environ.get("HERMES_PROFILE"))
+    if not reviewer:
+        return tool_error(
+            "kanban_approve: caller reviewer identity is unavailable; "
+            "dispatcher workers must run with HERMES_PROFILE set"
+        )
+    expected_claim = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+    if os.environ.get("HERMES_KANBAN_TASK") and not expected_claim:
+        return tool_error(
+            "kanban_approve: reviewer claim identity is unavailable; "
+            "refusing approval without HERMES_KANBAN_CLAIM_LOCK"
+        )
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            # No claim is installed: approval hands the card to the finalizer
+            # via ``ready`` and the dispatcher takes the claim on its next
+            # tick. ``expected_claim`` is the opposite direction — a CAS
+            # proving THIS run still holds the review claim it was spawned
+            # with, so a stalled reviewer whose claim already failed over
+            # cannot close the replacement reviewer's run.
+            task = kb.approve_review(
+                conn, tid,
+                reviewer=reviewer,
+                summary=str(summary),
+                head_sha=head_sha,
+                expected_claim=expected_claim,
+            )
+            if task is None:
+                return tool_error(f"could not approve {tid} (unknown id)")
+            return _ok(
+                task_id=tid, status=task.status, assignee=task.assignee,
+                approved=True, head_sha=head_sha,
+            )
+        finally:
+            conn.close()
+    except (RuntimeError, ValueError) as exc:
+        return tool_error(f"kanban_approve: {exc}")
 
 
 def _handle_heartbeat(args: dict, **kw) -> str:
@@ -1977,6 +2056,41 @@ KANBAN_REQUEST_CHANGES_SCHEMA = {
     }, "required": ["programmer"]},
 }
 
+KANBAN_APPROVE_SCHEMA = {
+    "name": "kanban_approve",
+    "description": (
+        "Approve the code review on this card. This is the reviewer's "
+        "terminal transition when the change passes review. It records a "
+        "durable approval (reviewer, exact head sha, summary) and hands the "
+        "SAME card to the finalizer so the merge can land. "
+        "head_sha is REQUIRED: pass the exact commit sha you reviewed so the "
+        "approval is pinned to that head rather than to a moving branch. "
+        "Approval is NOT completion: it does not mark the card done and does "
+        "not claim anything was merged. Use kanban_request_changes instead "
+        "when the change must go back to the programmer."
+    ),
+    "parameters": {"type": "object", "properties": {
+        "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+        "summary": {
+            "type": "string",
+            "description": (
+                "Approval rationale: what you verified (tests run, CI state, "
+                "scope of the diff). Stored durably on the card."
+            ),
+        },
+        "head_sha": {
+            "type": "string",
+            "description": (
+                "REQUIRED. The exact commit sha you reviewed (run "
+                "`git rev-parse HEAD` in the worktree you verified). The "
+                "approval is pinned to this head, not to a moving branch."
+            ),
+        },
+
+        "board": _board_schema_prop(),
+    }, "required": ["summary", "head_sha"]},
+}
+
 KANBAN_HEARTBEAT_SCHEMA = {
     "name": "kanban_heartbeat",
     "description": (
@@ -2405,6 +2519,15 @@ registry.register(
     handler=_handle_request_changes,
     check_fn=_check_kanban_mode,
     emoji="↩",
+)
+
+registry.register(
+    name="kanban_approve",
+    toolset="kanban",
+    schema=KANBAN_APPROVE_SCHEMA,
+    handler=_handle_approve,
+    check_fn=_check_kanban_mode,
+    emoji="✅",
 )
 
 registry.register(
