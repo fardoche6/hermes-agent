@@ -536,6 +536,7 @@ def test_approve_records_durable_exact_head_evidence(kanban_home):
             reviewer="code-reviewer",
             summary="67/67 focused tests, CI green",
             head_sha=HEAD_SHA,
+            expected_run_id=kb.get_task(conn, task_id).current_run_id,
             expected_claim=f"{host}:review",
         )
 
@@ -562,6 +563,7 @@ def test_approve_requires_full_exact_head(kanban_home):
             kb.approve_review(
                 conn, task_id, reviewer="code-reviewer", summary="approved",
                 head_sha="deadbeef",
+                expected_run_id=kb.get_task(conn, task_id).current_run_id,
             )
         assert kb.get_task(conn, task_id).status == "review"
 
@@ -573,7 +575,8 @@ def test_programmer_cannot_self_approve_reviewer_lane(kanban_home):
         with pytest.raises(RuntimeError, match="does not own the current reviewer lane"):
             kb.approve_review(
                 conn, task_id, reviewer="programmer", summary="approved",
-                head_sha=HEAD_SHA, expected_claim=f"{host}:review",
+                head_sha=HEAD_SHA, expected_run_id=kb.get_task(conn, task_id).current_run_id,
+                expected_claim=f"{host}:review",
             )
         assert kb.get_task(conn, task_id).status == "review"
 
@@ -585,9 +588,63 @@ def test_stale_reviewer_claim_cannot_close_replacement_run(kanban_home):
         with pytest.raises(RuntimeError, match="no longer holds"):
             kb.approve_review(
                 conn, task_id, reviewer="code-reviewer", summary="approved",
-                head_sha=HEAD_SHA, expected_claim=f"{host}:stale-review",
+                head_sha=HEAD_SHA, expected_run_id=kb.get_task(conn, task_id).current_run_id,
+                expected_claim=f"{host}:stale-review",
             )
         assert kb.get_task(conn, task_id).status == "review"
+
+
+def test_same_profile_reclaim_rejects_stale_approval_and_accepts_replacement(
+    kanban_home, all_assignees_spawnable,
+):
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = _approved_card(conn, host=host)
+        first = kb.get_task(conn, task_id)
+        assert first is not None
+        old_run_id, reused_claim = first.current_run_id, first.claim_lock
+        assert kb.failover_review_task(
+            conn, task_id, "code-reviewer", error="first reviewer failed",
+        ) is not None
+        replacement = kb.claim_review_task(
+            conn, task_id, claimer=reused_claim,
+        )
+        assert replacement is not None
+        assert replacement.current_run_id != old_run_id
+        assert replacement.claim_lock == reused_claim
+
+        with pytest.raises(RuntimeError):
+            kb.approve_review(
+                conn, task_id, reviewer="code-reviewer",
+                summary="stale approval", head_sha=HEAD_SHA,
+                expected_claim=reused_claim, expected_run_id=old_run_id,
+            )
+        unchanged = kb.get_task(conn, task_id)
+        assert unchanged.status == "review"
+        assert unchanged.current_run_id == replacement.current_run_id
+        assert conn.execute(
+            "SELECT outcome FROM task_runs WHERE id=?",
+            (replacement.current_run_id,),
+        ).fetchone()["outcome"] is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='review_approved'",
+            (task_id,),
+        ).fetchone()[0] == 0
+
+        approved = kb.approve_review(
+            conn, task_id, reviewer="code-reviewer", summary="current approval",
+            head_sha=HEAD_SHA, expected_claim=reused_claim,
+            expected_run_id=replacement.current_run_id,
+        )
+        assert approved.status == "ready"
+        event = _event_payload(conn, task_id, "review_approved")
+        assert event["reviewer"] == "code-reviewer"
+        assert event["head_sha"] == HEAD_SHA
+        assert approved.current_run_id is None
+        assert kb.dispatch_once(
+            conn, spawn_fn=_spawn_recorder([]),
+        ) is not None
+        assert kb.get_task(conn, task_id).status == "running"
 
 
 def test_approve_hands_same_card_to_the_finalization_lane(kanban_home):
@@ -601,6 +658,7 @@ def test_approve_hands_same_card_to_the_finalization_lane(kanban_home):
         task = kb.approve_review(
             conn, task_id, reviewer="code-reviewer",
             summary="approved", head_sha=HEAD_SHA,
+            expected_run_id=kb.get_task(conn, task_id).current_run_id,
         )
 
         assert task.status == "ready"
@@ -638,7 +696,8 @@ def test_approve_is_not_completion(kanban_home):
         task_id = _approved_card(conn, host=host)
         task = kb.approve_review(
             conn, task_id, reviewer="code-reviewer",
-            summary="approved", head_sha=HEAD_SHA, expected_claim=f"{host}:review",
+            summary="approved", head_sha=HEAD_SHA, expected_run_id=kb.get_task(conn, task_id).current_run_id,
+                expected_claim=f"{host}:review",
         )
         assert task.status != "done"
         assert task.completed_at is None
@@ -654,7 +713,8 @@ def test_approve_does_not_fake_a_change_request(kanban_home):
         task_id = _approved_card(conn, host=host)
         kb.approve_review(
             conn, task_id, reviewer="code-reviewer",
-            summary="approved", head_sha=HEAD_SHA, expected_claim=f"{host}:review",
+            summary="approved", head_sha=HEAD_SHA, expected_run_id=kb.get_task(conn, task_id).current_run_id,
+                expected_claim=f"{host}:review",
         )
         assert "changes_requested" not in _events(conn, task_id)
 
@@ -678,7 +738,8 @@ def test_approve_clears_the_review_required_sticky_block(kanban_home):
 
         kb.approve_review(
             conn, task_id, reviewer="code-reviewer",
-            summary="approved", head_sha=HEAD_SHA, expected_claim=f"{host}:review",
+            summary="approved", head_sha=HEAD_SHA, expected_run_id=kb.get_task(conn, task_id).current_run_id,
+                expected_claim=f"{host}:review",
         )
 
         assert kb._has_sticky_block(conn, task_id) is False
@@ -798,6 +859,7 @@ def test_approved_card_does_not_respawn_a_reviewer(
         kb.approve_review(
             conn, task_id, reviewer="code-reviewer",
             summary="approved", head_sha=HEAD_SHA,
+            expected_run_id=kb.get_task(conn, task_id).current_run_id,
         )
 
         spawned = []
@@ -833,6 +895,7 @@ def test_crashed_finalizer_resumes_the_same_pr(
         kb.approve_review(
             conn, task_id, reviewer="code-reviewer",
             summary="approved", head_sha=HEAD_SHA,
+            expected_run_id=kb.get_task(conn, task_id).current_run_id,
         )
 
         # The dispatcher claims the approved card for the finalizer...
@@ -895,6 +958,7 @@ def test_approve_fails_closed_without_a_resolvable_finalizer(kanban_home):
             kb.approve_review(
                 conn, task_id, reviewer="code-reviewer",
                 summary="approved", head_sha=HEAD_SHA,
+            expected_run_id=kb.get_task(conn, task_id).current_run_id,
             )
         assert kb.get_task(conn, task_id).status == "review"
 
@@ -975,6 +1039,7 @@ def test_approval_leaves_no_dead_pid_for_the_crash_reaper(
         task = kb.approve_review(
             conn, task_id, reviewer="code-reviewer",
             summary="approved", head_sha=HEAD_SHA,
+            expected_run_id=kb.get_task(conn, task_id).current_run_id,
         )
         assert task.worker_pid is None
         assert task.claim_lock is None
@@ -1039,6 +1104,7 @@ def test_approved_card_is_claimable_by_a_fresh_finalizer(
         kb.approve_review(
             conn, task_id, reviewer="code-reviewer",
             summary="approved", head_sha=HEAD_SHA,
+            expected_run_id=kb.get_task(conn, task_id).current_run_id,
         )
 
         spawned = []
@@ -1081,6 +1147,7 @@ def test_changes_requested_after_approval_closes_the_finalization_lane(
         kb.approve_review(
             conn, task_id, reviewer="code-reviewer",
             summary="approved", head_sha=HEAD_SHA,
+            expected_run_id=kb.get_task(conn, task_id).current_run_id,
         )
         assert kb.in_finalization_lane(conn, task_id) is True
         assert kb.in_correction_lane(conn, task_id) is False
@@ -1126,6 +1193,7 @@ def test_approval_after_changes_requested_closes_the_correction_lane(
         kb.approve_review(
             conn, task_id, reviewer="code-reviewer",
             summary="approved", head_sha=HEAD_SHA,
+            expected_run_id=kb.get_task(conn, task_id).current_run_id,
             expected_claim=f"{host}:review2",
         )
 

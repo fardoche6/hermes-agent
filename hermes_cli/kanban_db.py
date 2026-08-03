@@ -3834,6 +3834,7 @@ def _end_run(
     error: Optional[str] = None,
     metadata: Optional[dict] = None,
     status: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
 ) -> Optional[int]:
     """Close the currently-active run for ``task_id`` and clear the pointer.
 
@@ -3851,7 +3852,12 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
-    conn.execute(
+    if expected_run_id is not None and run_id != int(expected_run_id):
+        raise RuntimeError(
+            f"cannot end {task_id}: current run is {run_id}, "
+            f"expected {int(expected_run_id)}"
+        )
+    cur = conn.execute(
         """
         UPDATE task_runs
            SET status        = ?,
@@ -3865,6 +3871,7 @@ def _end_run(
                worker_pid    = NULL
          WHERE id = ?
            AND ended_at IS NULL
+           AND (? IS NULL OR id = ?)
         """,
         (
             status or outcome,
@@ -3874,11 +3881,18 @@ def _end_run(
             json.dumps(metadata, ensure_ascii=False) if metadata else None,
             now,
             run_id,
+            expected_run_id,
+            expected_run_id,
         ),
     )
-    conn.execute(
-        "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
+    if cur.rowcount != 1:
+        raise RuntimeError(f"cannot end {task_id}: run {run_id} is no longer active")
+    task_cur = conn.execute(
+        "UPDATE tasks SET current_run_id = NULL WHERE id = ? AND current_run_id = ?",
+        (task_id, run_id),
     )
+    if task_cur.rowcount != 1:
+        raise RuntimeError(f"cannot end {task_id}: current run changed")
     return run_id
 
 
@@ -4728,6 +4742,8 @@ def approve_review(
     summary: Optional[str] = None,
     head_sha: Optional[str] = None,
     expected_claim: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+    trusted_operator: bool = False,
 ) -> Optional[Task]:
     """Record a durable review APPROVAL and hand the card to its finalizer.
 
@@ -4787,12 +4803,19 @@ def approve_review(
     skips the check; dispatcher worker tools require the claim explicitly.
     """
     expected_claim = (expected_claim or "").strip() or None
+    if expected_run_id is not None:
+        try:
+            expected_run_id = int(expected_run_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("expected_run_id must be a positive integer") from exc
+        if expected_run_id <= 0:
+            raise ValueError("expected_run_id must be a positive integer")
     reviewer_name = _canonical_assignee(reviewer)
     if not reviewer_name:
         raise ValueError("reviewer is required and must identify the calling reviewer")
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id=?",
+            "SELECT status, claim_lock, assignee, current_run_id FROM tasks WHERE id=?",
             (task_id,),
         ).fetchone()
         if not row:
@@ -4802,6 +4825,15 @@ def approve_review(
                 f"cannot approve {task_id} from status {row['status']!r}: "
                 "approval is the reviewer lane's terminal transition and is "
                 "only valid while the card is in 'review'"
+            )
+        if trusted_operator and expected_run_id is None:
+            expected_run_id = row["current_run_id"]
+        if expected_run_id is None and not trusted_operator:
+            raise RuntimeError("expected_run_id is required")
+        if expected_run_id is None or row["current_run_id"] != expected_run_id:
+            raise RuntimeError(
+                f"cannot approve {task_id}: current review run does not match "
+                f"expected run {expected_run_id!r}"
             )
         if not head_sha or not _FULL_COMMIT_SHA_RE.fullmatch(str(head_sha).strip()):
             raise ValueError("head_sha must be the full 40- or 64-character commit sha")
@@ -4847,22 +4879,19 @@ def approve_review(
             raise RuntimeError(
                 f"cannot approve {task_id}: reviewer cannot be its own finalizer"
             )
-        reviewer_run_id = _end_run(
-            conn, task_id, outcome="approved", summary=summary,
-        )
-        # Re-assert both gates as a CAS on the write itself. ``write_txn`` is
+        # Re-assert all gates as a CAS on the terminal write itself. ``write_txn`` is
         # BEGIN IMMEDIATE so the read above cannot be raced, but stating the
         # predicates here means a future refactor that moves the read out of
         # the txn still cannot approve a card that has since left the reviewer
         # lane or changed hands.
-        predicates = ["id = ?", "status = 'review'"]
-        params: list[object] = [task_id]
+        predicates = ["id = ?", "status = 'review'", "current_run_id = ?"]
+        params: list[object] = [task_id, expected_run_id]
         if expected_claim is not None:
             predicates.append("claim_lock = ?")
             params.append(expected_claim)
         cur = conn.execute(
             "UPDATE tasks SET status='ready', assignee=?, claim_lock=NULL, "
-            "claim_expires=NULL, worker_pid=NULL, current_run_id=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, "
             "completed_at=NULL, block_kind=NULL WHERE "
             + " AND ".join(predicates),
             (finalizer_name, *params),
@@ -4875,6 +4904,10 @@ def approve_review(
                 f"cannot approve {task_id}: the card left the reviewer lane "
                 "while the approval was being recorded"
             )
+        reviewer_run_id = _end_run(
+            conn, task_id, outcome="approved", summary=summary,
+            expected_run_id=expected_run_id,
+        )
         _append_event(
             conn, task_id, "review_approved",
             {"reviewer": reviewer_name, "head_sha": head_sha,

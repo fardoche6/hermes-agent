@@ -3172,10 +3172,13 @@ def test_kanban_approve_handler_hands_card_to_finalizer(monkeypatch, tmp_path):
         assert kb.claim_task(conn, task_id) is not None
         assert kb.submit_task_for_review(conn, task_id, "code-reviewer") is not None
         assert kb.claim_review_task(conn, task_id) is not None
-        review_claim = kb.get_task(conn, task_id).claim_lock
+        review = kb.get_task(conn, task_id)
+        review_claim = review.claim_lock
+        review_run_id = review.current_run_id
     monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
     monkeypatch.setenv("HERMES_PROFILE", "code-reviewer")
     monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", review_claim)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review_run_id))
 
     result = json.loads(kt._handle_approve({
         "summary": "67/67 focused tests, CI green", "head_sha": head,
@@ -3199,6 +3202,7 @@ def test_kanban_approve_handler_hands_card_to_finalizer(monkeypatch, tmp_path):
             "kind='review_approved' ORDER BY id DESC LIMIT 1", (task_id,),
         ).fetchone()["payload"])
         assert payload["head_sha"] == head
+        assert payload["reviewer"] == "code-reviewer"
         kinds = {r["kind"] for r in conn.execute(
             "SELECT kind FROM task_events WHERE task_id=?", (task_id,),
         )}
@@ -3238,6 +3242,47 @@ def test_kanban_approve_refuses_delegated_child_context(monkeypatch, tmp_path):
             "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='review_approved'",
             (task_id,),
         ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("run_id", [None, "not-an-int", "0", "-4"])
+def test_kanban_approve_rejects_missing_or_malformed_run_id(
+    monkeypatch, tmp_path, run_id,
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import kanban_db as kb
+    import tools.kanban_tools as kt
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="run identity", assignee="programmer")
+        assert kb.claim_task(conn, task_id) is not None
+        assert kb.submit_task_for_review(conn, task_id, "code-reviewer") is not None
+        assert kb.claim_review_task(conn, task_id) is not None
+        review = kb.get_task(conn, task_id)
+        before = (review.status, review.claim_lock, review.current_run_id)
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=?", (task_id,)
+        ).fetchone()[0]
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_PROFILE", "code-reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", review.claim_lock)
+    if run_id is None:
+        monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", run_id)
+
+    result = json.loads(kt._handle_approve({
+        "summary": "approved",
+        "head_sha": "93ac74f13911542446b63ffc526736fed754ae6a",
+    }))
+    assert result.get("ok") is not True
+    with kb.connect() as conn:
+        after = kb.get_task(conn, task_id)
+        assert (after.status, after.claim_lock, after.current_run_id) == before
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=?", (task_id,)
+        ).fetchone()[0] == event_count
 
 
 def test_kanban_approve_requires_a_summary(monkeypatch, tmp_path):

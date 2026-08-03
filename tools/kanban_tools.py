@@ -1101,6 +1101,12 @@ def _handle_approve(args: dict, **kw) -> str:
             "kanban_approve: reviewer claim identity is unavailable; "
             "refusing approval without HERMES_KANBAN_CLAIM_LOCK"
         )
+    expected_run_id = _worker_run_id(tid)
+    if os.environ.get("HERMES_KANBAN_TASK") and expected_run_id is None:
+        return tool_error(
+            "kanban_approve: reviewer run identity is unavailable; "
+            "refusing approval without a valid HERMES_KANBAN_RUN_ID"
+        )
     try:
         kb, conn = _connect(board=args.get("board"))
         try:
@@ -1116,6 +1122,7 @@ def _handle_approve(args: dict, **kw) -> str:
                 summary=str(summary),
                 head_sha=head_sha,
                 expected_claim=expected_claim,
+                expected_run_id=expected_run_id,
             )
             if task is None:
                 return tool_error(f"could not approve {tid} (unknown id)")
