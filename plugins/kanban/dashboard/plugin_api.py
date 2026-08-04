@@ -920,6 +920,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                         conn, task_id, programmer,
                         reason=payload.review_reason or payload.block_reason,
                         claimer=payload.claimer,
+                        trusted_operator=True,
                     )
                 except (RuntimeError, ValueError) as e:
                     raise HTTPException(status_code=409, detail=str(e))
@@ -2722,7 +2723,7 @@ def get_orchestration_settings():
     kanban_cfg = (cfg.get("kanban") or {}) if isinstance(cfg, dict) else {}
     explicit_orch = (kanban_cfg.get("orchestrator_profile") or "").strip()
     explicit_default = (kanban_cfg.get("default_assignee") or "").strip()
-    auto_decompose = bool(kanban_cfg.get("auto_decompose", True))
+    auto_decompose = bool(kanban_cfg.get("auto_decompose", False))
     auto_promote_children = bool(kanban_cfg.get("auto_promote_children", True))
 
     # Resolve fallbacks the same way the decomposer does.

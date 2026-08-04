@@ -252,6 +252,118 @@ def test_failover_replaces_reviewer_and_rejects_stale_decision(kanban_home):
         assert current.claim_lock == replacement.claim_lock
 
 
+def test_stale_review_run_invalidates_prior_head_approval(kanban_home):
+    """A replacement review run must invalidate an approval from the old run.
+
+    Reusing the same reviewer profile and claim string is intentional: claim
+    identity alone cannot distinguish the stale process, so the active run id
+    is the CAS boundary.
+    """
+    with kb.connect() as conn:
+        task_id, first, host = _review_card(conn, reviewer="code-reviewer")
+        old_run_id = first.current_run_id
+        old_claim = first.claim_lock
+        assert old_run_id is not None
+        assert old_claim is not None
+
+        assert kb.failover_review_task(
+            conn, task_id, "code-reviewer", error="reviewer process replaced",
+        ) is not None
+        replacement = kb.claim_review_task(conn, task_id, claimer=old_claim)
+        assert replacement is not None
+        assert replacement.current_run_id != old_run_id
+        assert replacement.claim_lock == old_claim
+
+        with pytest.raises(RuntimeError, match="current review run"):
+            kb.approve_review(
+                conn,
+                task_id,
+                reviewer="code-reviewer",
+                summary="stale approval",
+                head_sha=HEAD_SHA,
+                expected_claim=old_claim,
+                expected_run_id=old_run_id,
+            )
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.status == "review"
+        assert current.current_run_id == replacement.current_run_id
+        assert "review_approved" not in _events(conn, task_id)
+
+        approved = kb.approve_review(
+            conn,
+            task_id,
+            reviewer="code-reviewer",
+            summary="current approval",
+            head_sha=HEAD_SHA,
+            expected_claim=replacement.claim_lock,
+            expected_run_id=replacement.current_run_id,
+        )
+        assert approved is not None
+        assert approved.status == "ready"
+
+
+def test_repeated_approval_is_idempotent(kanban_home):
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        approved = kb.approve_review(
+            conn,
+            task_id,
+            reviewer="code-reviewer",
+            summary="approved once",
+            head_sha=HEAD_SHA,
+            expected_claim=review.claim_lock,
+            expected_run_id=review.current_run_id,
+        )
+        assert approved is not None
+        before = _events(conn, task_id)
+
+        retried = kb.approve_review(
+            conn,
+            task_id,
+            reviewer="code-reviewer",
+            summary="approved once",
+            head_sha=HEAD_SHA,
+            expected_claim=review.claim_lock,
+            expected_run_id=review.current_run_id,
+        )
+        assert retried is not None
+        assert retried.status == "ready"
+        assert _events(conn, task_id) == before
+        assert _events(conn, task_id).count("review_approved") == 1
+
+
+def test_repeated_request_changes_is_idempotent(kanban_home):
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        corrected = kb.request_changes(
+            conn,
+            task_id,
+            "programmer",
+            reviewer="code-reviewer",
+            reason="tighten error handling",
+            expected_claim=review.claim_lock,
+            expected_run_id=review.current_run_id,
+        )
+        assert corrected is not None
+        assert corrected.status == "ready"
+        before = _events(conn, task_id)
+
+        retried = kb.request_changes(
+            conn,
+            task_id,
+            "programmer",
+            reviewer="code-reviewer",
+            reason="tighten error handling",
+            expected_claim=review.claim_lock,
+            expected_run_id=review.current_run_id,
+        )
+        assert retried is not None
+        assert retried.status == "ready"
+        assert _events(conn, task_id) == before
+        assert _events(conn, task_id).count("changes_requested") == 1
+
+
 def test_approval_leaves_no_dead_pid_for_crash_reaper(kanban_home, monkeypatch):
     monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
@@ -342,6 +454,7 @@ def test_worker_toolset_exposes_result_aware_review_transitions(
 ):
     from tools.registry import invalidate_check_fn_cache, registry
     from toolsets import resolve_toolset
+    import tools.kanban_tools  # noqa: F401 - registration side effect
 
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_review_worker")
     invalidate_check_fn_cache()

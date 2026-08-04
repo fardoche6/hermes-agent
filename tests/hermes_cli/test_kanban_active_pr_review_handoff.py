@@ -43,11 +43,28 @@ def kanban_home(tmp_path, monkeypatch):
 
 def _crash_current_worker(conn, task_id: str, pid: int = 987654) -> None:
     """Kill the live claim the way production did: a dead worker PID."""
+    run = conn.execute(
+        "SELECT current_run_id FROM tasks WHERE id=?", (task_id,),
+    ).fetchone()
+    run_id = run["current_run_id"] if run else None
+    started_at = int(time.time()) - 600
     conn.execute(
         "UPDATE tasks SET worker_pid=?, started_at=? WHERE id=?",
-        (pid, int(time.time()) - 600, task_id),
+        (pid, started_at, task_id),
     )
+    if run_id is not None:
+        conn.execute(
+            "UPDATE task_runs SET started_at=? WHERE id=?",
+            (started_at, run_id),
+        )
     conn.commit()
+
+
+def _spawn_recorder(sink, pid=None):
+    def _spawn(task, workspace):
+        sink.append((task.id, task.assignee))
+        return pid
+    return _spawn
 
 
 # ---------------------------------------------------------------------------
@@ -81,12 +98,18 @@ def test_correction_recovery_after_crash_is_not_pr_guarded(
         assert kb.claim_review_task(conn, task_id, claimer=f"{host}:review") is not None
         corrected = kb.request_changes(
             conn, task_id, "programmer",
-            reason="tighten error handling", claimer=f"{host}:impl2",
+            reason="tighten error handling", trusted_operator=True,
         )
-        assert corrected is not None and corrected.status == "running"
+        assert corrected is not None and corrected.status == "ready"
+        assert corrected.claim_lock is None
+        assert corrected.current_run_id is None
+
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=_spawn_recorder(spawned, pid=4242))
+        assert spawned == [(task_id, "programmer")]
 
         # The correction run crashes: pid not alive -> back to ready.
-        _crash_current_worker(conn, task_id)
+        _crash_current_worker(conn, task_id, pid=4242)
         assert task_id in kb.detect_crashed_workers(conn)
         assert kb.get_task(conn, task_id).status == "ready"
 
@@ -196,18 +219,17 @@ def test_completed_review_cycle_does_not_re_enter_review_lane(
         # The dispatcher already claimed + spawned the reviewer above.
         # Reviewer requests changes -> programmer correction -> crash.
         assert kb.request_changes(
-            conn, task_id, "programmer", reason="fix tests", claimer=f"{host}:impl2",
+            conn, task_id, "programmer", reason="fix tests",
+            trusted_operator=True,
         ) is not None
-        _crash_current_worker(conn, task_id)
+        spawned = []
+        kb.dispatch_once(conn, spawn_fn=_spawn_recorder(spawned, pid=4243))
+        assert spawned == [(task_id, "programmer")]
+        _crash_current_worker(conn, task_id, pid=4243)
         assert task_id in kb.detect_crashed_workers(conn)
 
-        spawned = []
-        kb.dispatch_once(
-            conn,
-            spawn_fn=lambda task, workspace: spawned.append(
-                (task.id, task.assignee)
-            ),
-        )
+        spawned.clear()
+        kb.dispatch_once(conn, spawn_fn=_spawn_recorder(spawned))
         task = kb.get_task(conn, task_id)
         assert task is not None and task.assignee == "programmer"
         assert spawned == [(task_id, "programmer")]

@@ -900,6 +900,32 @@ def _handle_submit_review(args: dict, **kw) -> str:
         return tool_error(f"kanban_review: {exc}")
 
 
+def _review_worker_auth(tid: str) -> tuple[Optional[str], Optional[str], Optional[int], Optional[str]]:
+    """Resolve reviewer identity and the active worker claim/run boundary."""
+    if not os.environ.get("HERMES_KANBAN_TASK"):
+        return None, None, None, tool_error(
+            "review decision tools require a dispatcher-scoped worker task"
+        )
+    reviewer = _normalize_profile(
+        os.environ.get("HERMES_PROFILE") or os.environ.get("HERMES_PROFILE_NAME")
+    )
+    claim = _normalize_profile(os.environ.get("HERMES_KANBAN_CLAIM_LOCK"))
+    run_id = _worker_run_id(tid)
+    missing = [
+        name for name, value in (
+            ("HERMES_PROFILE", reviewer),
+            ("HERMES_KANBAN_CLAIM_LOCK", claim),
+            ("HERMES_KANBAN_RUN_ID", run_id),
+        ) if value is None
+    ]
+    if missing:
+        return None, None, None, tool_error(
+            "review decision worker authorization is incomplete; missing "
+            + ", ".join(missing)
+        )
+    return reviewer, claim, run_id, None
+
+
 def _handle_request_changes(args: dict, **kw) -> str:
     tid = _default_task_id(args.get("task_id"))
     programmer = args.get("programmer")
@@ -908,13 +934,18 @@ def _handle_request_changes(args: dict, **kw) -> str:
     ownership_err = _enforce_worker_task_ownership(tid)
     if ownership_err:
         return ownership_err
+    reviewer, claim, run_id, auth_err = _review_worker_auth(tid)
+    if auth_err:
+        return auth_err
     try:
         kb, conn = _connect(board=args.get("board"))
         try:
             task = kb.request_changes(
                 conn, tid, programmer,
                 reason=args.get("reason"),
-                claimer=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"),
+                reviewer=reviewer,
+                expected_claim=claim,
+                expected_run_id=run_id,
             )
             if task is None:
                 return tool_error(f"could not request changes for {tid}")
@@ -923,6 +954,45 @@ def _handle_request_changes(args: dict, **kw) -> str:
             conn.close()
     except (RuntimeError, ValueError) as exc:
         return tool_error(f"kanban_request_changes: {exc}")
+
+
+def _handle_approve(args: dict, **kw) -> str:
+    tid = _default_task_id(args.get("task_id"))
+    head_sha = args.get("head_sha")
+    summary = args.get("summary")
+    if not tid or not head_sha or not summary:
+        return tool_error("task_id, head_sha, and summary are required")
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    reviewer, claim, run_id, auth_err = _review_worker_auth(tid)
+    if auth_err:
+        return auth_err
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            task = kb.approve_review(
+                conn,
+                tid,
+                reviewer=reviewer,
+                summary=str(summary).strip(),
+                head_sha=str(head_sha).strip(),
+                expected_claim=claim,
+                expected_run_id=run_id,
+            )
+            if task is None:
+                return tool_error(f"could not approve {tid}")
+            return _ok(
+                task_id=tid,
+                status=task.status,
+                assignee=task.assignee,
+                approved=True,
+                head_sha=str(head_sha).strip().lower(),
+            )
+        finally:
+            conn.close()
+    except (RuntimeError, ValueError) as exc:
+        return tool_error(f"kanban_approve: {exc}")
 
 
 def _handle_heartbeat(args: dict, **kw) -> str:
@@ -1811,6 +1881,23 @@ KANBAN_REVIEW_SCHEMA = {
     }, "required": ["reviewer"]},
 }
 
+KANBAN_APPROVE_SCHEMA = {
+    "name": "kanban_approve",
+    "description": (
+        "Record an exact-head review APPROVE on the current worker run and "
+        "hand the same card to its finalizer. This is not task completion."
+    ),
+    "parameters": {"type": "object", "properties": {
+        "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+        "head_sha": {
+            "type": "string",
+            "description": "Full 40- or 64-character commit SHA under review",
+        },
+        "summary": {"type": "string", "description": "Review evidence summary"},
+        "board": _board_schema_prop(),
+    }, "required": ["head_sha", "summary"]},
+}
+
 KANBAN_REQUEST_CHANGES_SCHEMA = {
     "name": "kanban_request_changes",
     "description": "Return a review directly to a programmer implementation run on the same card.",
@@ -2241,6 +2328,15 @@ registry.register(
     handler=_handle_submit_review,
     check_fn=_check_kanban_mode,
     emoji="🔎",
+)
+
+registry.register(
+    name="kanban_approve",
+    toolset="kanban",
+    schema=KANBAN_APPROVE_SCHEMA,
+    handler=_handle_approve,
+    check_fn=_check_kanban_mode,
+    emoji="✅",
 )
 
 registry.register(

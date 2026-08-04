@@ -3984,6 +3984,7 @@ def _end_run(
     error: Optional[str] = None,
     metadata: Optional[dict] = None,
     status: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
 ) -> Optional[int]:
     """Close the currently-active run for ``task_id`` and clear the pointer.
 
@@ -4001,7 +4002,12 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
-    conn.execute(
+    if expected_run_id is not None and run_id != int(expected_run_id):
+        raise RuntimeError(
+            f"cannot end {task_id}: current run is {run_id}, "
+            f"expected {int(expected_run_id)}"
+        )
+    cur = conn.execute(
         """
         UPDATE task_runs
            SET status        = ?,
@@ -4015,6 +4021,7 @@ def _end_run(
                worker_pid    = NULL
          WHERE id = ?
            AND ended_at IS NULL
+           AND (? IS NULL OR id = ?)
         """,
         (
             status or outcome,
@@ -4024,11 +4031,18 @@ def _end_run(
             json.dumps(metadata, ensure_ascii=False) if metadata else None,
             now,
             run_id,
+            expected_run_id,
+            expected_run_id,
         ),
     )
-    conn.execute(
-        "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
+    if cur.rowcount != 1:
+        raise RuntimeError(f"cannot end {task_id}: run {run_id} is no longer active")
+    task_cur = conn.execute(
+        "UPDATE tasks SET current_run_id = NULL WHERE id = ? AND current_run_id = ?",
+        (task_id, run_id),
     )
+    if task_cur.rowcount != 1:
+        raise RuntimeError(f"cannot end {task_id}: current run changed")
     return run_id
 
 
@@ -4449,9 +4463,18 @@ REVIEW_HANDOFF_PREFIX = "review-required:"
 _REVIEW_DIRECTIVE_EVENT_KINDS = ("dependency_wait", "blocked")
 
 # Event kinds that prove a pending review handoff has already been consumed:
-# the card entered the reviewer lane (``submitted_for_review``) or reached a
+# the card entered the reviewer lane (``submitted_for_review``), the reviewer
+# reached a durable decision (``review_approved``), or the card reached a
 # terminal state. Anything later than the directive closes it.
-_REVIEW_HANDOFF_CONSUMED_KINDS = ("submitted_for_review", "completed", "archived")
+_REVIEW_HANDOFF_CONSUMED_KINDS = (
+    "submitted_for_review", "review_approved", "completed", "archived",
+)
+
+_FINALIZATION_SETTLED_KINDS = (
+    "submitted_for_review", "completed", "archived", "changes_requested",
+)
+
+_FULL_COMMIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 
 
 def _latest_event_id(
@@ -4472,6 +4495,24 @@ def _latest_event_id(
         (task_id, *kinds),
     ).fetchone()
     return int(row["id"]) if row else 0
+
+
+def _latest_event_payload(
+    conn: sqlite3.Connection, task_id: str, kind: str,
+) -> tuple[int, dict[str, object]]:
+    """Return the newest event id and decoded object payload for ``kind``."""
+    row = conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id = ? AND kind = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, kind),
+    ).fetchone()
+    if not row:
+        return 0, {}
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except (TypeError, ValueError):
+        payload = {}
+    return int(row["id"]), payload if isinstance(payload, dict) else {}
 
 
 def _latest_review_directive_id(conn: sqlite3.Connection, task_id: str) -> int:
@@ -4531,6 +4572,15 @@ def in_correction_lane(conn: sqlite3.Connection, task_id: str) -> bool:
         conn, task_id, _REVIEW_HANDOFF_CONSUMED_KINDS,
     )
     return settled_id < changes_id
+
+
+def in_finalization_lane(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the newest unsettled review decision is approval."""
+    approved_id = _latest_event_id(conn, task_id, ("review_approved",))
+    if not approved_id:
+        return False
+    settled_id = _latest_event_id(conn, task_id, _FINALIZATION_SETTLED_KINDS)
+    return settled_id < approved_id
 
 
 def submit_task_for_review(
@@ -4649,62 +4699,324 @@ def request_changes(
     reason: Optional[str] = None,
     claimer: Optional[str] = None,
     ttl_seconds: Optional[int] = None,
+    reviewer: Optional[str] = None,
+    expected_claim: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+    trusted_operator: bool = False,
 ) -> Optional[Task]:
-    """Return a review directly to a claimed programmer implementation run.
+    """Return a review to the programmer on the SAME card via ``ready``.
 
-    The same card is reused and is never parked in ``blocked``, ``todo``, or
-    ``triage``.  The reviewer run is closed, the programmer is assigned, and a
-    fresh claim/run is created in one transaction.
+    A worker caller must prove the active reviewer profile, claim, and run.
+    The trusted CLI/dashboard mode is intentionally explicit and may operate
+    without those worker credentials.  In either mode this function closes
+    the reviewer run, records one durable correction packet, and leaves the
+    dispatcher to create the next real programmer run.
     """
     programmer = _canonical_assignee(programmer)
+    reviewer_name = _canonical_assignee(reviewer)
     if not programmer:
         raise ValueError("programmer is required")
-    now = int(time.time())
-    lock = claimer or _claimer_id()
-    expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    if not reviewer_name and not trusted_operator:
+        raise ValueError("reviewer is required")
+    reason = str(reason or "").strip()
+    if not reason:
+        raise ValueError("reason is required")
+    expected_claim = (expected_claim or "").strip() or None
+    if expected_run_id is not None:
+        try:
+            expected_run_id = int(expected_run_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("expected_run_id must be a positive integer") from exc
+        if expected_run_id <= 0:
+            raise ValueError("expected_run_id must be a positive integer")
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee, max_runtime_seconds, "
-            "current_step_key FROM tasks WHERE id=?", (task_id,),
+            "SELECT status, claim_lock, assignee, current_run_id "
+            "FROM tasks WHERE id=?", (task_id,),
         ).fetchone()
         if not row:
             return None
-        if row["status"] not in {"review", "running"}:
+
+        if row["status"] != "review":
+            decision_id, decision = _latest_event_payload(
+                conn, task_id, "changes_requested",
+            )
+            if (
+                decision_id
+                and in_correction_lane(conn, task_id)
+                and decision.get("programmer") == programmer
+                and decision.get("reason") == reason
+                and (
+                    trusted_operator
+                    or decision.get("reviewer") == reviewer_name
+                )
+            ):
+                return get_task(conn, task_id)
             raise RuntimeError(
                 f"cannot request changes for {task_id} from status {row['status']!r}"
             )
-        if row["status"] == "running" and row["claim_lock"] is None:
-            raise RuntimeError(f"cannot request changes for {task_id}: unclaimed run")
+
+        if trusted_operator and expected_run_id is None:
+            expected_run_id = row["current_run_id"]
+        if expected_run_id is None and not trusted_operator:
+            raise RuntimeError("expected_run_id is required")
+        if (
+            expected_run_id is not None
+            and row["current_run_id"] != expected_run_id
+        ):
+            raise RuntimeError(
+                f"cannot request changes for {task_id}: this run is no longer "
+                "the active review run"
+            )
+        if not trusted_operator and not expected_claim:
+            raise RuntimeError("expected_claim is required")
+        if (
+            not trusted_operator
+            and row["claim_lock"] != expected_claim
+        ):
+            raise RuntimeError(
+                f"cannot request changes for {task_id}: this run no longer holds "
+                "the review claim"
+            )
+
+        if not trusted_operator:
+            submitted = None
+            for event in conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? "
+                "AND kind IN ('submitted_for_review', 'review_failover') "
+                "ORDER BY id DESC",
+                (task_id,),
+            ):
+                try:
+                    payload = json.loads(event["payload"]) if event["payload"] else {}
+                except (TypeError, ValueError):
+                    payload = {}
+                if isinstance(payload, dict):
+                    submitted = _canonical_assignee(payload.get("reviewer"))
+                    if submitted:
+                        break
+            if submitted != reviewer_name:
+                raise RuntimeError(
+                    f"cannot request changes for {task_id}: caller "
+                    f"{reviewer_name!r} does not own the current reviewer lane"
+                )
+
+        predicates = ["id = ?", "status = 'review'"]
+        params: list[object] = [task_id]
+        if expected_run_id is not None:
+            predicates.append("current_run_id = ?")
+            params.append(expected_run_id)
+        if not trusted_operator:
+            predicates.append("claim_lock = ?")
+            params.append(expected_claim)
+        cur = conn.execute(
+            "UPDATE tasks SET status='ready', assignee=?, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, completed_at=NULL, "
+            "block_kind=NULL WHERE " + " AND ".join(predicates),
+            (programmer, *params),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError(
+                f"cannot request changes for {task_id}: the card left the "
+                "reviewer lane while the decision was being recorded"
+            )
         reviewer_run_id = _end_run(
-            conn, task_id, outcome="changes_requested", status="running",
-            summary=reason,
+            conn, task_id, outcome="changes_requested", summary=reason,
+            expected_run_id=expected_run_id,
         )
-        conn.execute(
-            "UPDATE tasks SET status='running', assignee=?, claim_lock=?, "
-            "claim_expires=?, started_at=COALESCE(started_at, ?), "
-            "completed_at=NULL, block_kind=NULL WHERE id=?",
-            (programmer, lock, expires, now, task_id),
-        )
-        run_cur = conn.execute(
-            "INSERT INTO task_runs (task_id, profile, step_key, status, "
-            "claim_lock, claim_expires, max_runtime_seconds, started_at) "
-            "VALUES (?, ?, ?, 'running', ?, ?, ?, ?)",
-            (task_id, programmer, row["current_step_key"], lock, expires,
-             row["max_runtime_seconds"], now),
-        )
-        run_id = int(run_cur.lastrowid)
-        conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, task_id))
+        payload: dict[str, object] = {"programmer": programmer, "reason": reason}
+        if reviewer_name:
+            payload["reviewer"] = reviewer_name
         _append_event(
-            conn, task_id, "changes_requested",
-            {"programmer": programmer, "reason": reason, "run_id": run_id},
+            conn, task_id, "changes_requested", payload, run_id=reviewer_run_id,
+        )
+        if _has_sticky_block(conn, task_id):
+            _append_event(
+                conn, task_id, "unblocked", {"source": "changes_requested"},
+            )
+        return get_task(conn, task_id)
+
+
+def _resolve_finalizer(
+    conn: sqlite3.Connection, task_id: str, *, reviewer: str,
+) -> Optional[str]:
+    """Resolve the pre-reviewer profile that must finalize the same card."""
+    for row in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND "
+        "kind = 'submitted_for_review' ORDER BY id DESC",
+        (task_id,),
+    ):
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            continue
+        candidate = _canonical_assignee(payload.get("previous_assignee"))
+        if candidate and candidate != reviewer:
+            return candidate
+    for row in conn.execute(
+        "SELECT profile FROM task_runs WHERE task_id = ? ORDER BY id DESC",
+        (task_id,),
+    ):
+        candidate = _canonical_assignee(row["profile"])
+        if candidate and candidate != reviewer:
+            return candidate
+    return None
+
+
+def approve_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reviewer: Optional[str] = None,
+    summary: Optional[str] = None,
+    head_sha: Optional[str] = None,
+    expected_claim: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+    trusted_operator: bool = False,
+) -> Optional[Task]:
+    """Record an exact-head approval and hand the same card to its finalizer.
+
+    Approval is a reviewer-run terminal transition, not task completion.  The
+    review run is closed, one durable ``review_approved`` event records the
+    exact head, and the card returns to an unclaimed ``ready`` state for the
+    original implementation owner to finalize.  A worker caller must provide
+    its claim and active run id; the explicit trusted-operator mode is for the
+    CLI/dashboard control plane.
+    """
+    expected_claim = (expected_claim or "").strip() or None
+    reviewer_name = _canonical_assignee(reviewer)
+    if not reviewer_name:
+        raise ValueError("reviewer is required and must identify the calling reviewer")
+    if not head_sha or not _FULL_COMMIT_SHA_RE.fullmatch(str(head_sha).strip()):
+        raise ValueError("head_sha must be the full 40- or 64-character commit sha")
+    head_sha = str(head_sha).strip().lower()
+    if expected_run_id is not None:
+        try:
+            expected_run_id = int(expected_run_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("expected_run_id must be a positive integer") from exc
+        if expected_run_id <= 0:
+            raise ValueError("expected_run_id must be a positive integer")
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, claim_lock, assignee, current_run_id "
+            "FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        if not row:
+            return None
+
+        # A lost tool response may cause the same reviewer process to retry
+        # after the transition already committed.  Accept only the identical
+        # decision while it is still the current finalization lane; a later
+        # review submission makes the old approval stale.
+        if row["status"] != "review":
+            decision_id, decision = _latest_event_payload(
+                conn, task_id, "review_approved",
+            )
+            if (
+                decision_id
+                and in_finalization_lane(conn, task_id)
+                and decision.get("reviewer") == reviewer_name
+                and decision.get("head_sha") == head_sha
+                and decision.get("summary") == summary
+            ):
+                return get_task(conn, task_id)
+            raise RuntimeError(
+                f"cannot approve {task_id} from status {row['status']!r}: "
+                "approval is only valid while the card is in 'review'"
+            )
+
+        if trusted_operator and expected_run_id is None:
+            expected_run_id = row["current_run_id"]
+        if expected_run_id is None and not trusted_operator:
+            raise RuntimeError("expected_run_id is required")
+        if expected_run_id is None or row["current_run_id"] != expected_run_id:
+            raise RuntimeError(
+                f"cannot approve {task_id}: current review run does not match "
+                f"expected run {expected_run_id!r}"
+            )
+        if not trusted_operator and not expected_claim:
+            raise RuntimeError("expected_claim is required")
+        if not trusted_operator and row["claim_lock"] != expected_claim:
+            raise RuntimeError(
+                f"cannot approve {task_id}: this run no longer holds the "
+                "review claim"
+            )
+
+        submitted = None
+        for event in conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? "
+            "AND kind IN ('submitted_for_review', 'review_failover') "
+            "ORDER BY id DESC",
+            (task_id,),
+        ):
+            try:
+                payload = json.loads(event["payload"]) if event["payload"] else {}
+            except (TypeError, ValueError):
+                payload = {}
+            if isinstance(payload, dict):
+                submitted = _canonical_assignee(payload.get("reviewer"))
+                if submitted:
+                    break
+        if submitted != reviewer_name:
+            raise RuntimeError(
+                f"cannot approve {task_id}: caller {reviewer_name!r} does not "
+                "own the current reviewer lane"
+            )
+
+        finalizer_name = _resolve_finalizer(
+            conn, task_id, reviewer=reviewer_name,
+        )
+        if not finalizer_name:
+            raise RuntimeError(
+                f"cannot approve {task_id}: no finalizer profile could be "
+                "resolved from the card's history"
+            )
+        if finalizer_name == reviewer_name:
+            raise RuntimeError(
+                f"cannot approve {task_id}: reviewer cannot be its own finalizer"
+            )
+
+        predicates = ["id = ?", "status = 'review'", "current_run_id = ?"]
+        params: list[object] = [task_id, expected_run_id]
+        if not trusted_operator:
+            predicates.append("claim_lock = ?")
+            params.append(expected_claim)
+        cur = conn.execute(
+            "UPDATE tasks SET status='ready', assignee=?, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, completed_at=NULL, "
+            "block_kind=NULL WHERE " + " AND ".join(predicates),
+            (finalizer_name, *params),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError(
+                f"cannot approve {task_id}: the card left the reviewer lane "
+                "while the approval was being recorded"
+            )
+        reviewer_run_id = _end_run(
+            conn, task_id, outcome="approved", summary=summary,
+            expected_run_id=expected_run_id,
+        )
+        _append_event(
+            conn,
+            task_id,
+            "review_approved",
+            {
+                "reviewer": reviewer_name,
+                "head_sha": head_sha,
+                "summary": summary,
+                "finalizer": finalizer_name,
+            },
             run_id=reviewer_run_id,
         )
-        _append_event(
-            conn, task_id, "claimed",
-            {"lock": lock, "expires": expires, "run_id": run_id,
-             "source_status": "review_changes_requested"},
-            run_id=run_id,
-        )
+        if _has_sticky_block(conn, task_id):
+            _append_event(
+                conn, task_id, "unblocked", {"source": "review_approved"},
+            )
         return get_task(conn, task_id)
 
 
@@ -8109,9 +8421,13 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     review_crashes: dict[str, str] = {}
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, status, current_run_id, assignee "
-            "FROM tasks "
-            "WHERE status IN ('running', 'review') AND worker_pid IS NOT NULL"
+            "SELECT t.id, t.worker_pid, t.claim_lock, t.status, "
+            "       t.current_run_id, t.assignee, "
+            "       COALESCE(r.started_at, t.started_at) AS active_started_at "
+            "FROM tasks t "
+            "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE t.status IN ('running', 'review') "
+            "  AND t.worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
@@ -8122,7 +8438,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             # Skip liveness check inside the launch-window grace period
             # so a freshly-spawned worker isn't reclaimed before its PID
             # is visible on /proc.
-            started_at = row["started_at"] if "started_at" in row.keys() else None
+            started_at = (
+                row["active_started_at"]
+                if "active_started_at" in row.keys() else None
+            )
             if started_at is not None:
                 grace = _resolve_crash_grace_seconds()
                 if time.time() - started_at < grace:
@@ -8833,7 +9152,11 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     #    reviewer lane), respawning continues existing work rather than
     #    duplicating it. Without this carve-out the card is stranded in
     #    ``ready`` for the full 24h PR window.
-    if in_correction_lane(conn, task_id) or pending_review_handoff(conn, task_id):
+    if (
+        in_correction_lane(conn, task_id)
+        or in_finalization_lane(conn, task_id)
+        or pending_review_handoff(conn, task_id)
+    ):
         return None
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
@@ -10051,6 +10374,19 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     lines.append("")
     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
     lines.append(f"Status:   {task.status}")
+    if in_finalization_lane(conn, task_id):
+        _, approval = _latest_event_payload(conn, task_id, "review_approved")
+        approved_head = approval.get("head_sha")
+        lines.extend([
+            "",
+            "## Finalization directive",
+            "A reviewer approved this same card. You are the finalizer/merge "
+            "worker, not a reviewer retry.",
+            f"Approved exact head: `{approved_head or '(missing — fail closed)'}`",
+            "Verify the durable tree is still exactly that head, perform the "
+            "merge through the repository's supported method, and call "
+            "kanban_complete only after the merge is durably verified.",
+        ])
     if task.tenant:
         lines.append(f"Tenant:   {task.tenant}")
     lines.append(f"Workspace: {task.workspace_kind} @ {task.workspace_path or '(unresolved)'}")

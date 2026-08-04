@@ -1054,11 +1054,70 @@ def test_kanban_request_changes_handler_returns_to_programmer(monkeypatch, tmp_p
         task_id = kb.create_task(conn, title="changes handler", assignee="programmer")
         assert kb.claim_task(conn, task_id) is not None
         assert kb.submit_task_for_review(conn, task_id, "code-reviewer") is not None
+        review = kb.claim_review_task(conn, task_id, claimer="test-host:review")
+        assert review is not None
     monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_PROFILE", "code-reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", review.claim_lock)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
     result = json.loads(kt._handle_request_changes({
         "programmer": "programmer", "reason": "add coverage",
     }))
     assert result == {
-        "ok": True, "task_id": task_id, "status": "running",
+        "ok": True, "task_id": task_id, "status": "ready",
         "assignee": "programmer",
     }
+
+    with kb.connect() as conn:
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.current_run_id is None
+        assert conn.execute(
+            "SELECT outcome, ended_at FROM task_runs WHERE id=?",
+            (review.current_run_id,),
+        ).fetchone()["outcome"] == "changes_requested"
+
+
+def test_kanban_approve_handler_closes_review_run_and_hands_off(
+    monkeypatch, tmp_path,
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import kanban_db as kb
+    import tools.kanban_tools as kt
+
+    head = "855fd911d56e1c6185fda5995d8aff430d964191"
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="approval handler", assignee="programmer")
+        assert kb.claim_task(conn, task_id, claimer="test-host:implementation")
+        assert kb.submit_task_for_review(conn, task_id, "code-reviewer") is not None
+        review = kb.claim_review_task(conn, task_id, claimer="test-host:review")
+        assert review is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_PROFILE", "code-reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", review.claim_lock)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    result = json.loads(kt._handle_approve({
+        "summary": "focused proof and CI are green",
+        "head_sha": head,
+    }))
+    assert result == {
+        "ok": True,
+        "task_id": task_id,
+        "status": "ready",
+        "assignee": "programmer",
+        "approved": True,
+        "head_sha": head,
+    }
+
+    with kb.connect() as conn:
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.status == "ready"
+        assert current.current_run_id is None
+        assert conn.execute(
+            "SELECT outcome, ended_at FROM task_runs WHERE id=?",
+            (review.current_run_id,),
+        ).fetchone()["outcome"] == "approved"

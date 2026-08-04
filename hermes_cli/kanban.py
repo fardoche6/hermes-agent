@@ -642,6 +642,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_review.add_argument("task_id")
     p_review.add_argument("reviewer", help="Reviewer profile")
 
+    p_approve = sub.add_parser("approve", help="Approve an exact reviewed commit head")
+    p_approve.add_argument("task_id")
+    p_approve.add_argument("reviewer", help="Reviewer profile recording the decision")
+    p_approve.add_argument("head_sha", help="Full 40- or 64-character commit SHA")
+    p_approve.add_argument("summary", nargs="*", help="Review evidence summary")
+
     p_changes = sub.add_parser("request-changes", help="Return a review to implementation")
     p_changes.add_argument("task_id")
     p_changes.add_argument("programmer", help="Programmer profile")
@@ -1074,6 +1080,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "review":   _cmd_review,
+            "approve":  _cmd_approve,
             "request-changes": _cmd_request_changes,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
@@ -1139,6 +1146,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "attach-rm",
     "complete",
     "review",
+    "approve",
     "request-changes",
     "edit",
     "block",
@@ -2278,11 +2286,36 @@ def _cmd_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_approve(args: argparse.Namespace) -> int:
+    summary = " ".join(args.summary).strip() if args.summary else None
+    if not summary:
+        print(
+            f"cannot approve {args.task_id}: a summary is required",
+            file=sys.stderr,
+        )
+        return 1
+    with kb.connect_closing() as conn:
+        task = kb.approve_review(
+            conn,
+            args.task_id,
+            reviewer=args.reviewer,
+            head_sha=args.head_sha,
+            summary=summary,
+            trusted_operator=True,
+        )
+    if task is None:
+        print(f"cannot approve {args.task_id}: task not found", file=sys.stderr)
+        return 1
+    print(f"Approved {args.task_id} at {args.head_sha} → {task.assignee}")
+    return 0
+
+
 def _cmd_request_changes(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     with kb.connect_closing() as conn:
         task = kb.request_changes(
             conn, args.task_id, args.programmer, reason=reason,
+            trusted_operator=True,
         )
     if task is None:
         print(f"cannot request changes for {args.task_id}: task not found", file=sys.stderr)
