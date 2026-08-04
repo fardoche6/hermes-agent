@@ -151,6 +151,44 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
+def _worker_heartbeat_credentials(task_id: str) -> tuple[Optional[str], Optional[int], Optional[str], Optional[str]]:
+    """Return worker heartbeat credentials, or an error for malformed env.
+
+    A dispatcher worker is identified by the presence of the task env var.
+    Its task, profile, claim, and positive run id are all credentials and
+    must come from that environment; never recover any of them from SQLite.
+    The operator CLI (with no worker task env var) retains its existing
+    convenience fallbacks.
+    """
+    worker_mode = any(
+        os.environ.get(name)
+        for name in (
+            "HERMES_KANBAN_TASK",
+            "HERMES_KANBAN_RUN_ID",
+            "HERMES_KANBAN_CLAIM_LOCK",
+        )
+    )
+    if not worker_mode:
+        return None, None, None, None
+    env_task = os.environ.get("HERMES_KANBAN_TASK")
+    profile = os.environ.get("HERMES_PROFILE")
+    claim = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+    raw_run = os.environ.get("HERMES_KANBAN_RUN_ID")
+    if not env_task or task_id != env_task:
+        return None, None, None, tool_error("worker heartbeat requires its task from HERMES_KANBAN_TASK")
+    if not profile:
+        return None, None, None, tool_error("worker heartbeat requires HERMES_PROFILE")
+    if not claim:
+        return None, None, None, tool_error("worker heartbeat requires HERMES_KANBAN_CLAIM_LOCK")
+    try:
+        run_id = int(raw_run or "")
+    except (TypeError, ValueError):
+        run_id = None
+    if run_id is None or run_id <= 0:
+        return None, None, None, tool_error("worker heartbeat requires a positive HERMES_KANBAN_RUN_ID")
+    return profile, run_id, claim, None
+
+
 def _stamp_worker_session_metadata(
     task_id: str, metadata: Optional[dict]
 ) -> Optional[dict]:
@@ -274,17 +312,21 @@ def heartbeat_current_worker_from_env() -> bool:
       * ``HERMES_KANBAN_TASK`` — task id (required; absence means no-op)
       * ``HERMES_KANBAN_RUN_ID`` — pins the run row so we don't heartbeat
         a stale run that may have already been reclaimed
-      * ``HERMES_KANBAN_CLAIM_LOCK`` — claim lock for ``heartbeat_claim``;
-        falls back to the default ``_claimer_id()`` for locally-driven
-        workers that never went through the dispatcher path
+      * ``HERMES_KANBAN_CLAIM_LOCK`` — claim lock for ``heartbeat_claim``
+      * ``HERMES_PROFILE`` — worker profile
 
     Rate-limited via the module-level ``_auto_heartbeat_last_attempt``
     timestamp (monotonic clock); not thread-safe in the strict sense, but
     the worst case is one extra DB write per race, which is harmless.
     """
     global _auto_heartbeat_last_attempt
+    if "HERMES_KANBAN_TASK" not in os.environ:
+        return False
     tid = os.environ.get("HERMES_KANBAN_TASK")
     if not tid:
+        return False
+    profile, run_id, claim_lock, auth_err = _worker_heartbeat_credentials(tid)
+    if auth_err:
         return False
     import time as _time
     now = _time.monotonic()
@@ -294,22 +336,10 @@ def heartbeat_current_worker_from_env() -> bool:
     try:
         kb, conn = _connect()
         try:
-            claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-            run_id_raw = os.environ.get("HERMES_KANBAN_RUN_ID")
-            run_id: Optional[int]
-            try:
-                run_id = int(run_id_raw) if run_id_raw else None
-            except (TypeError, ValueError):
-                run_id = None
-            if run_id is None:
-                row = conn.execute(
-                    "SELECT current_run_id FROM tasks WHERE id=?", (tid,),
-                ).fetchone()
-                run_id = int(row["current_run_id"]) if row and row["current_run_id"] else None
             try:
                 kb.heartbeat_worker(
                     conn, tid, note=None, expected_run_id=run_id,
-                    expected_profile=os.environ.get("HERMES_PROFILE"),
+                    expected_profile=profile,
                     expected_claim=claim_lock,
                 )
             except Exception:
@@ -1034,8 +1064,12 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or kb._claimer_id()
-            run_id = _worker_run_id(tid)
+            profile, run_id, claim_lock, auth_err = _worker_heartbeat_credentials(tid)
+            if auth_err:
+                return auth_err
+            if "HERMES_KANBAN_TASK" not in os.environ:
+                claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or kb._claimer_id()
+                run_id = _worker_run_id(tid)
             if run_id is None:
                 row = conn.execute(
                     "SELECT current_run_id FROM tasks WHERE id=?", (tid,),
@@ -1047,7 +1081,7 @@ def _handle_heartbeat(args: dict, **kw) -> str:
                 tid,
                 note=note,
                 expected_run_id=run_id,
-                expected_profile=os.environ.get("HERMES_PROFILE"),
+                expected_profile=profile or os.environ.get("HERMES_PROFILE"),
                 expected_claim=claim_lock,
             )
             if not ok:

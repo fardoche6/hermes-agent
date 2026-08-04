@@ -18,6 +18,7 @@ from gateway.kanban_watchers import (
     _resolve_auto_decompose_settings,
 )
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_diagnostics import triage_aux_status
 
 
 def test_disabled_by_default_when_key_absent():
@@ -60,6 +61,13 @@ def test_enabled_only_when_flag_explicitly_true():
     )
     assert enabled is True
     assert per_tick == 3
+
+
+@pytest.mark.parametrize("value", ["false", "true", 1])
+def test_diagnostics_requires_literal_boolean_true(value):
+    status = triage_aux_status({"kanban": {"auto_decompose": value}})
+    assert status is not None
+    assert status["auto_decompose"] is False
 
 
 @pytest.mark.parametrize(

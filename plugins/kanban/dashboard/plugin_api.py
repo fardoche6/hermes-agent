@@ -46,7 +46,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect, status as http_status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
@@ -2707,8 +2707,8 @@ def decompose_task_endpoint(
 class OrchestrationSettingsBody(BaseModel):
     orchestrator_profile: Optional[str] = None
     default_assignee: Optional[str] = None
-    auto_decompose: Optional[bool] = None
-    auto_promote_children: Optional[bool] = None
+    auto_decompose: Optional[StrictBool] = None
+    auto_promote_children: Optional[StrictBool] = None
 
 
 @router.get("/orchestration")
@@ -2723,8 +2723,8 @@ def get_orchestration_settings():
     kanban_cfg = (cfg.get("kanban") or {}) if isinstance(cfg, dict) else {}
     explicit_orch = (kanban_cfg.get("orchestrator_profile") or "").strip()
     explicit_default = (kanban_cfg.get("default_assignee") or "").strip()
-    auto_decompose = bool(kanban_cfg.get("auto_decompose", False))
-    auto_promote_children = bool(kanban_cfg.get("auto_promote_children", True))
+    auto_decompose = kanban_cfg.get("auto_decompose") is True
+    auto_promote_children = kanban_cfg.get("auto_promote_children") is True
 
     # Resolve fallbacks the same way the decomposer does.
     resolved_orch = explicit_orch

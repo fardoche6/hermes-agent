@@ -62,10 +62,15 @@ def worker_env(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
-        kb.claim_task(conn, tid)
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        run = kb.latest_run(conn, tid)
+        assert run is not None and claimed.claim_lock
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claimed.claim_lock)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
     return tid
 
 
@@ -348,6 +353,71 @@ def test_heartbeat_extends_claim_expires(worker_env):
         f"claim_expires={after} is suspiciously close to now={now}; "
         f"expected at least now + {kb.DEFAULT_CLAIM_TTL_SECONDS // 2}"
     )
+
+
+@pytest.mark.parametrize("missing", [
+    "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK", "HERMES_PROFILE",
+])
+def test_worker_heartbeat_missing_credentials_is_zero_mutation(
+    worker_env, monkeypatch, missing,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        before = tuple(conn.execute(
+            "SELECT status, claim_lock, claim_expires, last_heartbeat_at, current_run_id "
+            "FROM tasks WHERE id=?", (worker_env,),
+        ).fetchone())
+    finally:
+        conn.close()
+    monkeypatch.delenv(missing)
+    assert json.loads(kt._handle_heartbeat({})).get("ok") is None
+    kt.heartbeat_current_worker_from_env()
+    conn = kb.connect()
+    try:
+        after = tuple(conn.execute(
+            "SELECT status, claim_lock, claim_expires, last_heartbeat_at, current_run_id "
+            "FROM tasks WHERE id=?", (worker_env,),
+        ).fetchone())
+    finally:
+        conn.close()
+    assert after == before
+
+
+@pytest.mark.parametrize("field,value", [
+    ("HERMES_KANBAN_RUN_ID", "0"),
+    ("HERMES_KANBAN_RUN_ID", "not-a-run"),
+    ("HERMES_KANBAN_CLAIM_LOCK", "wrong-claim"),
+    ("HERMES_PROFILE", "wrong-profile"),
+])
+def test_worker_heartbeat_invalid_credentials_is_zero_mutation(
+    worker_env, monkeypatch, field, value,
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        before = tuple(conn.execute(
+            "SELECT status, claim_lock, claim_expires, last_heartbeat_at, current_run_id "
+            "FROM tasks WHERE id=?", (worker_env,),
+        ).fetchone())
+    finally:
+        conn.close()
+    monkeypatch.setenv(field, value)
+    assert json.loads(kt._handle_heartbeat({})).get("ok") is None
+    kt.heartbeat_current_worker_from_env()
+    conn = kb.connect()
+    try:
+        after = tuple(conn.execute(
+            "SELECT status, claim_lock, claim_expires, last_heartbeat_at, current_run_id "
+            "FROM tasks WHERE id=?", (worker_env,),
+        ).fetchone())
+    finally:
+        conn.close()
+    assert after == before
 
 
 def test_comment_happy_path(worker_env):

@@ -305,7 +305,7 @@ def triage_aux_status(config: Optional[dict]) -> Optional[dict]:
     # and can launch workers. Missing config must remain fail-closed.
     auto_decompose = False
     if isinstance(kanban_cfg, dict) and "auto_decompose" in kanban_cfg:
-        auto_decompose = bool(kanban_cfg.get("auto_decompose"))
+        auto_decompose = kanban_cfg.get("auto_decompose") is True
 
     return {
         "auto_decompose": auto_decompose,

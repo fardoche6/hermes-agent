@@ -572,9 +572,11 @@ dispatcher routes it to a reviewer without creating a child card. Reviewers
 must use `kanban_approve` or `kanban_request_changes` (or the equivalent CLI
 commands); `kanban_complete` is rejected for an active review run. Decisions
 are compare-and-set against the reviewer claim and run id, and request-changes
-always returns to the original implementation owner. Direct CLI/dashboard
-transitions are trusted-operator paths; worker tool calls must carry the
-dispatcher-issued profile, claim, and run credentials.
+always returns to the original implementation owner. Direct CLI transitions are trusted-operator paths. The dashboard can submit
+and request review changes through its task update surface, but it does not
+expose the independent reviewer approval API; use the CLI or reviewer tool
+for approval. Worker tool calls must carry the dispatcher-issued profile,
+claim, and run credentials.
 
 Flip between the two modes from the **Orchestration: Auto/Manual** pill at the top of the kanban page (emerald = Auto, muted gray = Manual), or by editing `config.yaml` directly. Both modes coexist with `hermes kanban specify` — that's still available as a single-task spec rewrite when you don't want fan-out.
 

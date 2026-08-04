@@ -665,6 +665,45 @@ def test_review_max_runtime_fails_over_to_alternate_reviewer(
         assert current.assignee == "reviewer-b"
         assert current.current_run_id is None
         assert "review_failover" in _events(conn, task_id)
+        closed = [r for r in kb.list_runs(conn, task_id) if r.outcome == "timed_out"]
+        assert len(closed) == 1
+        attempted = _payload(conn, task_id, "review_failover")["attempted"]
+        assert any(
+            item["profile"] == "code-reviewer" and item["error"] == closed[0].error
+            for item in attempted
+        )
+
+
+def test_review_crash_fails_over_with_closed_run_evidence(
+    kanban_home, monkeypatch,
+):
+    monkeypatch.setattr(
+        kb, "_reviewer_candidates",
+        lambda current: ([current, "reviewer-b"], []),
+    )
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        started_at = int(time.time()) - 120
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, started_at=? WHERE id=?",
+            (551000, started_at, task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at=? WHERE id=?",
+            (started_at, review.current_run_id),
+        )
+        conn.commit()
+        assert task_id in kb.detect_crashed_workers(conn)
+        current = kb.get_task(conn, task_id)
+        assert current is not None and current.assignee == "reviewer-b"
+        closed = [r for r in kb.list_runs(conn, task_id) if r.outcome == "crashed"]
+        assert len(closed) == 1
+        attempted = _payload(conn, task_id, "review_failover")["attempted"]
+        assert any(
+            item["profile"] == "code-reviewer" and item["error"] == closed[0].error
+            for item in attempted
+        )
 
 
 def test_review_max_runtime_blocks_after_same_reviewer_exhaustion(
@@ -692,6 +731,13 @@ def test_review_max_runtime_blocks_after_same_reviewer_exhaustion(
         assert current.status == "blocked"
         assert current.block_kind == "capability"
         assert current.assignee is None
+        closed = [r for r in kb.list_runs(conn, task_id) if r.outcome == "timed_out"]
+        assert len(closed) == 1
+        attempted = _payload(conn, task_id, "review_lanes_failed")["attempted"]
+        assert any(
+            item["profile"] == "code-reviewer" and item["error"] == closed[0].error
+            for item in attempted
+        )
 
 
 def test_review_heartbeat_stale_fails_over_to_alternate_reviewer(
@@ -722,3 +768,10 @@ def test_review_heartbeat_stale_fails_over_to_alternate_reviewer(
         assert current.status == "review"
         assert current.assignee == "reviewer-b"
         assert "review_failover" in _events(conn, task_id)
+        closed = [r for r in kb.list_runs(conn, task_id) if r.outcome == "stale"]
+        assert len(closed) == 1
+        attempted = _payload(conn, task_id, "review_failover")["attempted"]
+        assert any(
+            item["profile"] == "code-reviewer" and item["error"] == closed[0].error
+            for item in attempted
+        )

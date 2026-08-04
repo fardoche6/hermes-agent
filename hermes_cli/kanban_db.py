@@ -5426,7 +5426,7 @@ def release_stale_claims(
     """
     now = int(time.time())
     reclaimed = 0
-    review_reclaimed: list[str] = []
+    review_reclaimed: dict[str, str] = {}
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
         "SELECT id, status, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
@@ -5523,10 +5523,13 @@ def release_stale_claims(
             )
             if cur.rowcount != 1:
                 continue
+            terminal_error = _bounded_review_error(
+                f"stale_lock={row['claim_lock']}"
+            )
             run_id = _end_run(
                 conn, row["id"],
                 outcome="reclaimed", status="reclaimed",
-                error=f"stale_lock={row['claim_lock']}",
+                error=terminal_error,
                 metadata=termination,
             )
             payload = {
@@ -5552,12 +5555,12 @@ def release_stale_claims(
             )
             reclaimed += 1
             if row["status"] == "review":
-                review_reclaimed.append(row["id"])
-    for task_id in review_reclaimed:
+                review_reclaimed[row["id"]] = terminal_error
+    for task_id, terminal_error in review_reclaimed.items():
         _failover_review_after_recovery(
             conn,
             task_id,
-            error="stale reviewer claim reclaimed",
+            error=terminal_error,
         )
     return reclaimed
 
@@ -8358,7 +8361,7 @@ def detect_stale_running(
 
     now = int(time.time())
     reclaimed: list[str] = []
-    review_stale: list[str] = []
+    review_stale: dict[str, str] = {}
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, t.status, "
@@ -8427,14 +8430,17 @@ def detect_stale_running(
             }
             payload.update(termination)
 
-            run_id = _end_run(
-                conn, tid,
-                outcome="stale", status="stale",
-                error=(
+            terminal_error = _bounded_review_error(
+                (
                     f"no heartbeat for {int(hb_age)}s "
                     if hb_age is not None
                     else "no heartbeat ever"
-                ) + f" after {int(elapsed)}s running",
+                ) + f" after {int(elapsed)}s running"
+            )
+            run_id = _end_run(
+                conn, tid,
+                outcome="stale", status="stale",
+                error=terminal_error,
                 metadata=payload,
             )
             _append_event(
@@ -8442,7 +8448,7 @@ def detect_stale_running(
             )
             reclaimed.append(tid)
             if row["status"] == "review":
-                review_stale.append(tid)
+                review_stale[tid] = terminal_error
 
         # Intentionally NOT calling _record_task_failure here. Stale reclaim
         # is dispatcher-side detection of an absent heartbeat; the task is
@@ -8454,11 +8460,11 @@ def detect_stale_running(
         # right surface for "this happened" without conflating with the
         # spawn_failed / timed_out / crashed counters.
 
-    for task_id in review_stale:
+    for task_id, terminal_error in review_stale.items():
         _failover_review_after_recovery(
             conn,
             task_id,
-            error="stale reviewer heartbeat reclaimed",
+            error=terminal_error,
         )
     return reclaimed
 

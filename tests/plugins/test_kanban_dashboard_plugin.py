@@ -80,6 +80,15 @@ def test_board_empty(client):
     assert data["latest_event_id"] == 0
 
 
+@pytest.mark.parametrize("value", ["false", "true", 1])
+def test_orchestration_rejects_non_boolean_auto_decompose(client, value):
+    response = client.put(
+        "/api/plugins/kanban/orchestration",
+        json={"auto_decompose": value},
+    )
+    assert response.status_code == 422
+
+
 # ---------------------------------------------------------------------------
 # POST /tasks then GET /board sees it
 # ---------------------------------------------------------------------------
