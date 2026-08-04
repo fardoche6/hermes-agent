@@ -1034,8 +1034,14 @@ def test_kanban_review_handler_submits_same_card(monkeypatch, tmp_path):
 
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="review handler", assignee="programmer")
-        assert kb.claim_task(conn, task_id) is not None
+        implementation = kb.claim_task(
+            conn, task_id, claimer="test-host:implementation",
+        )
+        assert implementation is not None
     monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_PROFILE", "programmer")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", implementation.claim_lock)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(implementation.current_run_id))
     result = json.loads(kt._handle_submit_review({"reviewer": "code-reviewer"}))
     assert result == {
         "ok": True, "task_id": task_id, "status": "review",
@@ -1053,7 +1059,9 @@ def test_kanban_request_changes_handler_returns_to_programmer(monkeypatch, tmp_p
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="changes handler", assignee="programmer")
         assert kb.claim_task(conn, task_id) is not None
-        assert kb.submit_task_for_review(conn, task_id, "code-reviewer") is not None
+        assert kb.submit_task_for_review(
+            conn, task_id, "code-reviewer", trusted_operator=True,
+        ) is not None
         review = kb.claim_review_task(conn, task_id, claimer="test-host:review")
         assert review is not None
     monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
@@ -1091,7 +1099,9 @@ def test_kanban_approve_handler_closes_review_run_and_hands_off(
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="approval handler", assignee="programmer")
         assert kb.claim_task(conn, task_id, claimer="test-host:implementation")
-        assert kb.submit_task_for_review(conn, task_id, "code-reviewer") is not None
+        assert kb.submit_task_for_review(
+            conn, task_id, "code-reviewer", trusted_operator=True,
+        ) is not None
         review = kb.claim_review_task(conn, task_id, claimer="test-host:review")
         assert review is not None
 
@@ -1121,3 +1131,94 @@ def test_kanban_approve_handler_closes_review_run_and_hands_off(
             "SELECT outcome, ended_at FROM task_runs WHERE id=?",
             (review.current_run_id,),
         ).fetchone()["outcome"] == "approved"
+
+
+def test_complete_handler_rejects_claimed_review_without_mutation(
+    monkeypatch, tmp_path,
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import kanban_db as kb
+    import tools.kanban_tools as kt
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="review cannot complete", assignee="programmer")
+        assert kb.claim_task(conn, task_id, claimer="test-host:implementation")
+        assert kb.submit_task_for_review(
+            conn, task_id, "code-reviewer", trusted_operator=True,
+        ) is not None
+        review = kb.claim_review_task(conn, task_id, claimer="test-host:review")
+        assert review is not None
+        before_events = conn.execute(
+            "SELECT kind, run_id, payload FROM task_events WHERE task_id=? ORDER BY id",
+            (task_id,),
+        ).fetchall()
+        before_runs = conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs WHERE task_id=? ORDER BY id",
+            (task_id,),
+        ).fetchall()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_PROFILE", "code-reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", review.claim_lock)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    result = json.loads(kt._handle_complete({"summary": "reviewer bypass"}))
+    assert "error" in result
+    assert "kanban_approve" in result["error"]
+
+    with kb.connect() as conn:
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.status == "review"
+        assert current.current_run_id == review.current_run_id
+        assert current.claim_lock == review.claim_lock
+        assert conn.execute(
+            "SELECT kind, run_id, payload FROM task_events WHERE task_id=? ORDER BY id",
+            (task_id,),
+        ).fetchall() == before_events
+        assert conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs WHERE task_id=? ORDER BY id",
+            (task_id,),
+        ).fetchall() == before_runs
+
+
+def test_review_handler_rejects_reclaimed_implementation_credentials_atomically(
+    monkeypatch, tmp_path,
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from hermes_cli import kanban_db as kb
+    import tools.kanban_tools as kt
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="stale implementation submit", assignee="programmer")
+        run_a = kb.claim_task(conn, task_id, claimer="test-host:run-a")
+        assert run_a is not None
+        assert kb.reclaim_task(conn, task_id, reason="run-a reclaimed")
+        run_b = kb.claim_task(conn, task_id, claimer="test-host:run-b")
+        assert run_b is not None
+        before_events = conn.execute(
+            "SELECT kind, run_id, payload FROM task_events WHERE task_id=? ORDER BY id",
+            (task_id,),
+        ).fetchall()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_PROFILE", "programmer")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", run_a.claim_lock)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_a.current_run_id))
+    result = json.loads(kt._handle_submit_review({"reviewer": "code-reviewer"}))
+    assert "error" in result
+
+    with kb.connect() as conn:
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.status == "running"
+        assert current.assignee == "programmer"
+        assert current.claim_lock == run_b.claim_lock
+        assert current.current_run_id == run_b.current_run_id
+        assert conn.execute(
+            "SELECT kind, run_id, payload FROM task_events WHERE task_id=? ORDER BY id",
+            (task_id,),
+        ).fetchall() == before_events

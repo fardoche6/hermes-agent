@@ -94,7 +94,9 @@ def test_correction_recovery_after_crash_is_not_pr_guarded(
         task_id = kb.create_task(conn, title="coding card", assignee="programmer")
         assert kb.claim_task(conn, task_id, claimer=f"{host}:impl") is not None
         kb.add_comment(conn, task_id, "programmer", f"PR opened: {PR_URL}")
-        assert kb.submit_task_for_review(conn, task_id, "code-reviewer") is not None
+        assert kb.submit_task_for_review(
+            conn, task_id, "code-reviewer", trusted_operator=True,
+        ) is not None
         assert kb.claim_review_task(conn, task_id, claimer=f"{host}:review") is not None
         corrected = kb.request_changes(
             conn, task_id, "programmer",

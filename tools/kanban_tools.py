@@ -715,6 +715,11 @@ def _handle_complete(args: dict, **kw) -> str:
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
+            if task and task.status == "review":
+                return tool_error(
+                    "kanban_complete is prohibited for an active review run; "
+                    "use kanban_approve or kanban_request_changes"
+                )
             if task and task.goal_mode and _goal_judge_available():
                 verdict = "done"
                 reason = ""
@@ -886,7 +891,14 @@ def _handle_submit_review(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=args.get("board"))
         try:
-            task = kb.submit_task_for_review(conn, tid, reviewer)
+            task = kb.submit_task_for_review(
+                conn,
+                tid,
+                reviewer,
+                expected_assignee=os.environ.get("HERMES_PROFILE"),
+                expected_claim=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"),
+                expected_run_id=_worker_run_id(tid),
+            )
             if task is None:
                 return tool_error(f"could not submit {tid} for review")
             return _ok(task_id=tid, status=task.status, assignee=task.assignee)

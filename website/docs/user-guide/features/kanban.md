@@ -565,6 +565,17 @@ The kanban board has two ways to handle a task you drop into the Triage column:
 
 **Manual** — `kanban.auto_decompose: false`. Triage tasks stay in triage until you act. Click the **⚗ Decompose** button on a card, run `hermes kanban decompose <id>` (or `--all`), or use `/kanban decompose <id>` from a chat. This matches the pre-decomposer behavior of the board, useful when you want full control over what runs when.
 
+### Review handoffs and decisions
+
+Workers hand off the same card with a `review-required:` block directive. The
+dispatcher routes it to a reviewer without creating a child card. Reviewers
+must use `kanban_approve` or `kanban_request_changes` (or the equivalent CLI
+commands); `kanban_complete` is rejected for an active review run. Decisions
+are compare-and-set against the reviewer claim and run id, and request-changes
+always returns to the original implementation owner. Direct CLI/dashboard
+transitions are trusted-operator paths; worker tool calls must carry the
+dispatcher-issued profile, claim, and run credentials.
+
 Flip between the two modes from the **Orchestration: Auto/Manual** pill at the top of the kanban page (emerald = Auto, muted gray = Manual), or by editing `config.yaml` directly. Both modes coexist with `hermes kanban specify` — that's still available as a single-task spec rewrite when you don't want fan-out.
 
 The decomposer's routing decisions depend on profile descriptions, which is a per-profile labeling primitive you set with `hermes profile create --description "..."`, `hermes profile describe <name> --text "..."`, `hermes profile describe <name> --auto` (LLM-generates from the profile's installed skills + model), or the dashboard's per-profile editor in the expanded **Orchestration settings** panel. Profiles without a description still appear in the roster — they're routable by name, just less precisely. The decomposer NEVER lands a child task with `assignee=None`: when the LLM picks an unknown profile, the child gets routed to `kanban.default_assignee` (or the active default profile if that's unset).

@@ -57,13 +57,31 @@ def _review_card(conn, *, reviewer="code-reviewer", programmer="programmer"):
     task_id = kb.create_task(conn, title="review lifecycle", assignee=programmer)
     assert kb.claim_task(conn, task_id, claimer=f"{host}:implementation")
     kb.add_comment(conn, task_id, "programmer", f"PR opened: {PR_URL}")
-    assert kb.submit_task_for_review(conn, task_id, reviewer)
+    assert kb.submit_task_for_review(
+        conn, task_id, reviewer, trusted_operator=True,
+    )
     review = kb.claim_review_task(conn, task_id, claimer=f"{host}:review")
     assert review is not None
     assert review.status == "review"
     assert review.claim_lock == f"{host}:review"
     assert review.current_run_id is not None
     return task_id, review, host
+
+
+def _start_followup_review(conn, task_id: str, *, reviewer="code-reviewer", host):
+    """Start a second implementation/review run on the same card."""
+    implementation = kb.claim_task(
+        conn, task_id, claimer=f"{host}:implementation-followup",
+    )
+    assert implementation is not None
+    assert kb.submit_task_for_review(
+        conn, task_id, reviewer, trusted_operator=True,
+    ) is not None
+    review = kb.claim_review_task(
+        conn, task_id, claimer=f"{host}:review-followup",
+    )
+    assert review is not None
+    return review
 
 
 def test_claimed_reviewer_stays_in_review_column(kanban_home):
@@ -204,6 +222,27 @@ def test_request_changes_is_one_bundled_same_card_packet(kanban_home):
         assert kb.in_correction_lane(conn, task_id) is True
 
 
+def test_request_changes_rejects_programmer_not_from_submission_history(kanban_home):
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn, programmer="programmer")
+        with pytest.raises(RuntimeError, match="original implementation owner"):
+            kb.request_changes(
+                conn,
+                task_id,
+                "orchestrator",
+                reviewer="code-reviewer",
+                reason="reroute the work",
+                expected_claim=review.claim_lock,
+                expected_run_id=review.current_run_id,
+            )
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.status == "review"
+        assert current.assignee == "code-reviewer"
+        assert current.current_run_id == review.current_run_id
+        assert "changes_requested" not in _events(conn, task_id)
+
+
 def test_request_changes_rejects_unclaimed_or_nonreview_status(kanban_home):
     with kb.connect() as conn:
         task_id, review, _ = _review_card(conn)
@@ -333,6 +372,48 @@ def test_repeated_approval_is_idempotent(kanban_home):
         assert _events(conn, task_id).count("review_approved") == 1
 
 
+def test_old_approval_retry_is_rejected_after_identical_new_run_decision(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task_id, first, host = _review_card(conn)
+        first_run_id = first.current_run_id
+        assert first_run_id is not None
+        assert kb.approve_review(
+            conn,
+            task_id,
+            reviewer="code-reviewer",
+            summary="same decision",
+            head_sha=HEAD_SHA,
+            expected_claim=first.claim_lock,
+            expected_run_id=first_run_id,
+        ) is not None
+        second = _start_followup_review(conn, task_id, host=host)
+        assert second.current_run_id != first_run_id
+        assert kb.approve_review(
+            conn,
+            task_id,
+            reviewer="code-reviewer",
+            summary="same decision",
+            head_sha=HEAD_SHA,
+            expected_claim=second.claim_lock,
+            expected_run_id=second.current_run_id,
+        ) is not None
+        before = _events(conn, task_id)
+        with pytest.raises(RuntimeError, match="current review run|terminal"):
+            kb.approve_review(
+                conn,
+                task_id,
+                reviewer="code-reviewer",
+                summary="same decision",
+                head_sha=HEAD_SHA,
+                expected_claim=first.claim_lock,
+                expected_run_id=first_run_id,
+            )
+        assert _events(conn, task_id) == before
+        assert _events(conn, task_id).count("review_approved") == 2
+
+
 def test_repeated_request_changes_is_idempotent(kanban_home):
     with kb.connect() as conn:
         task_id, review, _ = _review_card(conn)
@@ -362,6 +443,49 @@ def test_repeated_request_changes_is_idempotent(kanban_home):
         assert retried.status == "ready"
         assert _events(conn, task_id) == before
         assert _events(conn, task_id).count("changes_requested") == 1
+
+
+def test_old_request_changes_retry_is_rejected_after_identical_new_run_decision(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task_id, first, host = _review_card(conn)
+        first_run_id = first.current_run_id
+        assert first_run_id is not None
+        reason = "same correction packet"
+        assert kb.request_changes(
+            conn,
+            task_id,
+            "programmer",
+            reviewer="code-reviewer",
+            reason=reason,
+            expected_claim=first.claim_lock,
+            expected_run_id=first_run_id,
+        ) is not None
+        second = _start_followup_review(conn, task_id, host=host)
+        assert second.current_run_id != first_run_id
+        assert kb.request_changes(
+            conn,
+            task_id,
+            "programmer",
+            reviewer="code-reviewer",
+            reason=reason,
+            expected_claim=second.claim_lock,
+            expected_run_id=second.current_run_id,
+        ) is not None
+        before = _events(conn, task_id)
+        with pytest.raises(RuntimeError, match="current review run|terminal"):
+            kb.request_changes(
+                conn,
+                task_id,
+                "programmer",
+                reviewer="code-reviewer",
+                reason=reason,
+                expected_claim=first.claim_lock,
+                expected_run_id=first_run_id,
+            )
+        assert _events(conn, task_id) == before
+        assert _events(conn, task_id).count("changes_requested") == 2
 
 
 def test_approval_leaves_no_dead_pid_for_crash_reaper(kanban_home, monkeypatch):
@@ -431,7 +555,9 @@ def test_approval_and_change_lanes_are_mutually_exclusive(kanban_home):
 
         host = kb._claimer_id().split(":", 1)[0]
         assert kb.claim_task(conn, task_id, claimer=f"{host}:implementation-2")
-        assert kb.submit_task_for_review(conn, task_id, "code-reviewer")
+        assert kb.submit_task_for_review(
+            conn, task_id, "code-reviewer", trusted_operator=True,
+        )
         second_review = kb.claim_review_task(
             conn, task_id, claimer=f"{host}:review-2",
         )
@@ -481,3 +607,131 @@ def test_cli_help_exposes_review_decisions(kanban_home):
     assert "request-changes" in choices
     assert hasattr(kanban, "_cmd_approve") or hasattr(kanban, "_cmd_review")
     assert hasattr(kanban, "_cmd_request_changes")
+
+
+def test_claimed_review_counts_against_global_concurrency_cap(
+    kanban_home, all_assignees_spawnable,
+):
+    with kb.connect() as conn:
+        _review_card(conn)
+        ready_id = kb.create_task(
+            conn, title="blocked by review cap", assignee="programmer",
+        )
+        spawned = []
+        result = kb.dispatch_once(
+            conn,
+            max_spawn=1,
+            spawn_fn=lambda task, workspace: spawned.append(task.id),
+        )
+        assert spawned == []
+        assert result.spawned == []
+        ready = kb.get_task(conn, ready_id)
+        assert ready is not None
+        assert ready.status == "ready"
+
+
+def test_claimed_review_counts_against_profile_concurrency_cap(
+    kanban_home, all_assignees_spawnable,
+):
+    with kb.connect() as conn:
+        _review_card(conn, reviewer="code-reviewer")
+        ready_id = kb.create_task(
+            conn, title="same reviewer profile", assignee="code-reviewer",
+        )
+        spawned = []
+        result = kb.dispatch_once(
+            conn,
+            max_spawn=5,
+            max_in_progress_per_profile=1,
+            spawn_fn=lambda task, workspace: spawned.append(task.id),
+        )
+        assert spawned == []
+        assert (ready_id, "code-reviewer", 1) in result.skipped_per_profile_capped
+
+
+def test_review_max_runtime_fails_over_to_alternate_reviewer(
+    kanban_home, monkeypatch,
+):
+    monkeypatch.setattr(
+        kb, "_reviewer_candidates",
+        lambda current: ([current, "reviewer-b"], []),
+    )
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        started_at = int(time.time()) - 120
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, max_runtime_seconds=?, started_at=? WHERE id=?",
+            (551001, 1, started_at, task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at=? WHERE id=?",
+            (started_at, review.current_run_id),
+        )
+        conn.commit()
+        assert task_id in kb.enforce_max_runtime(
+            conn, signal_fn=lambda _pid, _sig: None,
+        )
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.status == "review"
+        assert current.assignee == "reviewer-b"
+        assert current.current_run_id is None
+        assert "review_failover" in _events(conn, task_id)
+
+
+def test_review_max_runtime_blocks_after_same_reviewer_exhaustion(
+    kanban_home, monkeypatch,
+):
+    monkeypatch.setattr(
+        kb, "_reviewer_candidates", lambda current: ([current], []),
+    )
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        started_at = int(time.time()) - 120
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, max_runtime_seconds=?, started_at=? WHERE id=?",
+            (551002, 1, started_at, task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at=? WHERE id=?",
+            (started_at, review.current_run_id),
+        )
+        conn.commit()
+        kb.enforce_max_runtime(conn, signal_fn=lambda _pid, _sig: None)
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.status == "blocked"
+        assert current.block_kind == "capability"
+        assert current.assignee is None
+
+
+def test_review_heartbeat_stale_fails_over_to_alternate_reviewer(
+    kanban_home, monkeypatch,
+):
+    monkeypatch.setattr(
+        kb, "_reviewer_candidates",
+        lambda current: ([current, "reviewer-b"], []),
+    )
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        old = int(time.time()) - 7200
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, started_at=?, last_heartbeat_at=? WHERE id=?",
+            (551003, old, old, task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at=? WHERE id=?",
+            (old, review.current_run_id),
+        )
+        conn.commit()
+        assert task_id in kb.detect_stale_running(
+            conn, stale_timeout_seconds=1,
+        )
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.status == "review"
+        assert current.assignee == "reviewer-b"
+        assert "review_failover" in _events(conn, task_id)

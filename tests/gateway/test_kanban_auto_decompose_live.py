@@ -33,6 +33,27 @@ def test_disabled_when_flag_false():
     assert enabled is False
 
 
+@pytest.mark.parametrize(
+    "value",
+    [None, "false", "true", 0, 1],
+    ids=["none", "string-false", "string-true", "zero", "one"],
+)
+def test_auto_decompose_requires_literal_boolean_true(value):
+    enabled, _ = _resolve_auto_decompose_settings(
+        lambda: {"kanban": {"auto_decompose": value}}
+    )
+    assert enabled is False
+
+
+def test_auto_decompose_config_exception_fails_closed():
+    def broken_config():
+        raise RuntimeError("config unavailable")
+
+    enabled, per_tick = _resolve_auto_decompose_settings(broken_config)
+    assert enabled is False
+    assert per_tick == 3
+
+
 def test_enabled_only_when_flag_explicitly_true():
     enabled, per_tick = _resolve_auto_decompose_settings(
         lambda: {"kanban": {"auto_decompose": True}}
@@ -112,5 +133,21 @@ def test_block_loop_stays_on_canonical_card_when_auto_decompose_disabled(
         assert after_tasks == before_tasks
         assert after_links == before_links
         assert after_events == before_events
+
+
+def test_auto_decompose_rechecks_config_at_mutation_boundary():
+    reads = 0
+
+    def config_flip():
+        nonlocal reads
+        reads += 1
+        return {"kanban": {"auto_decompose": reads == 1}}
+
+    admitted, _ = _resolve_auto_decompose_settings(config_flip)
+    assert admitted is True
+    assert _auto_decompose_triage_tasks(
+        object(), 3, enabled=admitted, settings_loader=config_flip,
+    ) == 0
+    assert reads == 2
 
 

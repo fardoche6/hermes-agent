@@ -40,6 +40,25 @@ def worker_env(monkeypatch, tmp_path):
     return tid
 
 
+@pytest.fixture
+def review_env(worker_env):
+    """Convert the worker fixture's implementation run into a review run."""
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        assert kb.submit_task_for_review(
+            conn, worker_env, "code-reviewer", trusted_operator=True,
+        ) is not None
+        review = kb.claim_review_task(
+            conn, worker_env, claimer="test-host:review",
+        )
+        assert review is not None
+        return worker_env, review
+    finally:
+        conn.close()
+
+
 # ---------------------------------------------------------------------------
 # Positive tests — secrets are masked
 # ---------------------------------------------------------------------------
@@ -140,3 +159,99 @@ def test_kanban_complete_result_field_scrubbed(worker_env):
     assert run is not None
     stored = run.summary or run.result if hasattr(run, "result") else run.summary or ""
     assert secret not in (stored or "")
+
+
+@pytest.mark.parametrize("decision", ["approve", "request_changes"])
+def test_review_decision_persistence_scrubs_all_sensitive_text(review_env, decision):
+    from hermes_cli import kanban_db as kb
+
+    task_id, review = review_env
+    bearer = "Bearer " + "A" * 40
+    api_key = "sk-" + "B" * 48
+    credential_url = "https://review-user:review-password@example.com/review"
+    multiline = f"first line\nAuthorization: {bearer}\napi_key={api_key}\n{credential_url}"
+
+    with kb.connect() as conn:
+        if decision == "approve":
+            updated = kb.approve_review(
+                conn,
+                task_id,
+                reviewer="code-reviewer",
+                summary=multiline,
+                head_sha="855fd911d56e1c6185fda5995d8aff430d964191",
+                expected_claim=review.claim_lock,
+                expected_run_id=review.current_run_id,
+            )
+            event_kind = "review_approved"
+        else:
+            updated = kb.request_changes(
+                conn,
+                task_id,
+                "test-worker",
+                reviewer="code-reviewer",
+                reason=multiline,
+                expected_claim=review.claim_lock,
+                expected_run_id=review.current_run_id,
+            )
+            event_kind = "changes_requested"
+        assert updated is not None
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind=? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, event_kind),
+        ).fetchone()
+        run = conn.execute(
+            "SELECT summary, error, metadata FROM task_runs WHERE id=?",
+            (review.current_run_id,),
+        ).fetchone()
+        stored = " ".join([
+            event["payload"] or "",
+            run["summary"] or "",
+            run["error"] or "",
+            run["metadata"] or "",
+        ])
+        for secret in (bearer, api_key, credential_url):
+            assert secret not in stored
+        assert "first line" in stored
+
+
+def test_review_failover_persistence_scrubs_error_and_attempts(review_env):
+    from hermes_cli import kanban_db as kb
+
+    task_id, _review = review_env
+    bearer = "Bearer " + "C" * 40
+    api_key = "sk-" + "D" * 48
+    credential_url = "https://user:password@example.com/failover"
+    error = f"reviewer failed\nAuthorization: {bearer}\napi_key={api_key}\n{credential_url}"
+
+    with kb.connect() as conn:
+        failed = kb.failover_review_task(
+            conn,
+            task_id,
+            None,
+            error=error,
+            attempted=[{"profile": "code-reviewer", "error": error}],
+        )
+        assert failed is not None
+        event_rows = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? ORDER BY id",
+            (task_id,),
+        ).fetchall()
+        run_rows = conn.execute(
+            "SELECT error, metadata FROM task_runs WHERE task_id=? ORDER BY id",
+            (task_id,),
+        ).fetchall()
+        task_row = conn.execute(
+            "SELECT last_failure_error FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        stored = " ".join(
+            [
+                *(row["payload"] or "" for row in event_rows),
+                *(row["error"] or "" for row in run_rows),
+                *(row["metadata"] or "" for row in run_rows),
+                task_row["last_failure_error"] or "",
+            ]
+        )
+        for secret in (bearer, api_key, credential_url):
+            assert secret not in stored

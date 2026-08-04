@@ -89,6 +89,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
+from agent.redact import redact_sensitive_text
+
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
@@ -4468,6 +4470,28 @@ _FINALIZATION_SETTLED_KINDS = (
 _FULL_COMMIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 
 
+def _redact_review_text(value: object) -> str:
+    """Force-redact reviewer-controlled text before durable persistence."""
+    return redact_sensitive_text(
+        str(value or ""), force=True, redact_url_credentials=True,
+    )
+
+
+def _sanitize_review_attempts(
+    attempted: Optional[Iterable[Mapping[str, object]]],
+) -> list[dict[str, str]]:
+    """Keep failover diagnostics bounded and free of credential material."""
+    sanitized: list[dict[str, str]] = []
+    for item in attempted or []:
+        if not isinstance(item, Mapping):
+            continue
+        sanitized.append({
+            "profile": _redact_review_text(item.get("profile")),
+            "error": _redact_review_text(item.get("error")),
+        })
+    return sanitized
+
+
 def _latest_event_id(
     conn: sqlite3.Connection, task_id: str, kinds: tuple[str, ...],
 ) -> int:
@@ -4504,6 +4528,51 @@ def _latest_event_payload(
     except (TypeError, ValueError):
         payload = {}
     return int(row["id"]), payload if isinstance(payload, dict) else {}
+
+
+def _latest_event_record(
+    conn: sqlite3.Connection, task_id: str, kind: str,
+) -> tuple[int, Optional[int], dict[str, object]]:
+    """Return newest event id, run id, and payload for a decision event."""
+    row = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id = ? "
+        "AND kind = ? ORDER BY id DESC LIMIT 1",
+        (task_id, kind),
+    ).fetchone()
+    if not row:
+        return 0, None, {}
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except (TypeError, ValueError):
+        payload = {}
+    return (
+        int(row["id"]),
+        int(row["run_id"]) if row["run_id"] is not None else None,
+        payload if isinstance(payload, dict) else {},
+    )
+
+
+def _decision_retry_proves_terminal_run(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: Optional[int],
+    event_run_id: Optional[int],
+    outcome: str,
+) -> bool:
+    """Require a retry to prove the exact run that made the decision ended."""
+    if expected_run_id is None or event_run_id != int(expected_run_id):
+        return False
+    row = conn.execute(
+        "SELECT task_id, outcome, ended_at FROM task_runs WHERE id=?",
+        (int(expected_run_id),),
+    ).fetchone()
+    return bool(
+        row
+        and row["task_id"] == task_id
+        and row["outcome"] == outcome
+        and row["ended_at"] is not None
+    )
 
 
 def _latest_review_directive_id(conn: sqlite3.Connection, task_id: str) -> int:
@@ -4582,6 +4651,9 @@ def submit_task_for_review(
     expected_directive_id: Optional[int] = None,
     expected_assignee: Optional[str] = None,
     expected_status: Optional[str] = None,
+    expected_claim: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+    trusted_operator: bool = False,
 ) -> Optional[Task]:
     """Atomically hand an implementation run to a reviewer.
 
@@ -4594,6 +4666,15 @@ def submit_task_for_review(
     reviewer = _canonical_assignee(reviewer)
     if not reviewer:
         raise ValueError("reviewer is required")
+    expected_assignee = _canonical_assignee(expected_assignee)
+    expected_claim = (expected_claim or "").strip() or None
+    if expected_run_id is not None:
+        try:
+            expected_run_id = int(expected_run_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("expected_run_id must be a positive integer") from exc
+        if expected_run_id <= 0:
+            raise ValueError("expected_run_id must be a positive integer")
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, current_run_id, assignee "
@@ -4606,6 +4687,31 @@ def submit_task_for_review(
         if row["status"] not in {"running", "blocked", "ready"}:
             raise RuntimeError(
                 f"cannot submit {task_id} for review from status {row['status']!r}"
+            )
+        if row["status"] == "running" and not trusted_operator:
+            if not expected_assignee:
+                raise RuntimeError("expected_assignee is required")
+            if not expected_claim:
+                raise RuntimeError("expected_claim is required")
+            if expected_run_id is None:
+                raise RuntimeError("expected_run_id is required")
+            if row["assignee"] != expected_assignee:
+                raise RuntimeError(
+                    f"cannot submit {task_id}: active implementation profile "
+                    f"{row['assignee']!r} does not match {expected_assignee!r}"
+                )
+            if row["claim_lock"] != expected_claim:
+                raise RuntimeError(
+                    f"cannot submit {task_id}: implementation claim is stale"
+                )
+            if row["current_run_id"] != expected_run_id:
+                raise RuntimeError(
+                    f"cannot submit {task_id}: implementation run is stale"
+                )
+        if row["status"] in {"blocked", "ready"} and not trusted_operator:
+            raise RuntimeError(
+                f"cannot submit {task_id} from parked state without "
+                "trusted_operator=True"
             )
         if row["status"] in {"blocked", "ready"}:
             # Parked review handoff. ``blocked`` is the legacy shape;
@@ -4651,6 +4757,7 @@ def submit_task_for_review(
         if row["status"] == "running":
             old_run_id = _end_run(
                 conn, task_id, outcome="review_submitted", status="review",
+                expected_run_id=expected_run_id,
             )
             conn.execute(
                 "UPDATE tasks SET status='review', assignee=?, claim_lock=NULL, "
@@ -4709,7 +4816,7 @@ def request_changes(
         raise ValueError("programmer is required")
     if not reviewer_name and not trusted_operator:
         raise ValueError("reviewer is required")
-    reason = str(reason or "").strip()
+    reason = _redact_review_text(reason).strip()
     if not reason:
         raise ValueError("reason is required")
     expected_claim = (expected_claim or "").strip() or None
@@ -4729,12 +4836,19 @@ def request_changes(
             return None
 
         if row["status"] != "review":
-            decision_id, decision = _latest_event_payload(
+            decision_id, decision_run_id, decision = _latest_event_record(
                 conn, task_id, "changes_requested",
             )
             if (
                 decision_id
                 and in_correction_lane(conn, task_id)
+                and _decision_retry_proves_terminal_run(
+                    conn,
+                    task_id,
+                    expected_run_id=expected_run_id,
+                    event_run_id=decision_run_id,
+                    outcome="changes_requested",
+                )
                 and decision.get("programmer") == programmer
                 and decision.get("reason") == reason
                 and (
@@ -4744,7 +4858,8 @@ def request_changes(
             ):
                 return get_task(conn, task_id)
             raise RuntimeError(
-                f"cannot request changes for {task_id} from status {row['status']!r}"
+                f"cannot request changes for {task_id}: current review run is "
+                f"not active (status {row['status']!r}; terminal or stale)"
             )
 
         if trusted_operator and expected_run_id is None:
@@ -4792,6 +4907,20 @@ def request_changes(
                     f"{reviewer_name!r} does not own the current reviewer lane"
                 )
 
+        original_owner = _resolve_finalizer(
+            conn, task_id, reviewer=reviewer_name or "",
+        )
+        if not original_owner:
+            raise RuntimeError(
+                f"cannot request changes for {task_id}: no original "
+                "implementation owner could be resolved"
+            )
+        if programmer != original_owner:
+            raise RuntimeError(
+                f"cannot request changes for {task_id}: programmer must be "
+                f"the original implementation owner {original_owner!r}"
+            )
+
         predicates = ["id = ?", "status = 'review'"]
         params: list[object] = [task_id]
         if expected_run_id is not None:
@@ -4815,7 +4944,7 @@ def request_changes(
             conn, task_id, outcome="changes_requested", summary=reason,
             expected_run_id=expected_run_id,
         )
-        payload: dict[str, object] = {"programmer": programmer, "reason": reason}
+        payload: dict[str, object] = {"programmer": original_owner, "reason": reason}
         if reviewer_name:
             payload["reviewer"] = reviewer_name
         _append_event(
@@ -4883,6 +5012,7 @@ def approve_review(
     if not head_sha or not _FULL_COMMIT_SHA_RE.fullmatch(str(head_sha).strip()):
         raise ValueError("head_sha must be the full 40- or 64-character commit sha")
     head_sha = str(head_sha).strip().lower()
+    summary = _redact_review_text(summary).strip()
     if expected_run_id is not None:
         try:
             expected_run_id = int(expected_run_id)
@@ -4905,20 +5035,27 @@ def approve_review(
         # decision while it is still the current finalization lane; a later
         # review submission makes the old approval stale.
         if row["status"] != "review":
-            decision_id, decision = _latest_event_payload(
+            decision_id, decision_run_id, decision = _latest_event_record(
                 conn, task_id, "review_approved",
             )
             if (
                 decision_id
                 and in_finalization_lane(conn, task_id)
+                and _decision_retry_proves_terminal_run(
+                    conn,
+                    task_id,
+                    expected_run_id=expected_run_id,
+                    event_run_id=decision_run_id,
+                    outcome="approved",
+                )
                 and decision.get("reviewer") == reviewer_name
                 and decision.get("head_sha") == head_sha
                 and decision.get("summary") == summary
             ):
                 return get_task(conn, task_id)
             raise RuntimeError(
-                f"cannot approve {task_id} from status {row['status']!r}: "
-                "approval is only valid while the card is in 'review'"
+                f"cannot approve {task_id}: current review run is not active "
+                f"(status {row['status']!r}; terminal or stale)"
             )
 
         if trusted_operator and expected_run_id is None:
@@ -5013,7 +5150,7 @@ def approve_review(
 
 def _bounded_review_error(error: object) -> str:
     """Return a durable, bounded reviewer-lane error excerpt."""
-    text = " ".join(str(error or "reviewer failed").split())
+    text = " ".join(_redact_review_text(error or "reviewer failed").split())
     return text[:500]
 
 
@@ -5083,6 +5220,7 @@ def failover_review_task(
     """
     reviewer = _canonical_assignee(reviewer) if reviewer else None
     bounded = _bounded_review_error(error) if error else None
+    sanitized_attempted = _sanitize_review_attempts(attempted)
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, current_run_id FROM tasks WHERE id=?", (task_id,)
@@ -5091,7 +5229,7 @@ def failover_review_task(
             return None
         run_id = _end_run(
             conn, task_id, outcome="reviewer_failed", status="failed",
-            error=bounded, metadata={"attempted": attempted or []},
+            error=bounded, metadata={"attempted": sanitized_attempted},
         )
         if reviewer:
             conn.execute(
@@ -5101,15 +5239,19 @@ def failover_review_task(
             )
             _append_event(
                 conn, task_id, "review_failover",
-                {"reviewer": reviewer, "error": bounded, "attempted": attempted or []},
+                {
+                    "reviewer": reviewer,
+                    "error": bounded,
+                    "attempted": sanitized_attempted,
+                },
                 run_id=run_id,
             )
         else:
             reason = "all reviewer lanes failed"
-            if attempted:
+            if sanitized_attempted:
                 reason += ": " + "; ".join(
                     f"{item.get('profile', '?')}: {item.get('error', 'failed')}"
-                    for item in attempted
+                    for item in sanitized_attempted
                 )
             conn.execute(
                 "UPDATE tasks SET status='blocked', assignee=NULL, claim_lock=NULL, "
@@ -5119,10 +5261,42 @@ def failover_review_task(
             )
             _append_event(
                 conn, task_id, "review_lanes_failed",
-                {"reason": _bounded_review_error(reason), "attempted": attempted or []},
+                {
+                    "reason": _bounded_review_error(reason),
+                    "attempted": sanitized_attempted,
+                },
                 run_id=run_id,
             )
         return get_task(conn, task_id)
+
+
+def _failover_review_after_recovery(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    error: Optional[str],
+    attempted: Optional[Iterable[Mapping[str, object]]] = None,
+) -> Optional[Task]:
+    """Move recovery from a failed reviewer to one bounded alternate lane."""
+    task = get_task(conn, task_id)
+    if task is None or task.status != "review":
+        return task
+    candidates, preflight = _reviewer_candidates(task.assignee)
+    current = _canonical_assignee(task.assignee)
+    next_reviewer = next(
+        (candidate for candidate in candidates
+         if _canonical_assignee(candidate) != current),
+        None,
+    )
+    attempts = _sanitize_review_attempts(attempted)
+    attempts.extend(_sanitize_review_attempts(preflight))
+    return failover_review_task(
+        conn,
+        task_id,
+        next_reviewer,
+        error=error,
+        attempted=attempts,
+    )
 
 
 def heartbeat_claim(
@@ -5188,6 +5362,7 @@ def release_stale_claims(
     """
     now = int(time.time())
     reclaimed = 0
+    review_reclaimed: list[str] = []
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
         "SELECT id, status, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
@@ -5312,6 +5487,14 @@ def release_stale_claims(
                 run_id=run_id,
             )
             reclaimed += 1
+            if row["status"] == "review":
+                review_reclaimed.append(row["id"])
+    for task_id in review_reclaimed:
+        _failover_review_after_recovery(
+            conn,
+            task_id,
+            error="stale reviewer claim reclaimed",
+        )
     return reclaimed
 
 
@@ -5635,7 +5818,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'review', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked')
                 """,
                 (result, now, task_id),
             )
@@ -5652,7 +5835,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'review', 'ready', 'blocked')
+                   AND status IN ('running', 'ready', 'blocked')
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
@@ -7925,16 +8108,18 @@ def enforce_max_runtime(
     """
     import signal
     timed_out: list[str] = []
+    review_timeouts: dict[str, str] = {}
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
-        "       t.max_runtime_seconds, t.claim_lock "
+        "       t.max_runtime_seconds, t.claim_lock, t.status "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
+        "WHERE t.status IN ('running', 'review') "
+        "  AND t.max_runtime_seconds IS NOT NULL "
         "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
         "  AND t.worker_pid IS NOT NULL"
     ).fetchall()
@@ -7979,10 +8164,11 @@ def enforce_max_runtime(
 
         with write_txn(conn):
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = CASE WHEN status = 'review' "
+                "THEN 'review' ELSE 'ready' END, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running' "
+                "WHERE id = ? AND status IN ('running', 'review') "
                 "  AND worker_pid = ? AND claim_lock IS ?",
                 (tid, pid, row["claim_lock"]),
             )
@@ -8003,12 +8189,17 @@ def enforce_max_runtime(
                     conn, tid, "timed_out", payload, run_id=run_id,
                 )
                 timed_out.append(tid)
+                if row["status"] == "review":
+                    review_timeouts[tid] = (
+                        f"elapsed {int(elapsed)}s > limit "
+                        f"{int(row['max_runtime_seconds'])}s"
+                    )
         # Increment the unified failure counter. Outside the write_txn
         # above because ``_record_task_failure`` opens its own. If the
         # breaker trips, this flips the task ``ready → blocked`` and
         # emits a ``gave_up`` event on top of the ``timed_out`` we
         # already emitted.
-        if cur.rowcount == 1:
+        if cur.rowcount == 1 and row["status"] != "review":
             _record_task_failure(
                 conn, tid,
                 error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
@@ -8017,6 +8208,12 @@ def enforce_max_runtime(
                 end_run=False,
                 event_payload_extra={"pid": pid, "sigkill": killed},
             )
+    for task_id, error_text in review_timeouts.items():
+        _failover_review_after_recovery(
+            conn,
+            task_id,
+            error=error_text,
+        )
     return timed_out
 
 
@@ -8033,7 +8230,7 @@ def detect_stale_running(
     stale_timeout_seconds: int = 0,
     signal_fn=None,
 ) -> list[str]:
-    """Reclaim ``running`` tasks that show no progress (heartbeat) within the
+    """Reclaim ``running``/claimed ``review`` tasks that show no progress (heartbeat) within the
     staleness window.
 
     A task is considered stale when BOTH of these hold:
@@ -8044,12 +8241,13 @@ def detect_stale_running(
     2. Its ``last_heartbeat_at`` is older than
        ``_STALE_HEARTBEAT_GAP_SECONDS`` (or NULL — never sent a heartbeat).
 
-    On reclaim the task is reset to ``ready``, the run is closed with
-    ``outcome='stale'``, and the host-local worker (if still running) is
-    terminated.
+    On reclaim an implementation task is reset to ``ready``. A review task
+    stays in ``review`` long enough for bounded reviewer failover. The run is
+    closed with ``outcome='stale'`` and the host-local worker (if still
+    running) is terminated.
 
-    Only considers ``status='running'`` tasks. Blocked tasks are never
-    candidates.  Returns the list of reclaimed task IDs.
+    Only considers running tasks and claimed review tasks. Blocked tasks are
+    never candidates. Returns the list of reclaimed task IDs.
 
     ``stale_timeout_seconds=0`` disables the check entirely (returns ``[]``
     immediately).  ``signal_fn`` is a test hook; defaults to ``os.kill``
@@ -8061,13 +8259,15 @@ def detect_stale_running(
 
     now = int(time.time())
     reclaimed: list[str] = []
+    review_stale: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, t.status, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.status = 'running'"
+        "WHERE t.status IN ('running', 'review') "
+        "  AND t.claim_lock IS NOT NULL"
     ).fetchall()
 
     for row in rows:
@@ -8104,10 +8304,11 @@ def detect_stale_running(
 
         with write_txn(conn):
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = CASE WHEN status = 'review' "
+                "THEN 'review' ELSE 'ready' END, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running' "
+                "WHERE id = ? AND status IN ('running', 'review') "
                 "  AND claim_lock IS ?",
                 (tid, row["claim_lock"]),
             )
@@ -8141,6 +8342,8 @@ def detect_stale_running(
                 conn, tid, "stale", payload, run_id=run_id,
             )
             reclaimed.append(tid)
+            if row["status"] == "review":
+                review_stale.append(tid)
 
         # Intentionally NOT calling _record_task_failure here. Stale reclaim
         # is dispatcher-side detection of an absent heartbeat; the task is
@@ -8152,6 +8355,12 @@ def detect_stale_running(
         # right surface for "this happened" without conflating with the
         # spawn_failed / timed_out / crashed counters.
 
+    for task_id in review_stale:
+        _failover_review_after_recovery(
+            conn,
+            task_id,
+            error="stale reviewer heartbeat reclaimed",
+        )
     return reclaimed
 
 
@@ -8426,30 +8635,13 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     if row["status"] == "review":
                         review_crashes[row["id"]] = error_text
     # Reviewer process failures are transport/capability failures, not review
-    # decisions. Try each compatible reviewer lane exactly once while keeping
-    # the card in Review. If none remain, surface one bounded capability block.
+    # decisions. Try one compatible alternate lane; if none remain, surface
+    # one bounded capability block instead of retrying the same reviewer.
     for task_id, error_text in review_crashes.items():
-        current = get_task(conn, task_id)
-        if current is None:
-            continue
-        candidates, preflight = _reviewer_candidates(current.assignee)
-        candidates = [candidate for candidate in candidates if candidate != current.assignee]
-        attempted = [{
-            "profile": current.assignee or "",
-            "error": _bounded_review_error(error_text),
-        }]
-        attempted.extend(preflight)
-        next_reviewer = candidates[0] if candidates else None
-        # A synthetic/terminal assignee may have no profile lane at all. Keep
-        # legacy recovery in Review in that case; only a real capability
-        # preflight failure is terminal here.
-        if next_reviewer is None and not any(
-            "missing skill" in item.get("error", "") for item in preflight
-        ):
-            continue
-        failover_review_task(
-            conn, task_id, next_reviewer,
-            error=_bounded_review_error(error_text), attempted=attempted,
+        _failover_review_after_recovery(
+            conn,
+            task_id,
+            error=_bounded_review_error(error_text),
         )
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the task transitions ready → blocked with a ``gave_up`` event
@@ -8852,6 +9044,7 @@ def reconcile_review_handoffs(conn: sqlite3.Connection) -> list[str]:
                 expected_directive_id=directive_id,
                 expected_assignee=assignee,
                 expected_status=status,
+                trusted_operator=True,
             ) is not None:
                 moved.append(task_id)
         except Exception:
@@ -9257,7 +9450,8 @@ def _dispatch_once_locked(
     if max_spawn is not None:
         running_count = int(
             conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+                "SELECT COUNT(*) FROM tasks WHERE status = 'running' "
+                "OR (status = 'review' AND claim_lock IS NOT NULL)"
             ).fetchone()[0]
         )
 
@@ -9281,7 +9475,8 @@ def _dispatch_once_locked(
     # pile up and time out.
     if max_in_progress is not None and ready_rows:
         in_progress = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+            "SELECT COUNT(*) FROM tasks WHERE status = 'running' "
+            "OR (status = 'review' AND claim_lock IS NOT NULL)"
         ).fetchone()[0]
         if in_progress >= max_in_progress:
             return result
@@ -9306,7 +9501,8 @@ def _dispatch_once_locked(
     if _per_profile_cap is not None:
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
-            "WHERE status = 'running' AND assignee IS NOT NULL "
+            "WHERE (status = 'running' OR (status = 'review' AND claim_lock IS NOT NULL)) "
+            "AND assignee IS NOT NULL "
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
@@ -9543,8 +9739,19 @@ def _dispatch_once_locked(
             else:
                 result.skipped_nonspawnable.append(row["id"])
             continue
+        if _per_profile_cap is not None:
+            current = _per_profile_running.get(candidates[0], 0)
+            if current >= _per_profile_cap:
+                result.skipped_per_profile_capped.append(
+                    (row["id"], candidates[0], current)
+                )
+                continue
         if dry_run:
             result.spawned.append((row["id"], candidates[0], ""))
+            if _per_profile_cap is not None:
+                _per_profile_running[candidates[0]] = (
+                    _per_profile_running.get(candidates[0], 0) + 1
+                )
             continue
 
         attempted = list(preflight_failures)
@@ -9582,6 +9789,10 @@ def _dispatch_once_locked(
                     _set_worker_pid(conn, claimed.id, int(pid))
                 result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
                 spawned += 1
+                if _per_profile_cap is not None and claimed.assignee:
+                    _per_profile_running[claimed.assignee] = (
+                        _per_profile_running.get(claimed.assignee, 0) + 1
+                    )
                 spawned_review = True
                 break
             except Exception as exc:

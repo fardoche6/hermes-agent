@@ -50,7 +50,8 @@ def _resolve_auto_decompose_settings(
     # Auto-decomposition is destructive graph mutation, so an absent key must
     # be treated as disabled. Operators must opt in explicitly with
     # ``kanban.auto_decompose: true``.
-    enabled = bool(kcfg.get("auto_decompose", False))
+    # Destructive graph mutation requires the literal YAML boolean ``true``.
+    enabled = kcfg.get("auto_decompose") is True
     try:
         per_tick = int(kcfg.get("auto_decompose_per_tick", 3) or 3)
     except (TypeError, ValueError):
@@ -65,6 +66,7 @@ def _auto_decompose_triage_tasks(
     auto_decompose_per_tick: int,
     *,
     enabled: bool,
+    settings_loader: Optional[Callable[[], Any]] = None,
 ) -> int:
     """Decompose triage tasks only after an explicit opt-in.
 
@@ -74,8 +76,13 @@ def _auto_decompose_triage_tasks(
     boundary as well as at the watcher call site so a future caller cannot
     accidentally turn a block loop into fan-out.
     """
-    if not enabled:
+    if enabled is not True:
         return 0
+    # Re-read at the mutation boundary; a config flip must fail closed.
+    if settings_loader is not None:
+        current_enabled, _ = _resolve_auto_decompose_settings(settings_loader)
+        if current_enabled is not True:
+            return 0
 
     try:
         from hermes_cli import kanban_decompose as decomposer
@@ -1447,6 +1454,7 @@ class GatewayKanbanWatchersMixin:
                 _kb,
                 auto_decompose_per_tick,
                 enabled=enabled,
+                settings_loader=_load_config,
             )
 
         logger.info(
