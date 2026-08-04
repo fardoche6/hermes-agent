@@ -4469,6 +4469,12 @@ _FINALIZATION_SETTLED_KINDS = (
 
 _FULL_COMMIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$")
 
+# A claimed reviewer is normally kept in the ``review`` column, but the
+# dispatcher may expose the same active run as ``running``.  The run/claim and
+# reviewer-lane checks remain the authority; this status set only avoids
+# rejecting that legitimate in-flight representation.
+_ACTIVE_REVIEW_TASK_STATUSES = frozenset(("review", "running"))
+
 
 def _redact_review_text(value: object) -> str:
     """Force-redact reviewer-controlled text before durable persistence."""
@@ -4864,7 +4870,7 @@ def request_changes(
         if not row:
             return None
 
-        if row["status"] != "review":
+        if row["status"] not in _ACTIVE_REVIEW_TASK_STATUSES:
             decision_id, decision_run_id, decision = _latest_event_record(
                 conn, task_id, "changes_requested",
             )
@@ -4953,7 +4959,7 @@ def request_changes(
                 f"the original implementation owner {original_owner!r}"
             )
 
-        predicates = ["id = ?", "status = 'review'"]
+        predicates = ["id = ?", "status IN ('review', 'running')"]
         params: list[object] = [task_id]
         if expected_run_id is not None:
             predicates.append("current_run_id = ?")
@@ -5066,7 +5072,7 @@ def approve_review(
         # after the transition already committed.  Accept only the identical
         # decision while it is still the current finalization lane; a later
         # review submission makes the old approval stale.
-        if row["status"] != "review":
+        if row["status"] not in _ACTIVE_REVIEW_TASK_STATUSES:
             decision_id, decision_run_id, decision = _latest_event_record(
                 conn, task_id, "review_approved",
             )
@@ -5144,7 +5150,9 @@ def approve_review(
                 f"cannot approve {task_id}: reviewer cannot be its own finalizer"
             )
 
-        predicates = ["id = ?", "status = 'review'", "current_run_id = ?"]
+        predicates = [
+            "id = ?", "status IN ('review', 'running')", "current_run_id = ?",
+        ]
         params: list[object] = [task_id, expected_run_id]
         if not trusted_operator:
             predicates.append("claim_lock = ?")

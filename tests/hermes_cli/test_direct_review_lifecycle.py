@@ -94,6 +94,96 @@ def test_claimed_reviewer_stays_in_review_column(kanban_home):
         assert current.assignee == "code-reviewer"
 
 
+def test_running_reviewer_can_request_changes_exactly_once(kanban_home):
+    """A claimed reviewer run may be ``running`` while deciding."""
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
+        conn.commit()
+
+        corrected = kb.request_changes(
+            conn,
+            task_id,
+            "programmer",
+            reviewer="code-reviewer",
+            reason="tighten error handling",
+            expected_claim=review.claim_lock,
+            expected_run_id=review.current_run_id,
+        )
+        assert corrected is not None
+        assert corrected.status == "ready"
+        assert corrected.assignee == "programmer"
+        assert conn.execute(
+            "SELECT COUNT(*) AS count FROM task_events "
+            "WHERE task_id=? AND kind='changes_requested'",
+            (task_id,),
+        ).fetchone()["count"] == 1
+
+        retried = kb.request_changes(
+            conn,
+            task_id,
+            "programmer",
+            reviewer="code-reviewer",
+            reason="tighten error handling",
+            expected_claim=review.claim_lock,
+            expected_run_id=review.current_run_id,
+        )
+        assert retried is not None
+        assert retried.status == "ready"
+        assert conn.execute(
+            "SELECT COUNT(*) AS count FROM task_events "
+            "WHERE task_id=? AND kind='changes_requested'",
+            (task_id,),
+        ).fetchone()["count"] == 1
+
+
+def test_running_reviewer_can_approve_exact_head(kanban_home):
+    """Approve uses the same active reviewer predicate as request-changes."""
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
+        conn.commit()
+
+        approved = kb.approve_review(
+            conn,
+            task_id,
+            reviewer="code-reviewer",
+            summary="focused proof is green",
+            head_sha=HEAD_SHA,
+            expected_claim=review.claim_lock,
+            expected_run_id=review.current_run_id,
+        )
+        assert approved is not None
+        assert approved.status == "ready"
+        assert approved.assignee == "programmer"
+
+
+def test_running_reviewer_rejects_wrong_claim_without_mutation(kanban_home):
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
+        conn.commit()
+        before_events = _events(conn, task_id)
+
+        with pytest.raises(RuntimeError, match="no longer holds"):
+            kb.request_changes(
+                conn,
+                task_id,
+                "programmer",
+                reviewer="code-reviewer",
+                reason="wrong credential",
+                expected_claim="wrong-claim",
+                expected_run_id=review.current_run_id,
+            )
+
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.status == "running"
+        assert current.current_run_id == review.current_run_id
+        assert current.claim_lock == review.claim_lock
+        assert _events(conn, task_id) == before_events
+
+
 def test_approve_records_exact_head_and_routes_same_card_to_finalizer(kanban_home):
     with kb.connect() as conn:
         task_id, review, host = _review_card(conn)
