@@ -184,6 +184,93 @@ def test_running_reviewer_rejects_wrong_claim_without_mutation(kanban_home):
         assert _events(conn, task_id) == before_events
 
 
+def test_trusted_request_changes_rejects_successor_programmer_run(kanban_home):
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        assert kb.request_changes(
+            conn, task_id, "programmer", reason="first decision",
+            trusted_operator=True,
+        ) is not None
+        correction = kb.claim_task(conn, task_id, claimer="host:programmer")
+        assert correction is not None
+        before_events = _events(conn, task_id)
+        before_run = conn.execute(
+            "SELECT status, outcome, ended_at FROM task_runs WHERE id=?",
+            (correction.current_run_id,),
+        ).fetchone()
+
+        with pytest.raises(RuntimeError, match="reviewer generation"):
+            kb.request_changes(
+                conn, task_id, "programmer", reason="duplicate decision",
+                trusted_operator=True,
+            )
+
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.status == "running"
+        assert current.current_run_id == correction.current_run_id
+        assert _events(conn, task_id) == before_events
+        assert conn.execute(
+            "SELECT status, outcome, ended_at FROM task_runs WHERE id=?",
+            (correction.current_run_id,),
+        ).fetchone() == before_run
+
+
+def test_trusted_approve_rejects_successor_programmer_run(kanban_home):
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        assert kb.approve_review(
+            conn, task_id, reviewer="code-reviewer", summary="first approval",
+            head_sha=HEAD_SHA, trusted_operator=True,
+        ) is not None
+        finalizer = kb.claim_task(conn, task_id, claimer="host:programmer")
+        assert finalizer is not None
+        before_events = _events(conn, task_id)
+        before_run = conn.execute(
+            "SELECT status, outcome, ended_at FROM task_runs WHERE id=?",
+            (finalizer.current_run_id,),
+        ).fetchone()
+
+        with pytest.raises(RuntimeError, match="reviewer generation"):
+            kb.approve_review(
+                conn, task_id, reviewer="code-reviewer", summary="duplicate approval",
+                head_sha=HEAD_SHA, trusted_operator=True,
+            )
+
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.status == "running"
+        assert current.current_run_id == finalizer.current_run_id
+        assert _events(conn, task_id) == before_events
+        assert conn.execute(
+            "SELECT status, outcome, ended_at FROM task_runs WHERE id=?",
+            (finalizer.current_run_id,),
+        ).fetchone() == before_run
+
+
+def test_running_reviewer_rejects_expired_claim_without_mutation(kanban_home):
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        conn.execute(
+            "UPDATE tasks SET claim_expires=? WHERE id=?",
+            (int(time.time()) - 1, task_id),
+        )
+        conn.commit()
+        before_events = _events(conn, task_id)
+
+        with pytest.raises(RuntimeError, match="reviewer generation"):
+            kb.request_changes(
+                conn, task_id, "programmer", reviewer="code-reviewer",
+                reason="expired", expected_claim=review.claim_lock,
+                expected_run_id=review.current_run_id,
+            )
+
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.current_run_id == review.current_run_id
+        assert _events(conn, task_id) == before_events
+
+
 def test_approve_records_exact_head_and_routes_same_card_to_finalizer(kanban_home):
     with kb.connect() as conn:
         task_id, review, host = _review_card(conn)

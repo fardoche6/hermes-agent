@@ -4614,6 +4614,90 @@ def _decision_retry_proves_terminal_run(
     )
 
 
+def _active_review_generation(
+    conn: sqlite3.Connection,
+    task_id: str,
+    task_row: sqlite3.Row,
+    *,
+    reviewer: Optional[str],
+) -> str:
+    """Prove the current task/run is the unsettled reviewer generation.
+
+    ``running`` is shared by implementation and reviewer workers.  The task
+    status alone therefore cannot authorize a review decision, especially for
+    trusted operators.  The current run must still be a live reviewer run,
+    match the card's reviewer assignee/claim, and have the latest review claim
+    event with no later decision event.
+    """
+    run_id = task_row["current_run_id"]
+    run = conn.execute(
+        "SELECT task_id, profile, status, claim_lock, claim_expires, ended_at "
+        "FROM task_runs WHERE id=?",
+        (run_id,),
+    ).fetchone()
+    now = int(time.time())
+    if (
+        not run
+        or run["task_id"] != task_id
+        or run["status"] != "running"
+        or run["ended_at"] is not None
+        or not run["profile"]
+        or not run["claim_lock"]
+        or (
+            run["claim_expires"] is not None
+            and int(run["claim_expires"]) <= now
+        )
+        or (
+            task_row["claim_expires"] is not None
+            and int(task_row["claim_expires"]) <= now
+        )
+        or task_row["claim_lock"] != run["claim_lock"]
+        or task_row["assignee"] != run["profile"]
+        or (reviewer is not None and reviewer != _canonical_assignee(run["profile"]))
+    ):
+        raise RuntimeError(
+            f"cannot decide review for {task_id}: current reviewer generation "
+            "is no longer active"
+        )
+
+    claim_event = conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id=? AND run_id=? "
+        "AND kind='claimed' ORDER BY id DESC LIMIT 1",
+        (task_id, run_id),
+    ).fetchone()
+    latest_claim = conn.execute(
+        "SELECT id, run_id FROM task_events WHERE task_id=? AND kind='claimed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    try:
+        claim_payload = json.loads(claim_event["payload"]) if claim_event else {}
+    except (TypeError, ValueError):
+        claim_payload = {}
+    if (
+        not claim_event
+        or not isinstance(claim_payload, dict)
+        or claim_payload.get("source_status") != "review"
+        or not latest_claim
+        or int(latest_claim["id"]) != int(claim_event["id"])
+    ):
+        raise RuntimeError(
+            f"cannot decide review for {task_id}: current reviewer generation "
+            "has a successor or is not the active review claim"
+        )
+    later_decision = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id=? AND id>? "
+        "AND kind IN ('changes_requested', 'review_approved') LIMIT 1",
+        (task_id, claim_event["id"]),
+    ).fetchone()
+    if later_decision:
+        raise RuntimeError(
+            f"cannot decide review for {task_id}: current reviewer generation "
+            "already has a decision"
+        )
+    return _canonical_assignee(run["profile"]) or ""
+
+
 def _latest_review_directive_id(conn: sqlite3.Connection, task_id: str) -> int:
     """Return the id of the newest un-consumed ``review-required:`` directive.
 
@@ -4864,7 +4948,7 @@ def request_changes(
             raise ValueError("expected_run_id must be a positive integer")
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee, current_run_id "
+            "SELECT status, claim_lock, claim_expires, assignee, current_run_id "
             "FROM tasks WHERE id=?", (task_id,),
         ).fetchone()
         if not row:
@@ -4899,6 +4983,12 @@ def request_changes(
 
         if trusted_operator and expected_run_id is None:
             expected_run_id = row["current_run_id"]
+        if trusted_operator and row["status"] in _ACTIVE_REVIEW_TASK_STATUSES:
+            active_reviewer = _active_review_generation(
+                conn, task_id, row, reviewer=reviewer_name or None,
+            )
+            if trusted_operator and not reviewer_name:
+                reviewer_name = active_reviewer
         if expected_run_id is None and not trusted_operator:
             raise RuntimeError("expected_run_id is required")
         if (
@@ -4944,6 +5034,11 @@ def request_changes(
                     f"cannot request changes for {task_id}: caller "
                     f"{reviewer_name!r} does not own the current reviewer lane"
                 )
+
+        if not trusted_operator and row["status"] in _ACTIVE_REVIEW_TASK_STATUSES:
+            _active_review_generation(
+                conn, task_id, row, reviewer=reviewer_name,
+            )
 
         original_owner = _resolve_finalizer(
             conn, task_id, reviewer=reviewer_name or "",
@@ -5061,7 +5156,7 @@ def approve_review(
 
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee, current_run_id "
+            "SELECT status, claim_lock, claim_expires, assignee, current_run_id "
             "FROM tasks WHERE id=?",
             (task_id,),
         ).fetchone()
@@ -5135,6 +5230,11 @@ def approve_review(
             raise RuntimeError(
                 f"cannot approve {task_id}: caller {reviewer_name!r} does not "
                 "own the current reviewer lane"
+            )
+
+        if row["status"] in _ACTIVE_REVIEW_TASK_STATUSES:
+            _active_review_generation(
+                conn, task_id, row, reviewer=reviewer_name,
             )
 
         finalizer_name = _resolve_finalizer(
