@@ -154,22 +154,9 @@ def _worker_run_id(task_id: str) -> Optional[int]:
 def _worker_heartbeat_credentials(task_id: str) -> tuple[Optional[str], Optional[int], Optional[str], Optional[str]]:
     """Return worker heartbeat credentials, or an error for malformed env.
 
-    A dispatcher worker is identified by the presence of the task env var.
     Its task, profile, claim, and positive run id are all credentials and
     must come from that environment; never recover any of them from SQLite.
-    The operator CLI (with no worker task env var) retains its existing
-    convenience fallbacks.
     """
-    worker_mode = any(
-        os.environ.get(name)
-        for name in (
-            "HERMES_KANBAN_TASK",
-            "HERMES_KANBAN_RUN_ID",
-            "HERMES_KANBAN_CLAIM_LOCK",
-        )
-    )
-    if not worker_mode:
-        return None, None, None, None
     env_task = os.environ.get("HERMES_KANBAN_TASK")
     profile = os.environ.get("HERMES_PROFILE")
     claim = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
@@ -1051,7 +1038,7 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     delegated_err = _reject_delegated_child_mutation("kanban_heartbeat")
     if delegated_err:
         return delegated_err
-    tid = _default_task_id(args.get("task_id"))
+    tid = args.get("task_id") or os.environ.get("HERMES_KANBAN_TASK")
     if not tid:
         return tool_error(
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
@@ -1067,15 +1054,6 @@ def _handle_heartbeat(args: dict, **kw) -> str:
             profile, run_id, claim_lock, auth_err = _worker_heartbeat_credentials(tid)
             if auth_err:
                 return auth_err
-            if "HERMES_KANBAN_TASK" not in os.environ:
-                claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or kb._claimer_id()
-                run_id = _worker_run_id(tid)
-            if run_id is None:
-                row = conn.execute(
-                    "SELECT current_run_id FROM tasks WHERE id=?", (tid,),
-                ).fetchone()
-                run_id = int(row["current_run_id"]) if row and row["current_run_id"] else None
-
             ok = kb.heartbeat_worker(
                 conn,
                 tid,

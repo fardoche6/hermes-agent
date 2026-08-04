@@ -420,6 +420,40 @@ def test_worker_heartbeat_invalid_credentials_is_zero_mutation(
     assert after == before
 
 
+def test_heartbeat_explicit_task_without_worker_tuple_is_zero_mutation(
+    worker_env, monkeypatch,
+):
+    """The model-facing heartbeat must not recover operator credentials."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
+    monkeypatch.delenv("HERMES_KANBAN_CLAIM_LOCK")
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+
+    def serialized_state():
+        conn = kb.connect()
+        try:
+            return tuple(
+                tuple(row)
+                for table in ("tasks", "task_runs", "task_events")
+                for row in conn.execute(
+                    f"SELECT * FROM {table} ORDER BY rowid"
+                ).fetchall()
+            )
+        finally:
+            conn.close()
+
+    before = serialized_state()
+    result = json.loads(kt._handle_heartbeat({"task_id": worker_env}))
+    after = serialized_state()
+
+    assert result.get("ok") is None
+    assert "worker heartbeat requires" in result["error"]
+    assert after == before
+
+
 def test_comment_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_comment({

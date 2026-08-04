@@ -397,13 +397,10 @@ hermes dashboard        # 导航栏中出现 "Kanban" 标签页，位于 "Skills
 
 ### Review 交接与决定
 
-Worker 只能通过带有精确任务、profile、claim 和 run 凭据的工具调用提交或决定 review；过期 worker 凭据必须被拒绝且不得改变状态。经过认证的 CLI 和 dashboard 是显式的 trusted-operator 边界，可以提交、批准或请求修改；reviewer 不能直接完成任务，必须使用 approve 或 request-changes。CLI 语法为 `hermes kanban approve <id> <reviewer> <head_sha> "<summary>"`，位置顺序与解析器一致。
-
 Worker 使用 `review-required:` block 指令在同一张卡上请求独立审查；调度器会把它路由给 reviewer，不会创建子卡。Reviewer 必须使用
 `kanban_approve` 或 `kanban_request_changes`（或等价 CLI 命令）；活动 review run
 不能调用 `kanban_complete`。决定会以 reviewer claim 和 run id 做原子校验，request-changes
-始终返回给原始实现负责人。CLI/仪表盘路径属于受信任操作员路径；worker 工具调用必须携带
-调度器签发的 profile、claim 和 run 凭据。
+始终返回给原始实现负责人。CLI 的直接转换属于受信任操作员路径，并支持提交、批准或请求修改；仪表盘可通过任务更新界面提交 review 和请求修改，但不提供独立的 reviewer 批准 API。需要批准时使用 CLI 或 reviewer 工具。Worker 工具调用必须携带调度器签发的 profile、claim 和 run 凭据。
 
 从 kanban 页面顶部的 **Orchestration: Auto/Manual** 切换按钮（翠绿色 = 自动，静音灰色 = 手动）在两种模式之间切换，或直接编辑 `config.yaml`。两种模式都与 `hermes kanban specify` 共存 —— 当你不想扇出时，它仍然可用作单任务规格重写。
 
