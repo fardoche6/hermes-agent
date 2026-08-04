@@ -47,7 +47,10 @@ def _resolve_auto_decompose_settings(
     except Exception:
         return False, 3
     kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-    enabled = bool(kcfg.get("auto_decompose", True))
+    # Auto-decomposition is destructive graph mutation, so an absent key must
+    # be treated as disabled. Operators must opt in explicitly with
+    # ``kanban.auto_decompose: true``.
+    enabled = bool(kcfg.get("auto_decompose", False))
     try:
         per_tick = int(kcfg.get("auto_decompose_per_tick", 3) or 3)
     except (TypeError, ValueError):
@@ -55,6 +58,101 @@ def _resolve_auto_decompose_settings(
     if per_tick < 1:
         per_tick = 1
     return enabled, per_tick
+
+
+def _auto_decompose_triage_tasks(
+    kanban_db: Any,
+    auto_decompose_per_tick: int,
+    *,
+    enabled: bool,
+) -> int:
+    """Decompose triage tasks only after an explicit opt-in.
+
+    ``block_task`` deliberately routes a recurrence-limit card to ``triage``
+    and records ``block_loop_detected``. That event is recovery evidence, not
+    authorization to mutate the task graph. Keep the guard at the mutation
+    boundary as well as at the watcher call site so a future caller cannot
+    accidentally turn a block loop into fan-out.
+    """
+    if not enabled:
+        return 0
+
+    try:
+        from hermes_cli import kanban_decompose as decomposer
+    except Exception as exc:  # pragma: no cover
+        logger.warning("kanban auto-decompose: import failed (%s); skipping", exc)
+        return 0
+
+    try:
+        boards = kanban_db.list_boards(include_archived=False)
+    except Exception:
+        boards = [kanban_db.read_board_metadata(kanban_db.DEFAULT_BOARD)]
+
+    attempted = 0
+    successes = 0
+    for board_metadata in boards:
+        slug = board_metadata.get("slug") or kanban_db.DEFAULT_BOARD
+        if attempted >= auto_decompose_per_tick:
+            break
+
+        # The decomposer module resolves its board from this environment
+        # variable. Restore it even when the LLM/decomposer raises.
+        previous_board = os.environ.get("HERMES_KANBAN_BOARD")
+        try:
+            os.environ["HERMES_KANBAN_BOARD"] = slug
+            try:
+                triage_ids = decomposer.list_triage_ids()
+            except Exception as exc:
+                logger.debug(
+                    "kanban auto-decompose: list_triage_ids failed on board %s (%s)",
+                    slug,
+                    exc,
+                )
+                triage_ids = []
+
+            for task_id in triage_ids:
+                if attempted >= auto_decompose_per_tick:
+                    break
+                attempted += 1
+                try:
+                    outcome = decomposer.decompose_task(
+                        task_id,
+                        author="auto-decomposer",
+                    )
+                except Exception:
+                    logger.exception(
+                        "kanban auto-decompose: decompose_task crashed on %s",
+                        task_id,
+                    )
+                    continue
+                if outcome.ok:
+                    successes += 1
+                    if outcome.fanout and outcome.child_ids:
+                        logger.info(
+                            "kanban auto-decompose [%s]: %s → %d children",
+                            slug,
+                            task_id,
+                            len(outcome.child_ids),
+                        )
+                    else:
+                        logger.info(
+                            "kanban auto-decompose [%s]: %s → single task (no fanout)",
+                            slug,
+                            task_id,
+                        )
+                else:
+                    logger.debug(
+                        "kanban auto-decompose [%s]: %s skipped: %s",
+                        slug,
+                        task_id,
+                        outcome.reason,
+                    )
+        finally:
+            if previous_board is None:
+                os.environ.pop("HERMES_KANBAN_BOARD", None)
+            else:
+                os.environ["HERMES_KANBAN_BOARD"] = previous_board
+    return successes
 
 
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
@@ -968,9 +1066,9 @@ class GatewayKanbanWatchersMixin:
         in-flight ``to_thread`` returns on its own after the current
         ``dispatch_once`` call finishes (typically <1ms on an idle board).
         """
-        # Read config once at boot. If the user flips the flag later, they
-        # restart the gateway; same pattern as every other background
-        # watcher here. Honours HERMES_KANBAN_DISPATCH_IN_GATEWAY env var
+        # Read the dispatcher gate once at boot; the auto-decompose gate below
+        # is intentionally re-read every tick. Honours
+        # HERMES_KANBAN_DISPATCH_IN_GATEWAY env var
         # as an escape hatch (false-y value disables without editing YAML).
         try:
             from hermes_cli.config import load_config as _load_config
@@ -1323,7 +1421,7 @@ class GatewayKanbanWatchersMixin:
 
         # Auto-decompose: turn fresh triage tasks into ready workgraphs
         # before the dispatcher fans out workers. Gated by
-        # ``kanban.auto_decompose`` (default True). Capped by
+        # ``kanban.auto_decompose`` (default False). Capped by
         # ``kanban.auto_decompose_per_tick`` (default 3) so a bulk-load
         # of triage tasks doesn't burst-spend the aux LLM in one tick;
         # remainder defers to subsequent ticks.
@@ -1340,82 +1438,16 @@ class GatewayKanbanWatchersMixin:
             """Re-resolve (enabled, per_tick) from current config each tick."""
             return _resolve_auto_decompose_settings(_load_config)
 
-        def _auto_decompose_tick(auto_decompose_per_tick: int) -> int:
-            """Run the auto-decomposer for up to N triage tasks across all
-            boards. Returns the number of triage tasks that were
-            successfully decomposed or specified this tick.
-            """
-            try:
-                from hermes_cli import kanban_decompose as _decomp
-            except Exception as exc:  # pragma: no cover
-                logger.warning(
-                    "kanban auto-decompose: import failed (%s); skipping", exc,
-                )
-                return 0
-            try:
-                boards = _kb.list_boards(include_archived=False)
-            except Exception:
-                boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
-            attempted = 0
-            successes = 0
-            for b in boards:
-                slug = b.get("slug") or _kb.DEFAULT_BOARD
-                if attempted >= auto_decompose_per_tick:
-                    break
-                # Pin this board for the duration of the call — same
-                # pattern as the dashboard specify endpoint. The
-                # decomposer module connects with no board kwarg and
-                # relies on the env var.
-                prev_env = os.environ.get("HERMES_KANBAN_BOARD")
-                try:
-                    os.environ["HERMES_KANBAN_BOARD"] = slug
-                    try:
-                        triage_ids = _decomp.list_triage_ids()
-                    except Exception as exc:
-                        logger.debug(
-                            "kanban auto-decompose: list_triage_ids failed on board %s (%s)",
-                            slug, exc,
-                        )
-                        triage_ids = []
-                    for tid in triage_ids:
-                        if attempted >= auto_decompose_per_tick:
-                            break
-                        attempted += 1
-                        try:
-                            outcome = _decomp.decompose_task(
-                                tid, author="auto-decomposer",
-                            )
-                        except Exception:
-                            logger.exception(
-                                "kanban auto-decompose: decompose_task crashed on %s",
-                                tid,
-                            )
-                            continue
-                        if outcome.ok:
-                            successes += 1
-                            if outcome.fanout and outcome.child_ids:
-                                logger.info(
-                                    "kanban auto-decompose [%s]: %s → %d children",
-                                    slug, tid, len(outcome.child_ids),
-                                )
-                            else:
-                                logger.info(
-                                    "kanban auto-decompose [%s]: %s → single task (no fanout)",
-                                    slug, tid,
-                                )
-                        else:
-                            # Common no-op reasons (no aux client configured) shouldn't
-                            # spam logs every tick. Log at debug.
-                            logger.debug(
-                                "kanban auto-decompose [%s]: %s skipped: %s",
-                                slug, tid, outcome.reason,
-                            )
-                finally:
-                    if prev_env is None:
-                        os.environ.pop("HERMES_KANBAN_BOARD", None)
-                    else:
-                        os.environ["HERMES_KANBAN_BOARD"] = prev_env
-            return successes
+        def _auto_decompose_tick(
+            auto_decompose_per_tick: int,
+            *,
+            enabled: bool,
+        ) -> int:
+            return _auto_decompose_triage_tasks(
+                _kb,
+                auto_decompose_per_tick,
+                enabled=enabled,
+            )
 
         logger.info(
             "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
@@ -1440,7 +1472,11 @@ class GatewayKanbanWatchersMixin:
                 # takes effect on the next tick, not on gateway restart (#49638).
                 _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
                 if _ad_enabled:
-                    await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
+                    await asyncio.to_thread(
+                        _auto_decompose_tick,
+                        _ad_per_tick,
+                        enabled=True,
+                    )
                 results = await asyncio.to_thread(_tick_once)
                 any_spawned = False
                 for slug, res in (results or []):

@@ -826,6 +826,11 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
 class UpdateTaskBody(BaseModel):
     status: Optional[str] = None
     assignee: Optional[str] = None
+    reviewer: Optional[str] = None
+    programmer: Optional[str] = None
+    review_decision: Optional[str] = None
+    review_reason: Optional[str] = None
+    claimer: Optional[str] = None
     priority: Optional[int] = None
     title: Optional[str] = None
     body: Optional[str] = None
@@ -861,7 +866,12 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
 
         # --- assignee ----------------------------------------------------
-        if payload.assignee is not None:
+        review_submission = payload.status == "review"
+        request_change = (
+            payload.review_decision == "REQUEST_CHANGES"
+            or payload.status == "request_changes"
+        )
+        if payload.assignee is not None and not (review_submission or request_change):
             try:
                 ok = kanban_db.assign_task(
                     conn, task_id, payload.assignee or None,
@@ -872,7 +882,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 raise HTTPException(status_code=404, detail="task not found")
 
         # --- status -------------------------------------------------------
-        if payload.status is not None:
+        if payload.status is not None or request_change:
             s = payload.status
             ok = True
             if s == "done":
@@ -884,6 +894,37 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 )
             elif s == "blocked":
                 ok = kanban_db.block_task(conn, task_id, reason=payload.block_reason)
+            elif s == "review":
+                reviewer = payload.reviewer or payload.assignee
+                if not reviewer:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="reviewer is required when moving a task to review",
+                    )
+                try:
+                    updated = kanban_db.submit_task_for_review(
+                        conn, task_id, reviewer,
+                    )
+                except (RuntimeError, ValueError) as e:
+                    raise HTTPException(status_code=409, detail=str(e))
+                ok = updated is not None
+            elif request_change:
+                programmer = payload.programmer or payload.assignee
+                if not programmer:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="programmer is required when requesting changes",
+                    )
+                try:
+                    updated = kanban_db.request_changes(
+                        conn, task_id, programmer,
+                        reason=payload.review_reason or payload.block_reason,
+                        claimer=payload.claimer,
+                        trusted_operator=True,
+                    )
+                except (RuntimeError, ValueError) as e:
+                    raise HTTPException(status_code=409, detail=str(e))
+                ok = updated is not None
             elif s == "scheduled":
                 ok = kanban_db.schedule_task(conn, task_id, reason=payload.block_reason)
             elif s == "ready":
@@ -2682,7 +2723,7 @@ def get_orchestration_settings():
     kanban_cfg = (cfg.get("kanban") or {}) if isinstance(cfg, dict) else {}
     explicit_orch = (kanban_cfg.get("orchestrator_profile") or "").strip()
     explicit_default = (kanban_cfg.get("default_assignee") or "").strip()
-    auto_decompose = bool(kanban_cfg.get("auto_decompose", True))
+    auto_decompose = bool(kanban_cfg.get("auto_decompose", False))
     auto_promote_children = bool(kanban_cfg.get("auto_promote_children", True))
 
     # Resolve fallbacks the same way the decomposer does.
