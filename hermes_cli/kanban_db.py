@@ -4602,6 +4602,12 @@ def _decision_retry_proves_terminal_run(
     """Require a retry to prove the exact run that made the decision ended."""
     if expected_run_id is None or event_run_id != int(expected_run_id):
         return False
+    successor = conn.execute(
+        "SELECT 1 FROM task_runs WHERE task_id=? AND id>? LIMIT 1",
+        (task_id, int(expected_run_id)),
+    ).fetchone()
+    if successor:
+        return False
     row = conn.execute(
         "SELECT task_id, outcome, ended_at FROM task_runs WHERE id=?",
         (int(expected_run_id),),
@@ -4612,6 +4618,33 @@ def _decision_retry_proves_terminal_run(
         and row["outcome"] == outcome
         and row["ended_at"] is not None
     )
+
+
+def _authoritative_reviewer(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    """Resolve reviewer ownership from the latest review-lane generation."""
+    for row in conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id=? "
+        "AND kind IN ('submitted_for_review', 'review_failover') "
+        "ORDER BY id DESC",
+        (task_id,),
+    ):
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            continue
+        candidate = (
+            payload.get("next_reviewer")
+            if row["kind"] == "review_failover"
+            else payload.get("reviewer")
+        )
+        reviewer = _canonical_assignee(candidate if isinstance(candidate, str) else None)
+        if reviewer:
+            return reviewer
+    return None
 
 
 def _active_review_generation(
@@ -4636,6 +4669,7 @@ def _active_review_generation(
         (run_id,),
     ).fetchone()
     now = int(time.time())
+    authoritative = _authoritative_reviewer(conn, task_id)
     if (
         not run
         or run["task_id"] != task_id
@@ -4652,7 +4686,9 @@ def _active_review_generation(
             and int(task_row["claim_expires"]) <= now
         )
         or task_row["claim_lock"] != run["claim_lock"]
-        or task_row["assignee"] != run["profile"]
+        or not authoritative
+        or task_row["assignee"] != authoritative
+        or _canonical_assignee(run["profile"]) != authoritative
         or (reviewer is not None and reviewer != _canonical_assignee(run["profile"]))
     ):
         raise RuntimeError(

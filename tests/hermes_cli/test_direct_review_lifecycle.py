@@ -271,6 +271,132 @@ def test_running_reviewer_rejects_expired_claim_without_mutation(kanban_home):
         assert _events(conn, task_id) == before_events
 
 
+def test_trusted_request_changes_rejects_reassigned_review_owner(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="reassigned review", assignee="programmer")
+        assert kb.claim_task(conn, task_id, claimer="host:implementation")
+        assert kb.submit_task_for_review(
+            conn, task_id, "code-reviewer", trusted_operator=True,
+        ) is not None
+        assert kb.assign_task(conn, task_id, "reviewer-b")
+        review = kb.claim_review_task(conn, task_id, claimer="host:review")
+        assert review is not None
+        before_events = _events(conn, task_id)
+        before_runs = conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id=? ORDER BY id", (task_id,),
+        ).fetchall()
+
+        with pytest.raises(RuntimeError, match="reviewer generation"):
+            kb.request_changes(
+                conn, task_id, "programmer", reason="wrong owner",
+                trusted_operator=True,
+            )
+
+        assert _events(conn, task_id) == before_events
+        assert conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id=? ORDER BY id", (task_id,),
+        ).fetchall() == before_runs
+        current = kb.get_task(conn, task_id)
+        assert current is not None and current.current_run_id == review.current_run_id
+
+
+def test_trusted_approve_rejects_reassigned_review_owner(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="reassigned approval", assignee="programmer")
+        assert kb.claim_task(conn, task_id, claimer="host:implementation")
+        assert kb.submit_task_for_review(
+            conn, task_id, "code-reviewer", trusted_operator=True,
+        ) is not None
+        assert kb.assign_task(conn, task_id, "reviewer-b")
+        review = kb.claim_review_task(conn, task_id, claimer="host:review")
+        assert review is not None
+        before_events = _events(conn, task_id)
+        before_runs = conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id=? ORDER BY id", (task_id,),
+        ).fetchall()
+
+        with pytest.raises(RuntimeError, match="does not own|reviewer generation"):
+            kb.approve_review(
+                conn, task_id, reviewer="reviewer-b", summary="wrong owner",
+                head_sha=HEAD_SHA, trusted_operator=True,
+            )
+
+        assert _events(conn, task_id) == before_events
+        assert conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id=? ORDER BY id", (task_id,),
+        ).fetchall() == before_runs
+        current = kb.get_task(conn, task_id)
+        assert current is not None and current.current_run_id == review.current_run_id
+
+
+def test_old_request_retry_rejects_reclaimed_successor(kanban_home):
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        reason = "same correction packet"
+        assert kb.request_changes(
+            conn, task_id, "programmer", reviewer="code-reviewer", reason=reason,
+            expected_claim=review.claim_lock, expected_run_id=review.current_run_id,
+        ) is not None
+        successor = kb.claim_task(conn, task_id, claimer="host:successor")
+        assert successor is not None
+        assert kb.reclaim_task(conn, task_id, reason="successor reclaimed")
+        before_events = _events(conn, task_id)
+        before_runs = conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id=? ORDER BY id", (task_id,),
+        ).fetchall()
+
+        with pytest.raises(RuntimeError, match="not active"):
+            kb.request_changes(
+                conn, task_id, "programmer", reviewer="code-reviewer", reason=reason,
+                expected_claim=review.claim_lock, expected_run_id=review.current_run_id,
+            )
+
+        assert _events(conn, task_id) == before_events
+        assert conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id=? ORDER BY id", (task_id,),
+        ).fetchall() == before_runs
+
+
+def test_old_approval_retry_rejects_blocked_successor(kanban_home):
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        assert kb.approve_review(
+            conn, task_id, reviewer="code-reviewer", summary="same approval",
+            head_sha=HEAD_SHA, expected_claim=review.claim_lock,
+            expected_run_id=review.current_run_id,
+        ) is not None
+        successor = kb.claim_task(conn, task_id, claimer="host:successor")
+        assert successor is not None
+        assert kb.block_task(
+            conn, task_id, reason="successor blocked",
+            expected_run_id=successor.current_run_id,
+        )
+        before_events = _events(conn, task_id)
+        before_runs = conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id=? ORDER BY id", (task_id,),
+        ).fetchall()
+
+        with pytest.raises(RuntimeError, match="not active"):
+            kb.approve_review(
+                conn, task_id, reviewer="code-reviewer", summary="same approval",
+                head_sha=HEAD_SHA, expected_claim=review.claim_lock,
+                expected_run_id=review.current_run_id,
+            )
+
+        assert _events(conn, task_id) == before_events
+        assert conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id=? ORDER BY id", (task_id,),
+        ).fetchall() == before_runs
+
+
 def test_approve_records_exact_head_and_routes_same_card_to_finalizer(kanban_home):
     with kb.connect() as conn:
         task_id, review, host = _review_card(conn)
