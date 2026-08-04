@@ -4514,8 +4514,10 @@ def _review_attempts_for_generation(
         except (TypeError, ValueError):
             payload = {}
         if isinstance(payload, dict):
-            profile = _canonical_assignee(payload.get("reviewer"))
-            if profile:
+            profile = _canonical_assignee(
+                payload.get("failed_reviewer") or payload.get("reviewer")
+            )
+            if profile and payload.get("error") is not None:
                 attempts.append({
                     "profile": profile,
                     "error": _redact_review_text(payload.get("error")),
@@ -4925,7 +4927,10 @@ def request_changes(
                 except (TypeError, ValueError):
                     payload = {}
                 if isinstance(payload, dict):
-                    submitted = _canonical_assignee(payload.get("reviewer"))
+                    lane = payload.get("next_reviewer") or payload.get("reviewer")
+                    submitted = _canonical_assignee(
+                        lane if isinstance(lane, str) else None
+                    )
                     if submitted:
                         break
             if submitted != reviewer_name:
@@ -5114,7 +5119,10 @@ def approve_review(
             except (TypeError, ValueError):
                 payload = {}
             if isinstance(payload, dict):
-                submitted = _canonical_assignee(payload.get("reviewer"))
+                lane = payload.get("next_reviewer") or payload.get("reviewer")
+                submitted = _canonical_assignee(
+                    lane if isinstance(lane, str) else None
+                )
                 if submitted:
                     break
         if submitted != reviewer_name:
@@ -5269,9 +5277,17 @@ def failover_review_task(
             attempted_profiles.add(current_profile)
         if reviewer and reviewer in attempted_profiles:
             reviewer = None
+        failed_attempt = (
+            [{"profile": current_profile, "error": bounded}]
+            if current_profile and bounded
+            else []
+        )
+        combined_attempted = _sanitize_review_attempts(
+            [*sanitized_attempted, *failed_attempt]
+        )
         run_id = _end_run(
             conn, task_id, outcome="reviewer_failed", status="failed",
-            error=bounded, metadata={"attempted": sanitized_attempted},
+            error=bounded, metadata={"attempted": combined_attempted},
         )
         if reviewer:
             conn.execute(
@@ -5282,18 +5298,19 @@ def failover_review_task(
             _append_event(
                 conn, task_id, "review_failover",
                 {
-                    "reviewer": reviewer,
+                    "failed_reviewer": current_profile,
                     "error": bounded,
-                    "attempted": sanitized_attempted,
+                    "next_reviewer": reviewer,
+                    "attempted": combined_attempted,
                 },
                 run_id=run_id,
             )
         else:
             reason = "all reviewer lanes failed"
-            if sanitized_attempted:
+            if combined_attempted:
                 reason += ": " + "; ".join(
                     f"{item.get('profile', '?')}: {item.get('error', 'failed')}"
-                    for item in sanitized_attempted
+                    for item in combined_attempted
                 )
             conn.execute(
                 "UPDATE tasks SET status='blocked', assignee=NULL, claim_lock=NULL, "
@@ -5305,7 +5322,7 @@ def failover_review_task(
                 conn, task_id, "review_lanes_failed",
                 {
                     "reason": _bounded_review_error(reason),
-                    "attempted": sanitized_attempted,
+                    "attempted": combined_attempted,
                 },
                 run_id=run_id,
             )
@@ -5846,6 +5863,14 @@ def complete_task(
         )
         if phantom_cards:
             with write_txn(conn):
+                current_row = conn.execute(
+                    "SELECT status FROM tasks WHERE id=?", (task_id,),
+                ).fetchone()
+                if current_row is not None and current_row["status"] == "review":
+                    raise RuntimeError(
+                        "reviewer cannot complete a review task; use kanban_approve "
+                        "or kanban_request_changes"
+                    )
                 _append_event(
                     conn, task_id, "completion_blocked_hallucination",
                     {
@@ -8119,36 +8144,48 @@ def heartbeat_worker(
     should be heartbeating (not running, or claim expired).
     """
     now = int(time.time())
-    with write_txn(conn):
-        if expected_run_id is None or not expected_profile or not expected_claim:
-            return False
-        cur = conn.execute(
-            """UPDATE tasks SET last_heartbeat_at = ?
-               WHERE id = ? AND status IN ('running', 'review')
-                 AND current_run_id = ? AND assignee = ? AND claim_lock = ?
-                 AND EXISTS (
-                     SELECT 1 FROM task_runs r
-                      WHERE r.id = tasks.current_run_id AND r.task_id = tasks.id
-                        AND r.status = 'running' AND r.profile = ?
-                        AND r.claim_lock = ?
-                 )""",
-            (now, task_id, int(expected_run_id), expected_profile,
-             expected_claim, expected_profile, expected_claim),
-        )
-        if cur.rowcount != 1:
-            return False
-        run_id = int(expected_run_id)
-        if run_id is not None:
-            conn.execute(
-                "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
-                (now, run_id),
+    expires = now + _resolve_claim_ttl_seconds()
+    if expected_run_id is None or not expected_profile or not expected_claim:
+        return False
+
+    class _HeartbeatCASRejected(Exception):
+        pass
+
+    try:
+        with write_txn(conn):
+            cur = conn.execute(
+                """UPDATE tasks SET last_heartbeat_at = ?, claim_expires = ?
+                   WHERE id = ? AND status IN ('running', 'review')
+                     AND current_run_id = ? AND assignee = ? AND claim_lock = ?
+                     AND EXISTS (
+                         SELECT 1 FROM task_runs r
+                          WHERE r.id = tasks.current_run_id AND r.task_id = tasks.id
+                            AND r.status = 'running' AND r.profile = ?
+                            AND r.claim_lock = ?
+                     )""",
+                (now, expires, task_id, int(expected_run_id), expected_profile,
+                 expected_claim, expected_profile, expected_claim),
             )
-        _append_event(
-            conn, task_id, "heartbeat",
-            {"note": note} if note else None,
-            run_id=run_id,
-        )
-    return True
+            if cur.rowcount != 1:
+                raise _HeartbeatCASRejected
+            run_cur = conn.execute(
+                """UPDATE task_runs
+                      SET last_heartbeat_at = ?, claim_expires = ?
+                    WHERE id = ? AND task_id = ? AND status = 'running'
+                      AND profile = ? AND claim_lock = ?""",
+                (now, expires, int(expected_run_id), task_id,
+                 expected_profile, expected_claim),
+            )
+            if run_cur.rowcount != 1:
+                raise _HeartbeatCASRejected
+            _append_event(
+                conn, task_id, "heartbeat",
+                {"note": note} if note else None,
+                run_id=int(expected_run_id),
+            )
+        return True
+    except _HeartbeatCASRejected:
+        return False
 
 
 def enforce_max_runtime(

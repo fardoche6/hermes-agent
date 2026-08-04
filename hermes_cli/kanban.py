@@ -1463,20 +1463,30 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         run_id = _worker_run_id_for(args.task_id)
         claim = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-        if run_id is None or not claim:
+        profile = os.environ.get("HERMES_PROFILE")
+        worker_mode = any(
+            os.environ.get(name)
+            for name in (
+                "HERMES_KANBAN_TASK",
+                "HERMES_KANBAN_RUN_ID",
+                "HERMES_KANBAN_CLAIM_LOCK",
+            )
+        )
+        if not worker_mode:
             row = conn.execute(
-                "SELECT current_run_id, claim_lock FROM tasks WHERE id=?",
+                "SELECT current_run_id, claim_lock, assignee FROM tasks WHERE id=?",
                 (args.task_id,),
             ).fetchone()
             if row:
                 run_id = run_id or row["current_run_id"]
                 claim = claim or row["claim_lock"]
+                profile = profile or row["assignee"]
         ok = kb.heartbeat_worker(
             conn,
             args.task_id,
             note=getattr(args, "note", None),
             expected_run_id=run_id,
-            expected_profile=os.environ.get("HERMES_PROFILE"),
+            expected_profile=profile,
             expected_claim=claim,
         )
     if not ok:
