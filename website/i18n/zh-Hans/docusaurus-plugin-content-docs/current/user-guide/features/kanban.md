@@ -369,7 +369,7 @@ hermes dashboard        # 导航栏中出现 "Kanban" 标签页，位于 "Skills
 ### 插件提供的功能
 
 - 一个 **Kanban** 标签页，每个状态显示一列：`triage`、`todo`、`ready`、`running`、`blocked`、`done`（开启切换时还有 `archived`）。
-  - `triage` 是粗略想法的停车列。默认情况下（`kanban.auto_decompose: true`），调度器会自动对落在这里的任务运行**分解器** —— 编排器配置文件读取粗略想法，查看你的配置文件名册（含描述），并将任务扇出为路由到最合适专家的小型子任务图。原始任务作为每个子任务的父级保持存活，因此当所有子任务完成时，编排器会重新唤醒以判断完成情况，并在工作未完成时添加更多任务。点击页面顶部的 **Orchestration: Auto/Manual** 切换按钮（或设置 `kanban.auto_decompose: false`）切换到手动模式，在手动模式下分诊任务保持原位，直到你点击卡片上的 **⚗ Decompose** 或运行 `hermes kanban decompose <id>`。对于不需要扇出的任务（或没有编排器配置文件的设置），**✨ Specify** 按钮通过相同的 LLM 机制进行单任务规格重写（标题 + 正文，包含目标、方法、验收标准）。详见下方[自动与手动编排](#auto-vs-manual-orchestration)。
+  - `triage` 是粗略想法的停车列。默认情况下（`kanban.auto_decompose: false`），调度器不会自动运行**分解器**；只有显式字面量 `kanban.auto_decompose: true` 才启用。点击页面顶部的 **Orchestration: Auto/Manual** 切换按钮（或保留 `false`）切换到手动模式，在手动模式下分诊任务保持原位，直到你点击卡片上的 **⚗ Decompose** 或运行 `hermes kanban decompose <id>`。对于不需要扇出的任务（或没有编排器配置文件的设置），**✨ Specify** 按钮通过相同的 LLM 机制进行单任务规格重写（标题 + 正文，包含目标、方法、验收标准）。详见下方[自动与手动编排](#auto-vs-manual-orchestration)。
 - 卡片显示任务 id、标题、优先级徽章、租户标签、分配的配置文件、评论/链接计数、**进度标签**（任务有依赖项时显示 `N/M` 子任务已完成）以及"N 前创建"。每张卡片的复选框启用多选。
 - **Running 列内的按配置文件分组** —— 工具栏复选框切换 Running 列按受让人的子分组。
 - **通过 WebSocket 实时更新** —— 插件以短轮询间隔追踪仅追加的 `task_events` 表；任何配置文件（CLI、gateway 或另一个仪表盘标签页）操作后，看板立即反映变化。重新加载经过防抖处理，因此一批事件只触发一次重新获取。
@@ -396,6 +396,8 @@ hermes dashboard        # 导航栏中出现 "Kanban" 标签页，位于 "Skills
 **手动** —— `kanban.auto_decompose: false`。分诊任务保持在分诊中，直到你操作。点击卡片上的 **⚗ Decompose** 按钮，运行 `hermes kanban decompose <id>`（或 `--all`），或从聊天中使用 `/kanban decompose <id>`。这与看板的预分解器行为一致，适合需要完全控制运行时机的场景。
 
 ### Review 交接与决定
+
+Worker 只能通过带有精确任务、profile、claim 和 run 凭据的工具调用提交或决定 review；过期 worker 凭据必须被拒绝且不得改变状态。经过认证的 CLI 和 dashboard 是显式的 trusted-operator 边界，可以提交、批准或请求修改；reviewer 不能直接完成任务，必须使用 approve 或 request-changes。CLI 语法为 `hermes kanban approve <id> <reviewer> <head_sha> "<summary>"`，位置顺序与解析器一致。
 
 Worker 使用 `review-required:` block 指令在同一张卡上请求独立审查；调度器会把它路由给 reviewer，不会创建子卡。Reviewer 必须使用
 `kanban_approve` 或 `kanban_request_changes`（或等价 CLI 命令）；活动 review run

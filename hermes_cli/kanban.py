@@ -1461,11 +1461,23 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 def _cmd_heartbeat(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
+        run_id = _worker_run_id_for(args.task_id)
+        claim = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+        if run_id is None or not claim:
+            row = conn.execute(
+                "SELECT current_run_id, claim_lock FROM tasks WHERE id=?",
+                (args.task_id,),
+            ).fetchone()
+            if row:
+                run_id = run_id or row["current_run_id"]
+                claim = claim or row["claim_lock"]
         ok = kb.heartbeat_worker(
             conn,
             args.task_id,
             note=getattr(args, "note", None),
-            expected_run_id=_worker_run_id_for(args.task_id),
+            expected_run_id=run_id,
+            expected_profile=os.environ.get("HERMES_PROFILE"),
+            expected_claim=claim,
         )
     if not ok:
         print(f"cannot heartbeat {args.task_id} (not running?)", file=sys.stderr)
@@ -2278,7 +2290,9 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 
 def _cmd_review(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
-        task = kb.submit_task_for_review(conn, args.task_id, args.reviewer)
+        task = kb.submit_task_for_review(
+            conn, args.task_id, args.reviewer, trusted_operator=True,
+        )
     if task is None:
         print(f"cannot submit {args.task_id} for review: task not found", file=sys.stderr)
         return 1

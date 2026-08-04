@@ -305,13 +305,12 @@ def test_stale_review_run_invalidates_prior_head_approval(kanban_home):
         assert old_run_id is not None
         assert old_claim is not None
 
-        assert kb.failover_review_task(
+        failed = kb.failover_review_task(
             conn, task_id, "code-reviewer", error="reviewer process replaced",
-        ) is not None
-        replacement = kb.claim_review_task(conn, task_id, claimer=old_claim)
-        assert replacement is not None
-        assert replacement.current_run_id != old_run_id
-        assert replacement.claim_lock == old_claim
+        )
+        assert failed is not None
+        assert failed.status == "blocked"
+        assert failed.block_kind == "capability"
 
         with pytest.raises(RuntimeError, match="current review run"):
             kb.approve_review(
@@ -325,21 +324,9 @@ def test_stale_review_run_invalidates_prior_head_approval(kanban_home):
             )
         current = kb.get_task(conn, task_id)
         assert current is not None
-        assert current.status == "review"
-        assert current.current_run_id == replacement.current_run_id
+        assert current.status == "blocked"
+        assert current.current_run_id is None
         assert "review_approved" not in _events(conn, task_id)
-
-        approved = kb.approve_review(
-            conn,
-            task_id,
-            reviewer="code-reviewer",
-            summary="current approval",
-            head_sha=HEAD_SHA,
-            expected_claim=replacement.claim_lock,
-            expected_run_id=replacement.current_run_id,
-        )
-        assert approved is not None
-        assert approved.status == "ready"
 
 
 def test_repeated_approval_is_idempotent(kanban_home):

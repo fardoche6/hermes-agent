@@ -294,7 +294,7 @@ def heartbeat_current_worker_from_env() -> bool:
     try:
         kb, conn = _connect()
         try:
-            claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+            claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or kb._claimer_id()
             try:
                 kb.heartbeat_claim(conn, tid, claimer=claim_lock)
             except Exception:
@@ -305,8 +305,17 @@ def heartbeat_current_worker_from_env() -> bool:
                 run_id = int(run_id_raw) if run_id_raw else None
             except (TypeError, ValueError):
                 run_id = None
+            if run_id is None:
+                row = conn.execute(
+                    "SELECT current_run_id FROM tasks WHERE id=?", (tid,),
+                ).fetchone()
+                run_id = int(row["current_run_id"]) if row and row["current_run_id"] else None
             try:
-                kb.heartbeat_worker(conn, tid, note=None, expected_run_id=run_id)
+                kb.heartbeat_worker(
+                    conn, tid, note=None, expected_run_id=run_id,
+                    expected_profile=os.environ.get("HERMES_PROFILE"),
+                    expected_claim=claim_lock,
+                )
             except Exception:
                 logger.debug("auto-heartbeat: heartbeat_worker failed", exc_info=True)
         finally:
@@ -1034,14 +1043,23 @@ def _handle_heartbeat(args: dict, **kw) -> str:
             # (see _default_spawn in kanban_db.py); falling back to the
             # default _claimer_id() covers locally-driven workers that
             # never went through the dispatcher path.
-            claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+            claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or kb._claimer_id()
             kb.heartbeat_claim(conn, tid, claimer=claim_lock)
+
+            run_id = _worker_run_id(tid)
+            if run_id is None:
+                row = conn.execute(
+                    "SELECT current_run_id FROM tasks WHERE id=?", (tid,),
+                ).fetchone()
+                run_id = int(row["current_run_id"]) if row and row["current_run_id"] else None
 
             ok = kb.heartbeat_worker(
                 conn,
                 tid,
                 note=note,
-                expected_run_id=_worker_run_id(tid),
+                expected_run_id=run_id,
+                expected_profile=os.environ.get("HERMES_PROFILE"),
+                expected_claim=claim_lock,
             )
             if not ok:
                 return tool_error(

@@ -422,8 +422,8 @@ hermes kanban [--board <slug>] <action> [options]
 | `context <id>` | 打印 worker 将看到的完整上下文（标题 + 正文 + 父任务结果 + 评论）。 |
 | `specify <id>` / `specify --all` | 通过辅助 LLM 将 triage 列中的任务细化为具体规格（标题 + 包含目标、方案、验收标准的正文），然后将其提升到 `todo`。标志：`--tenant`（将 `--all` 限定到一个 tenant）、`--author`、`--json`。在 `config.yaml` 的 `auxiliary.triage_specifier` 下配置模型。 |
 | `decompose <id>` / `decompose --all` | 将 triage 列中的任务按描述拆分为子任务图，路由到专业 profile（编排器驱动路径）。当 LLM 判断任务不适合拆分时，回退到 specify 风格的单任务提升。与 `specify` 相同的标志。在 `config.yaml` 的 `auxiliary.kanban_decomposer` 下配置模型。当 `kanban.auto_decompose: true`（仅显式字面量 `true`）时，每次调度器 tick 也会自动运行。参见 [自动与手动编排](/user-guide/features/kanban#auto-vs-manual-orchestration)。 |
-| `approve <id>` | 为当前 review run 记录独立审查批准。必须提供准确的 reviewer claim/run 和完整 commit SHA；此操作会进入 finalization lane。 |
-| `request-changes <id> "<reason>"` | 原子地将同一张卡返回给原始实现负责人进行修正。reviewer 不能直接完成该卡。 |
+| `approve <id> <reviewer> <head_sha> "<summary>"` | 为当前 review run 记录独立审查批准。按解析器的位置顺序传入 reviewer、完整 commit SHA 和 summary；CLI 是经过认证的 trusted-operator 路径，不要求 worker claim/run。此操作会进入 finalization lane。 |
+| `request-changes <id> <programmer> "<reason>"` | 原子地将同一张卡返回给原始实现负责人进行修正。CLI 是经过认证的 trusted-operator 路径；reviewer 不能直接完成该卡。 |
 | `gc` | 删除已归档任务的 scratch 工作区。 |
 
 示例：

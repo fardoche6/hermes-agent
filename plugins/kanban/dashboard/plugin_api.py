@@ -903,7 +903,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     )
                 try:
                     updated = kanban_db.submit_task_for_review(
-                        conn, task_id, reviewer,
+                        conn, task_id, reviewer, trusted_operator=True,
                     )
                 except (RuntimeError, ValueError) as e:
                     raise HTTPException(status_code=409, detail=str(e))

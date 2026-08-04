@@ -4492,6 +4492,37 @@ def _sanitize_review_attempts(
     return sanitized
 
 
+def _review_attempts_for_generation(
+    conn: sqlite3.Connection, task_id: str,
+) -> list[dict[str, str]]:
+    """Return reviewer lanes attempted since the current submission."""
+    rows = conn.execute(
+        "SELECT id, kind, payload FROM task_events WHERE task_id=? "
+        "AND kind IN ('submitted_for_review', 'review_failover') ORDER BY id",
+        (task_id,),
+    ).fetchall()
+    latest_submission = 0
+    for row in rows:
+        if row["kind"] == "submitted_for_review":
+            latest_submission = int(row["id"])
+    attempts: list[dict[str, str]] = []
+    for row in rows:
+        if int(row["id"]) < latest_submission:
+            continue
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (TypeError, ValueError):
+            payload = {}
+        if isinstance(payload, dict):
+            profile = _canonical_assignee(payload.get("reviewer"))
+            if profile:
+                attempts.append({
+                    "profile": profile,
+                    "error": _redact_review_text(payload.get("error")),
+                })
+    return attempts
+
+
 def _latest_event_id(
     conn: sqlite3.Connection, task_id: str, kinds: tuple[str, ...],
 ) -> int:
@@ -4741,16 +4772,12 @@ def submit_task_for_review(
             # graph. Demote back to 'todo' (recompute_ready re-promotes
             # once the parents actually finish) and refuse the transition.
             if _has_unfinished_parents(conn, task_id):
-                conn.execute(
-                    "UPDATE tasks SET status = 'todo' "
-                    "WHERE id = ? AND status = 'ready'",
-                    (task_id,),
-                )
-                _append_event(
-                    conn, task_id, "review_submit_rejected",
-                    {"reason": "parents_not_done"},
-                )
                 return None
+        if _has_unfinished_parents(conn, task_id):
+            # Recheck every source state inside the same write transaction,
+            # immediately before ending the implementation run or mutating
+            # the card. A late parent link must cause a true no-op.
+            return None
         if row["status"] == "running" and row["claim_lock"] is None:
             raise RuntimeError(f"cannot submit {task_id}: running task is unclaimed")
         old_run_id = None
@@ -5227,6 +5254,21 @@ def failover_review_task(
         ).fetchone()
         if row is None or row["status"] != "review":
             return None
+        attempted_profiles = {
+            _canonical_assignee(item.get("profile"))
+            for item in sanitized_attempted
+            if _canonical_assignee(item.get("profile"))
+        }
+        current_row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id=?", (task_id,),
+        ).fetchone()
+        current_profile = _canonical_assignee(
+            current_row["assignee"] if current_row else None
+        )
+        if current_profile:
+            attempted_profiles.add(current_profile)
+        if reviewer and reviewer in attempted_profiles:
+            reviewer = None
         run_id = _end_run(
             conn, task_id, outcome="reviewer_failed", status="failed",
             error=bounded, metadata={"attempted": sanitized_attempted},
@@ -5283,12 +5325,17 @@ def _failover_review_after_recovery(
         return task
     candidates, preflight = _reviewer_candidates(task.assignee)
     current = _canonical_assignee(task.assignee)
+    attempts = _review_attempts_for_generation(conn, task_id)
+    attempted_names = {
+        _canonical_assignee(item.get("profile")) for item in attempts
+    }
     next_reviewer = next(
         (candidate for candidate in candidates
-         if _canonical_assignee(candidate) != current),
+         if _canonical_assignee(candidate) not in attempted_names
+         and _canonical_assignee(candidate) != current),
         None,
     )
-    attempts = _sanitize_review_attempts(attempted)
+    attempts.extend(_sanitize_review_attempts(attempted))
     attempts.extend(_sanitize_review_attempts(preflight))
     return failover_review_task(
         conn,
@@ -5774,7 +5821,21 @@ def complete_task(
     """
     now = int(time.time())
 
-    # Gate: verify created_cards BEFORE the main write txn. A rejected
+    # Reviewers must decide through approve/request-changes. This guard is the
+    # first operation in the write transaction so even a hallucinated
+    # ``created_cards`` payload cannot emit an audit event or otherwise mutate
+    # the active review state.
+    with write_txn(conn):
+        review_row = conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (task_id,),
+        ).fetchone()
+        if review_row is not None and review_row["status"] == "review":
+            raise RuntimeError(
+                "reviewer cannot complete a review task; use kanban_approve "
+                "or kanban_request_changes"
+            )
+
+    # Gate: verify created_cards before the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
     # tiny dedicated txn, then raise. The caller is responsible for
     # surfacing HallucinatedCardsError to the worker; this function
@@ -8044,6 +8105,8 @@ def heartbeat_worker(
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    expected_profile: Optional[str] = None,
+    expected_claim: Optional[str] = None,
 ) -> bool:
     """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
 
@@ -8057,25 +8120,24 @@ def heartbeat_worker(
     """
     now = int(time.time())
     with write_txn(conn):
-        if expected_run_id is None:
-            cur = conn.execute(
-                "UPDATE tasks SET last_heartbeat_at = ? "
-                "WHERE id = ? AND status = 'running'",
-                (now, task_id),
-            )
-        else:
-            cur = conn.execute(
-                "UPDATE tasks SET last_heartbeat_at = ? "
-                "WHERE id = ? AND status = 'running' AND current_run_id = ?",
-                (now, task_id, int(expected_run_id)),
-            )
+        if expected_run_id is None or not expected_profile or not expected_claim:
+            return False
+        cur = conn.execute(
+            """UPDATE tasks SET last_heartbeat_at = ?
+               WHERE id = ? AND status IN ('running', 'review')
+                 AND current_run_id = ? AND assignee = ? AND claim_lock = ?
+                 AND EXISTS (
+                     SELECT 1 FROM task_runs r
+                      WHERE r.id = tasks.current_run_id AND r.task_id = tasks.id
+                        AND r.status = 'running' AND r.profile = ?
+                        AND r.claim_lock = ?
+                 )""",
+            (now, task_id, int(expected_run_id), expected_profile,
+             expected_claim, expected_profile, expected_claim),
+        )
         if cur.rowcount != 1:
             return False
-        run_id = (
-            int(expected_run_id)
-            if expected_run_id is not None
-            else _current_run_id(conn, task_id)
-        )
+        run_id = int(expected_run_id)
         if run_id is not None:
             conn.execute(
                 "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",

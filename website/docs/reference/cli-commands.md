@@ -624,8 +624,8 @@ Multi-profile, multi-project collaboration board. Each install can host many boa
 | `context <id>` | Print the full context a worker would see (title + body + parent results + comments). |
 | `specify <id>` / `specify --all` | Flesh out a triage-column task into a concrete spec (title + body with goal, approach, acceptance criteria) via the auxiliary LLM, then promote it to `todo`. Flags: `--tenant` (scope `--all` to one tenant), `--author`, `--json`. Configure the model under `auxiliary.triage_specifier` in `config.yaml`. |
 | `decompose <id>` / `decompose --all` | Fan a triage-column task out into a graph of child tasks routed to specialist profiles by description. Falls back to specify-style single-task promotion when the LLM decides the task doesn't benefit from fan-out. Same flags as `specify`. Configure the decomposer model under `auxiliary.kanban_decomposer` in `config.yaml`; `kanban.orchestrator_profile` only controls who owns the root/orchestration task after fan-out. Also runs automatically every dispatcher tick only when `kanban.auto_decompose: true` is explicitly enabled. See [Auto vs Manual orchestration](/user-guide/features/kanban#auto-vs-manual-orchestration). |
-| `approve <id>` | Record an independent reviewer approval for the active review run. Requires the exact reviewer claim/run and full commit SHA; it creates the finalization lane. |
-| `request-changes <id> "<reason>"` | Atomically return the same card to its original implementation owner for correction. The reviewer cannot complete the card directly. |
+| `approve <id> <reviewer> <head_sha> "<summary>"` | Record an independent reviewer approval for the active review run. The direct CLI is an authenticated trusted-operator path; pass the positional reviewer, full commit SHA, then summary. It creates the finalization lane. |
+| `request-changes <id> <programmer> "<reason>"` | Atomically return the same card to its original implementation owner for correction. The direct CLI is an authenticated trusted-operator path; the reviewer cannot complete the card directly. |
 | `gc` | Remove scratch workspaces for archived tasks. |
 
 Examples:
