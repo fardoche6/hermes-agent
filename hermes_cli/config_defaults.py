@@ -2293,11 +2293,10 @@ DEFAULT_CONFIG = {
         # otherwise saturate one profile's local model / API quota /
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
-        # When true, the kanban dispatcher auto-runs the decomposer on
-        # tasks that land in Triage (every dispatcher tick). When false,
-        # decomposition is manual via `hermes kanban decompose <id>` or
-        # the dashboard's Decompose button.
-        "auto_decompose": True,
+        # Auto-decomposition mutates the task graph and can launch workers.
+        # It is opt-in: when false (the safe default), decomposition is
+        # manual via `hermes kanban decompose <id>` or the dashboard button.
+        "auto_decompose": False,
         # Max triage tasks to decompose per dispatcher tick. Prevents a
         # large bulk-load of triage tasks from spending a burst of aux
         # LLM calls in one tick. Excess tasks defer to the next tick.
