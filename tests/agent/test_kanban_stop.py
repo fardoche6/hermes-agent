@@ -113,6 +113,84 @@ def test_successful_reviewer_decision_is_terminal(clear_kanban_env, tool_name):
     assert build_kanban_stop_nudge(messages=messages) is None
 
 
+@pytest.mark.parametrize("decision_name", ["kanban_approve", "kanban_request_changes"])
+def test_orphan_reviewer_result_is_not_terminal(clear_kanban_env, decision_name):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_review")
+    messages = [
+        {
+            "role": "tool",
+            "name": decision_name,
+            "tool_call_id": "orphan-result",
+            "content": json.dumps({"ok": True}),
+        }
+    ]
+
+    assert session_called_kanban_terminal(messages) is False
+    assert build_kanban_stop_nudge(messages=messages) is not None
+
+
+@pytest.mark.parametrize("decision_name", ["kanban_approve", "kanban_request_changes"])
+def test_reviewer_result_with_wrong_id_is_not_terminal(clear_kanban_env, decision_name):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_review")
+    messages = _tool_messages(
+        decision_name,
+        {"ok": True, "task_id": "t_review", "status": "ready"},
+    )
+    messages[-1]["tool_call_id"] = "wrong-call-id"
+
+    assert session_called_kanban_terminal(messages) is False
+    assert build_kanban_stop_nudge(messages=messages) is not None
+
+
+@pytest.mark.parametrize(
+    ("decision_name", "other_decision_name"),
+    [
+        ("kanban_approve", "kanban_request_changes"),
+        ("kanban_request_changes", "kanban_approve"),
+    ],
+)
+def test_reviewer_result_with_mismatched_name_is_not_terminal(
+    clear_kanban_env, decision_name, other_decision_name
+):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_review")
+    messages = _tool_messages(
+        decision_name,
+        {"ok": True, "task_id": "t_review", "status": "ready"},
+    )
+    messages[-1]["name"] = other_decision_name
+
+    assert session_called_kanban_terminal(messages) is False
+    assert build_kanban_stop_nudge(messages=messages) is not None
+
+
+@pytest.mark.parametrize("decision_name", ["kanban_approve", "kanban_request_changes"])
+def test_reviewer_call_without_result_is_not_terminal(clear_kanban_env, decision_name):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_review")
+    messages = _tool_messages(
+        decision_name,
+        {"ok": True, "task_id": "t_review", "status": "ready"},
+    )
+    messages.pop()
+
+    assert session_called_kanban_terminal(messages) is False
+    assert build_kanban_stop_nudge(messages=messages) is not None
+
+
+@pytest.mark.parametrize("decision_name", ["kanban_approve", "kanban_request_changes"])
+def test_reviewer_result_uses_originating_call_name_when_result_name_missing(
+    clear_kanban_env, decision_name
+):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_review")
+    messages = _tool_messages(
+        decision_name,
+        {"ok": True, "task_id": "t_review", "status": "ready"},
+    )
+    messages[-1].pop("name")
+
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
 @pytest.mark.parametrize("tool_name", ["kanban_approve", "kanban_request_changes"])
 def test_rejected_reviewer_decision_is_not_terminal(clear_kanban_env, tool_name):
     clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_review")
