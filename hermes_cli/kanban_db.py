@@ -93,6 +93,13 @@ from typing import Any, Iterable, Mapping, Optional
 from agent.redact import redact_sensitive_text
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli.kanban_dependencies import (
+    KanbanDependencyContext,
+    KanbanDependencyResult,
+    KanbanWorkspaceBasePin,
+    evaluate_kanban_dependency_provider,
+    validate_dependency_metadata,
+)
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -1043,6 +1050,9 @@ class Task:
     # clear the physical-ownership uncertainty.
     recovery_required: bool = False
     recovery_reason: Optional[str] = None
+    # Read-only projection of the current run's immutable provider admission.
+    # Historical tasks/runs have NULL here.
+    dependency_binding: Optional[dict] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1056,6 +1066,14 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+        dependency_binding: Optional[dict] = None
+        if "dependency_binding" in keys and row["dependency_binding"]:
+            try:
+                parsed_binding = json.loads(row["dependency_binding"])
+                if isinstance(parsed_binding, dict):
+                    dependency_binding = parsed_binding
+            except Exception:
+                dependency_binding = None
         return cls(
             id=row["id"],
             title=row["title"],
@@ -1151,6 +1169,7 @@ class Task:
             recovery_reason=(
                 row["recovery_reason"] if "recovery_reason" in keys else None
             ),
+            dependency_binding=dependency_binding,
         )
 
 
@@ -1185,6 +1204,7 @@ class Run:
     error: Optional[str]
     recovery_required: bool = False
     recovery_reason: Optional[str] = None
+    dependency_binding: Optional[dict] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
@@ -1192,6 +1212,16 @@ class Run:
             meta = json.loads(row["metadata"]) if row["metadata"] else None
         except Exception:
             meta = None
+        try:
+            binding = (
+                json.loads(row["dependency_binding"])
+                if "dependency_binding" in row.keys() and row["dependency_binding"]
+                else None
+            )
+            if not isinstance(binding, dict):
+                binding = None
+        except Exception:
+            binding = None
         return cls(
             id=int(row["id"]),
             task_id=row["task_id"],
@@ -1224,6 +1254,7 @@ class Run:
             recovery_reason=(
                 row["recovery_reason"] if "recovery_reason" in row.keys() else None
             ),
+            dependency_binding=binding,
         )
 
 
@@ -1370,8 +1401,13 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
-    parent_id  TEXT NOT NULL,
-    child_id   TEXT NOT NULL,
+    parent_id         TEXT NOT NULL,
+    child_id          TEXT NOT NULL,
+    -- ``completion`` preserves the original parent-Done behavior. Other
+    -- values identify a generic provider registered by a plugin.
+    dependency_kind   TEXT NOT NULL DEFAULT 'completion',
+    provider_name     TEXT,
+    metadata          TEXT,
     PRIMARY KEY (parent_id, child_id)
 );
 
@@ -1425,6 +1461,8 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
+    -- Immutable provider generations/base pins admitted for this run.
+    dependency_binding  TEXT,
     error               TEXT
 );
 
@@ -1572,6 +1610,21 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     # the PRAGMA explicitly so it is observable and survives future wrapper
     # changes. Parameter binding is not supported for PRAGMA assignments.
     conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    return conn
+
+
+def _bind_kanban_connection_board(
+    conn: sqlite3.Connection,
+    board: Optional[str],
+) -> sqlite3.Connection:
+    """Bind the resolved board for APIs whose legacy signature lacks board."""
+    try:
+        setattr(conn, "_hermes_kanban_board", board)
+    except Exception:
+        # sqlite3.Connection normally permits attributes; callers still pass
+        # explicit board values when a custom connection implementation does
+        # not, so this is only a compatibility fallback.
+        pass
     return conn
 
 
@@ -2298,9 +2351,11 @@ def connect(
       ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
       ``<root>/kanban/current`` → ``default``.
     """
+    resolved_board = _normalize_board_slug(board)
     if db_path is not None:
         path = db_path
     else:
+        resolved_board = resolved_board or get_current_board()
         path = kanban_db_path(board=board)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -2316,7 +2371,9 @@ def connect(
     # connection with WAL/pragmas under the cheap in-process _INIT_LOCK.
     resolved = str(path.resolve())
     if resolved in _INITIALIZED_PATHS:
-        conn = _sqlite_connect(path)
+        conn = _bind_kanban_connection_board(
+            _sqlite_connect(path), resolved_board
+        )
         try:
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
@@ -2347,7 +2404,9 @@ def connect(
         # via _INITIALIZED_PATHS so it only runs once per process per path.
         _guard_existing_db_is_healthy(path)
         resolved = str(path.resolve())
-        conn = _sqlite_connect(path)
+        conn = _bind_kanban_connection_board(
+            _sqlite_connect(path), resolved_board
+        )
         try:
             conn.row_factory = sqlite3.Row
             with _INIT_LOCK:
@@ -2682,6 +2741,50 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 "gate_starttime TEXT",
             )
 
+    # Typed dependency links are additive.  Legacy rows retain ordinary
+    # completion semantics because the new kind column defaults to
+    # ``completion`` and the provider fields remain NULL.
+    link_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_links'"
+    ).fetchone() is not None
+    if link_table_exists:
+        link_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_links)")
+        }
+        if "dependency_kind" not in link_cols:
+            _add_column_if_missing(
+                conn,
+                "task_links",
+                "dependency_kind",
+                "dependency_kind TEXT NOT NULL DEFAULT 'completion'",
+            )
+        if "provider_name" not in link_cols:
+            _add_column_if_missing(
+                conn,
+                "task_links",
+                "provider_name",
+                "provider_name TEXT",
+            )
+        if "metadata" not in link_cols:
+            _add_column_if_missing(conn, "task_links", "metadata", "metadata TEXT")
+
+    # Provider admission is persisted on the historical run, never only in
+    # process memory.  Existing runs naturally get NULL.
+    runs_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone() is not None
+    if runs_table_exists:
+        run_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+        }
+        if "dependency_binding" not in run_cols:
+            _add_column_if_missing(
+                conn,
+                "task_runs",
+                "dependency_binding",
+                "dependency_binding TEXT",
+            )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2848,6 +2951,7 @@ _REBUILD_SPECS = {
         " recovery_reason TEXT, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
+        " dependency_binding TEXT,"
         " error TEXT)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
@@ -3406,6 +3510,47 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+_DEPENDENCY_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}$")
+
+
+def _normalize_dependency_spec(
+    dependency_kind: Optional[str],
+    provider_name: Optional[str],
+    metadata: Optional[Mapping[str, Any]],
+) -> tuple[str, Optional[str], dict[str, Any]]:
+    """Validate the generic typed-link fields shared by create/link APIs."""
+    if dependency_kind is None:
+        kind = "completion"
+    elif not isinstance(dependency_kind, str):
+        raise ValueError("dependency_kind must be a string")
+    else:
+        kind = dependency_kind.strip()
+    if not _DEPENDENCY_NAME_RE.fullmatch(kind):
+        raise ValueError(
+            "dependency_kind must match "
+            "[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}"
+        )
+    if provider_name is not None and not isinstance(provider_name, str):
+        raise ValueError("provider_name must be a string")
+    provider = provider_name.strip() if provider_name is not None else None
+    if provider is not None and not _DEPENDENCY_NAME_RE.fullmatch(provider):
+        raise ValueError(
+            "provider_name must match [A-Za-z0-9][A-Za-z0-9_.:-]{0,95}"
+        )
+    safe_metadata = validate_dependency_metadata(metadata)
+    if kind == "completion":
+        if provider is not None or safe_metadata:
+            raise ValueError(
+                "completion dependencies cannot carry provider_name or metadata"
+            )
+        return kind, None, {}
+    if provider is None:
+        raise ValueError(
+            "non-completion dependencies require provider_name"
+        )
+    return kind, provider, safe_metadata
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3434,6 +3579,9 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    dependency_kind: str = "completion",
+    provider_name: Optional[str] = None,
+    dependency_metadata: Optional[Mapping[str, Any]] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3477,6 +3625,7 @@ def create_task(
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    board_slug = _dependency_board(conn, board)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
@@ -3501,7 +3650,7 @@ def create_task(
     # (deterministic worktree + branch) without each surface repeating it.
     if project_id is None:
         try:
-            _bmeta = read_board_metadata(board if board else get_current_board())
+            _bmeta = read_board_metadata(board_slug)
             _board_project = (_bmeta.get("project_id") or "").strip()
             if _board_project:
                 project_id = _board_project
@@ -3597,7 +3746,12 @@ def create_task(
                 # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
                 project_repo = str(project_obj.primary_path)
 
-    parents = tuple(p for p in parents if p)
+    parents = tuple(dict.fromkeys(p for p in parents if p))
+    dependency_kind, provider_name, dependency_metadata = _normalize_dependency_spec(
+        dependency_kind,
+        provider_name,
+        dependency_metadata,
+    )
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -3675,7 +3829,6 @@ def create_task(
         and project_repo is None
         and workspace_kind in {"dir", "worktree"}
     ):
-        board_slug = board if board else get_current_board()
         board_meta = read_board_metadata(board_slug)
         board_default = board_meta.get("default_workdir")
         if board_default:
@@ -3703,14 +3856,6 @@ def create_task(
                         missing = _find_missing_parents(conn, parents)
                         if missing:
                             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-                        # If any parent is not yet done, we're todo.
-                        rows = conn.execute(
-                            "SELECT status FROM tasks WHERE id IN "
-                            "(" + ",".join("?" * len(parents)) + ")",
-                            parents,
-                        ).fetchall()
-                        if any(r["status"] != "done" for r in rows):
-                            task_status = "todo"
                 # Even in triage mode we still need to validate parent ids
                 # so the eventual link rows don't dangle.
                 if triage and parents:
@@ -3776,9 +3921,30 @@ def create_task(
                 )
                 for pid in parents:
                     conn.execute(
-                        "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
-                        (pid, task_id),
+                        "INSERT INTO task_links "
+                        "(parent_id, child_id, dependency_kind, provider_name, metadata) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (
+                            pid,
+                            task_id,
+                            dependency_kind,
+                            provider_name,
+                            json.dumps(dependency_metadata, sort_keys=True)
+                            if dependency_metadata else None,
+                        ),
                     )
+                if not triage and initial_status != "blocked" and parents:
+                    dependency_resolution = resolve_task_dependencies(
+                        conn,
+                        task_id,
+                        board=board_slug,
+                    )
+                    if not dependency_resolution.satisfied:
+                        task_status = "todo"
+                        conn.execute(
+                            "UPDATE tasks SET status = 'todo' WHERE id = ?",
+                            (task_id,),
+                        )
                 _append_event(
                     conn,
                     task_id,
@@ -3796,6 +3962,9 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "dependency_kind": dependency_kind,
+                        "provider_name": provider_name,
+                        "dependency_metadata": dependency_metadata or None,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -3863,7 +4032,15 @@ def _inherit_notify_subs(
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
-    row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    # Project the current run's immutable provider admission onto the task
+    # without duplicating it on tasks.  The LEFT JOIN keeps legacy tasks and
+    # ordinary completion runs fully backward-compatible.
+    row = conn.execute(
+        "SELECT tasks.*, task_runs.dependency_binding AS dependency_binding "
+        "FROM tasks LEFT JOIN task_runs ON task_runs.id = tasks.current_run_id "
+        "WHERE tasks.id = ?",
+        (task_id,),
+    ).fetchone()
     return Task.from_row(row) if row else None
 
 
@@ -4066,7 +4243,378 @@ def set_reasoning_effort(
 # Links
 # ---------------------------------------------------------------------------
 
-def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+@dataclass(frozen=True)
+class DependencyEvidence:
+    """Bounded readback for one typed dependency edge."""
+
+    parent_id: str
+    child_id: str
+    dependency_kind: str
+    provider_name: Optional[str]
+    status: str
+    generation: Optional[str] = None
+    workspace_base: Optional[dict[str, str]] = None
+    metadata: Optional[dict[str, Any]] = None
+    diagnostics: Optional[dict[str, Any]] = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "parent_id": self.parent_id,
+            "child_id": self.child_id,
+            "dependency_kind": self.dependency_kind,
+            "provider_name": self.provider_name,
+            "status": self.status,
+            "generation": self.generation,
+            "workspace_base": self.workspace_base,
+            "metadata": self.metadata or {},
+            "diagnostics": self.diagnostics or {},
+        }
+
+
+@dataclass(frozen=True)
+class DependencyResolution:
+    """Single shared dependency decision used by readiness and claim CAS."""
+
+    satisfied: bool
+    evidence: tuple[DependencyEvidence, ...] = ()
+    binding: Optional[dict[str, Any]] = None
+    diagnostics: tuple[dict[str, Any], ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "satisfied": self.satisfied,
+            "evidence": [item.as_dict() for item in self.evidence],
+            "binding": self.binding,
+            "diagnostics": list(self.diagnostics),
+        }
+
+
+def _dependency_board(
+    conn: sqlite3.Connection,
+    board: Optional[str] = None,
+) -> str:
+    explicit = _normalize_board_slug(board)
+    bound = getattr(conn, "_hermes_kanban_board", None)
+    if bound:
+        bound = _normalize_board_slug(str(bound))
+    if explicit and bound and explicit != bound:
+        raise ValueError(
+            f"dependency board {explicit!r} does not match connection board {bound!r}"
+        )
+    if explicit:
+        return explicit
+    if bound:
+        return bound
+    return get_current_board()
+
+
+def _dependency_task_context(task: Task, *, board: str) -> dict[str, Any]:
+    """Expose only stable, non-body task fields to provider code."""
+    return {
+        "board": board,
+        "id": task.id,
+        "title": task.title,
+        "status": task.status,
+        "assignee": task.assignee,
+        "priority": task.priority,
+        "tenant": task.tenant,
+        "workspace_kind": task.workspace_kind,
+        "workspace_path": task.workspace_path,
+        "branch_name": task.branch_name,
+        "project_id": task.project_id,
+        "created_at": task.created_at,
+    }
+
+
+def _decode_dependency_metadata(raw: Any) -> dict[str, Any]:
+    if raw is None or raw == "":
+        return {}
+    parsed = json.loads(raw) if isinstance(raw, str) else raw
+    if not isinstance(parsed, Mapping):
+        raise ValueError("dependency metadata must be an object")
+    return validate_dependency_metadata(parsed)
+
+
+def resolve_task_dependencies(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+) -> DependencyResolution:
+    """Resolve every edge for ``task_id`` using the one canonical algorithm.
+
+    Callers must invoke this while holding their own ``write_txn`` when the
+    result will authorize a mutation (notably ``claim_task``).  Providers
+    receive no connection and every fault is fail-closed by the provider
+    registry.
+    """
+    board_slug = _dependency_board(conn, board)
+    task = get_task(conn, task_id)
+    if task is None:
+        return DependencyResolution(
+            satisfied=False,
+            diagnostics=(
+                {"reason": "task_unavailable", "task_id": str(task_id)},
+            ),
+        )
+    rows = conn.execute(
+        "SELECT parent_id, child_id, dependency_kind, provider_name, metadata "
+        "FROM task_links WHERE child_id = ? ORDER BY parent_id",
+        (task_id,),
+    ).fetchall()
+    if not rows:
+        return DependencyResolution(satisfied=True)
+
+    evidence: list[DependencyEvidence] = []
+    provider_bindings: list[dict[str, Any]] = []
+    aggregate_diagnostics: list[dict[str, Any]] = []
+    all_satisfied = True
+    for row in rows:
+        parent_id = str(row["parent_id"])
+        child_id = str(row["child_id"])
+        kind = str(row["dependency_kind"] or "completion")
+        provider_name = row["provider_name"]
+        raw_metadata = row["metadata"]
+        try:
+            link_metadata = _decode_dependency_metadata(raw_metadata)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            evidence.append(
+                DependencyEvidence(
+                    parent_id=parent_id,
+                    child_id=child_id,
+                    dependency_kind=kind,
+                    provider_name=provider_name,
+                    status="unknown",
+                    metadata={},
+                    diagnostics={"reason": "malformed_link_metadata"},
+                )
+            )
+            aggregate_diagnostics.append(
+                {"reason": "malformed_link_metadata", "parent_id": parent_id}
+            )
+            all_satisfied = False
+            continue
+        if child_id != task.id:
+            evidence.append(
+                DependencyEvidence(
+                    parent_id=parent_id,
+                    child_id=child_id,
+                    dependency_kind=kind,
+                    provider_name=provider_name,
+                    status="unknown",
+                    metadata=link_metadata,
+                    diagnostics={"reason": "wrong_child_identity"},
+                )
+            )
+            aggregate_diagnostics.append(
+                {"reason": "wrong_child_identity", "parent_id": parent_id}
+            )
+            all_satisfied = False
+            continue
+        parent = get_task(conn, parent_id)
+        if parent is None:
+            evidence.append(
+                DependencyEvidence(
+                    parent_id=parent_id,
+                    child_id=child_id,
+                    dependency_kind=kind,
+                    provider_name=provider_name,
+                    status="unknown",
+                    metadata=link_metadata,
+                    diagnostics={"reason": "parent_unavailable"},
+                )
+            )
+            aggregate_diagnostics.append(
+                {"reason": "parent_unavailable", "parent_id": parent_id}
+            )
+            all_satisfied = False
+            continue
+
+        if kind == "completion":
+            if provider_name is not None or link_metadata:
+                edge_status = "unknown"
+                edge_diagnostics = {"reason": "malformed_completion_link"}
+            else:
+                edge_status = (
+                    "satisfied" if parent.status in {"done", "archived"}
+                    else "unsatisfied"
+                )
+                edge_diagnostics = (
+                    {} if edge_status == "satisfied"
+                    else {"reason": "parent_not_done", "parent_status": parent.status}
+                )
+            evidence.append(
+                DependencyEvidence(
+                    parent_id=parent_id,
+                    child_id=child_id,
+                    dependency_kind=kind,
+                    provider_name=None,
+                    status=edge_status,
+                    metadata=link_metadata,
+                    diagnostics=edge_diagnostics,
+                )
+            )
+            if edge_status != "satisfied":
+                all_satisfied = False
+            continue
+
+        if not provider_name or not _DEPENDENCY_NAME_RE.fullmatch(str(provider_name)):
+            edge_status = "unknown"
+            edge_diagnostics = {"reason": "malformed_provider_key"}
+            result = None
+        else:
+            try:
+                context = KanbanDependencyContext(
+                    board=board_slug,
+                    task=_dependency_task_context(task, board=board_slug),
+                    link={
+                        "board": board_slug,
+                        "parent_id": parent_id,
+                        "child_id": child_id,
+                        "dependency_kind": kind,
+                        "provider_name": str(provider_name),
+                        "metadata": link_metadata,
+                    },
+                    parent=_dependency_task_context(parent, board=board_slug),
+                )
+                result = evaluate_kanban_dependency_provider(
+                    kind,
+                    str(provider_name),
+                    context,
+                )
+                edge_status = result.status
+                edge_diagnostics = dict(result.diagnostics)
+            except Exception:
+                result = None
+                edge_status = "unknown"
+                edge_diagnostics = {"reason": "provider_context_invalid"}
+
+        generation = result.generation if result and edge_status == "satisfied" else None
+        workspace_base = (
+            result.workspace_base.as_dict()
+            if result and edge_status == "satisfied" and result.workspace_base
+            else None
+        )
+        if workspace_base is not None and task.workspace_kind != "worktree":
+            edge_status = "unknown"
+            edge_diagnostics = {
+                "reason": "workspace_base_requires_worktree",
+            }
+            generation = None
+            workspace_base = None
+        if edge_status == "satisfied" and not generation:
+            edge_status = "unknown"
+            edge_diagnostics = {"reason": "missing_provider_generation"}
+        evidence.append(
+            DependencyEvidence(
+                parent_id=parent_id,
+                child_id=child_id,
+                dependency_kind=kind,
+                provider_name=str(provider_name) if provider_name else None,
+                status=edge_status,
+                generation=generation,
+                workspace_base=workspace_base,
+                metadata=link_metadata,
+                diagnostics=edge_diagnostics,
+            )
+        )
+        if edge_status != "satisfied":
+            all_satisfied = False
+        else:
+            provider_bindings.append(
+                {
+                    "parent_id": parent_id,
+                    "child_id": child_id,
+                    "dependency_kind": kind,
+                    "provider_name": str(provider_name),
+                    "generation": generation,
+                    "workspace_base": workspace_base,
+                }
+            )
+
+    unique_pins = {
+        json.dumps(item["workspace_base"], sort_keys=True)
+        for item in provider_bindings
+        if item["workspace_base"] is not None
+    }
+    if len(unique_pins) > 1:
+        all_satisfied = False
+        aggregate_diagnostics.append({"reason": "conflicting_workspace_base_pins"})
+
+    binding: Optional[dict[str, Any]] = None
+    if all_satisfied and provider_bindings:
+        binding = {
+            "board": board_slug,
+            "dependencies": provider_bindings,
+        }
+        pinned = [item["workspace_base"] for item in provider_bindings if item["workspace_base"]]
+        if pinned:
+            binding["workspace_base"] = pinned[0]
+    return DependencyResolution(
+        satisfied=all_satisfied,
+        evidence=tuple(evidence),
+        binding=binding,
+        diagnostics=tuple(aggregate_diagnostics),
+    )
+
+
+def task_dependency_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Official bounded readback for current dependency/provider evidence."""
+    return [item.as_dict() for item in resolve_task_dependencies(conn, task_id, board=board).evidence]
+
+
+def list_dependency_links(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Return typed link storage without exposing the SQLite connection."""
+    _dependency_board(conn, board)
+    rows = conn.execute(
+        "SELECT parent_id, child_id, dependency_kind, provider_name, metadata "
+        "FROM task_links WHERE child_id = ? ORDER BY parent_id",
+        (task_id,),
+    ).fetchall()
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            metadata = _decode_dependency_metadata(row["metadata"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            metadata = {}
+        output.append(
+            {
+                "parent_id": row["parent_id"],
+                "child_id": row["child_id"],
+                "dependency_kind": row["dependency_kind"] or "completion",
+                "provider_name": row["provider_name"],
+                "metadata": metadata,
+            }
+        )
+    return output
+
+
+def link_tasks(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    dependency_kind: str = "completion",
+    provider_name: Optional[str] = None,
+    metadata: Optional[Mapping[str, Any]] = None,
+    board: Optional[str] = None,
+) -> None:
+    board_slug = _dependency_board(conn, board)
+    dependency_kind, provider_name, safe_metadata = _normalize_dependency_spec(
+        dependency_kind,
+        provider_name,
+        metadata,
+    )
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     with write_txn(conn):
@@ -4077,22 +4625,74 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
             raise ValueError(
                 f"linking {parent_id} -> {child_id} would create a cycle"
             )
-        conn.execute(
-            "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+        existing = conn.execute(
+            "SELECT dependency_kind, provider_name, metadata "
+            "FROM task_links WHERE parent_id = ? AND child_id = ?",
             (parent_id, child_id),
+        ).fetchone()
+        if existing is not None:
+            try:
+                existing_spec = _normalize_dependency_spec(
+                    existing["dependency_kind"] or "completion",
+                    existing["provider_name"],
+                    _decode_dependency_metadata(existing["metadata"]),
+                )
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    "existing dependency link has malformed immutable metadata"
+                ) from exc
+            requested_spec = (dependency_kind, provider_name, safe_metadata)
+            if existing_spec != requested_spec:
+                raise ValueError(
+                    "dependency link binding is immutable; unlink it before "
+                    "creating a different binding"
+                )
+            dependency_resolution = resolve_task_dependencies(
+                conn,
+                child_id,
+                board=board_slug,
+            )
+            if not dependency_resolution.satisfied:
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+                    (child_id,),
+                )
+            return
+        conn.execute(
+            "INSERT INTO task_links "
+            "(parent_id, child_id, dependency_kind, provider_name, metadata) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(parent_id, child_id) DO NOTHING",
+            (
+                parent_id,
+                child_id,
+                dependency_kind,
+                provider_name,
+                json.dumps(safe_metadata, sort_keys=True) if safe_metadata else None,
+            ),
         )
-        # If child was ready but parent is not yet done, demote child to todo.
-        parent_status = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?", (parent_id,)
-        ).fetchone()["status"]
-        if parent_status != "done":
+        # Reuse the canonical resolver rather than special-casing completion
+        # links here.  This keeps typed-link updates and claim/readiness
+        # decisions in lockstep.
+        dependency_resolution = resolve_task_dependencies(
+            conn,
+            child_id,
+            board=board_slug,
+        )
+        if not dependency_resolution.satisfied:
             conn.execute(
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
                 (child_id,),
             )
         _append_event(
             conn, child_id, "linked",
-            {"parent": parent_id, "child": child_id},
+            {
+                "parent": parent_id,
+                "child": child_id,
+                "dependency_kind": dependency_kind,
+                "provider_name": provider_name,
+                "metadata": safe_metadata or None,
+            },
         )
         _inherit_notify_subs(conn, child_id, (parent_id,))
 
@@ -4120,7 +4720,14 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
     return False
 
 
-def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+def unlink_tasks(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    board: Optional[str] = None,
+) -> bool:
+    board_slug = _dependency_board(conn, board)
     with write_txn(conn):
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
@@ -4137,7 +4744,7 @@ def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
         # child immediately.  Matches the contract of complete_task and
         # unblock_task; without this the child stays stuck in todo until the
         # next dispatcher tick or a manual `hermes kanban recompute` (issue #22459).
-        recompute_ready(conn)
+        recompute_ready(conn, board=board_slug)
     return removed
 
 
@@ -4688,7 +5295,10 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def recompute_ready(
-    conn: sqlite3.Connection, failure_limit: int = None,
+    conn: sqlite3.Connection,
+    failure_limit: int = None,
+    *,
+    board: Optional[str] = None,
 ) -> int:
     """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
 
@@ -4720,12 +5330,13 @@ def recompute_ready(
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
+    board_slug = _dependency_board(conn, board)
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
             "SELECT id, status, consecutive_failures, max_retries, "
             "       recovery_required "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+            "FROM tasks WHERE status IN ('todo', 'blocked', 'ready')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
@@ -4738,42 +5349,48 @@ def recompute_ready(
                 # legitimate exit (it emits ``"unblocked"`` which flips
                 # this predicate back).
                 continue
-            parents = conn.execute(
-                "SELECT t.status FROM tasks t "
-                "JOIN task_links l ON l.parent_id = t.id "
-                "WHERE l.child_id = ?",
-                (task_id,),
-            ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
-                if cur_status == "blocked":
-                    # Don't auto-recover tasks that have hit the
-                    # circuit-breaker failure limit.  Without this
-                    # guard, a task that repeatedly exhausts its
-                    # iteration budget would cycle forever:
-                    # block → auto-recover → respawn → budget
-                    # exhausted → block → …  The counter must also
-                    # be preserved so the breaker can accumulate
-                    # across recovery cycles.
-                    failures = int(row["consecutive_failures"] or 0)
-                    task_limit = row["max_retries"]
-                    effective_limit = (
-                        int(task_limit) if task_limit is not None
-                        else int(failure_limit)
-                    )
-                    if failures >= effective_limit:
-                        continue
+            dependency_resolution = resolve_task_dependencies(
+                conn,
+                task_id,
+                board=board_slug,
+            )
+            if not dependency_resolution.satisfied:
+                # A provider may change after a previous sweep.  Ready is
+                # therefore not a durable authorization; demote it just as
+                # claim_task does, keeping readback and admission honest.
+                if cur_status == "ready":
                     conn.execute(
-                        "UPDATE tasks SET status = 'ready' "
-                        "WHERE id = ? AND status = 'blocked'",
+                        "UPDATE tasks SET status = 'todo' "
+                        "WHERE id = ? AND status = 'ready'",
                         (task_id,),
                     )
-                else:
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
-                        (task_id,),
-                    )
-                _append_event(conn, task_id, "promoted", None)
-                promoted += 1
+                continue
+            if cur_status == "ready":
+                continue
+            if cur_status == "blocked":
+                # Don't auto-recover tasks that have hit the circuit-breaker
+                # failure limit.  The counter must accumulate across recovery
+                # cycles rather than resetting on every promotion.
+                failures = int(row["consecutive_failures"] or 0)
+                task_limit = row["max_retries"]
+                effective_limit = (
+                    int(task_limit) if task_limit is not None
+                    else int(failure_limit)
+                )
+                if failures >= effective_limit:
+                    continue
+                conn.execute(
+                    "UPDATE tasks SET status = 'ready' "
+                    "WHERE id = ? AND status = 'blocked'",
+                    (task_id,),
+                )
+            else:
+                conn.execute(
+                    "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
+                    (task_id,),
+                )
+            _append_event(conn, task_id, "promoted", None)
+            promoted += 1
     return promoted
 
 
@@ -4781,19 +5398,14 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
-def _has_unfinished_parents(conn: sqlite3.Connection, task_id: str) -> bool:
-    """True when any linked parent of ``task_id`` is not yet done/archived.
-
-    Single source of truth for the dependency invariant: no task may leave
-    ``ready`` (to ``running`` via :func:`claim_task`, or to ``review`` via a
-    parked ``review-required:`` handoff) while a parent is still open.
-    """
-    return conn.execute(
-        "SELECT 1 FROM task_links l "
-        "JOIN tasks p ON p.id = l.parent_id "
-        "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
-        (task_id,),
-    ).fetchone() is not None
+def _has_unfinished_parents(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+) -> bool:
+    """Compatibility predicate backed by the canonical typed resolver."""
+    return not resolve_task_dependencies(conn, task_id, board=board).satisfied
 
 
 def claim_task(
@@ -4802,6 +5414,7 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    board: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -4811,6 +5424,7 @@ def claim_task(
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    board_slug = _dependency_board(conn, board)
     with write_txn(conn):
         task_guard = conn.execute(
             "SELECT recovery_required FROM tasks WHERE id=?", (task_id,)
@@ -4825,17 +5439,36 @@ def claim_task(
         # 'todo' here — recompute_ready will re-promote when the parents
         # actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone = _has_unfinished_parents(conn, task_id)
-        if undone:
+        dependency_resolution = resolve_task_dependencies(
+            conn,
+            task_id,
+            board=board_slug,
+        )
+        if not dependency_resolution.satisfied:
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "
                 "WHERE id = ? AND status = 'ready'",
                 (task_id,),
             )
-            _append_event(
-                conn, task_id, "claim_rejected",
-                {"reason": "parents_not_done"},
-            )
+            if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone():
+                diagnostic = (
+                    dependency_resolution.diagnostics[0]
+                    if dependency_resolution.diagnostics
+                    else next(
+                        (
+                            item.diagnostics
+                            for item in dependency_resolution.evidence
+                            if item.status != "satisfied" and item.diagnostics
+                        ),
+                        {"reason": "dependencies_unsatisfied"},
+                    )
+                )
+                _append_event(
+                    conn,
+                    task_id,
+                    "claim_rejected",
+                    {"reason": "dependencies_unsatisfied", "diagnostic": diagnostic},
+                )
             return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
@@ -4884,8 +5517,8 @@ def claim_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                dependency_binding, started_at
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -4894,6 +5527,13 @@ def claim_task(
                 lock,
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
+                json.dumps(
+                    dependency_resolution.binding,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                if dependency_resolution.binding
+                else None,
                 now,
             ),
         )
@@ -4903,15 +5543,22 @@ def claim_task(
             (run_id, task_id),
         )
         _append_event(
-            conn, task_id, "claimed",
-            {"lock": lock, "expires": expires, "run_id": run_id},
+            conn,
+            task_id,
+            "claimed",
+            {
+                "lock": lock,
+                "expires": expires,
+                "run_id": run_id,
+                "dependency_binding": dependency_resolution.binding,
+            },
             run_id=run_id,
         )
         claimed = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
         task_id,
-        board=get_current_board(),
+        board=board_slug,
         assignee=claimed.assignee if claimed else None,
         run_id=run_id,
     )
@@ -7915,6 +8562,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    board: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -7945,6 +8593,7 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    board_slug = _dependency_board(conn, board)
 
     # Reviewers must decide through approve/request-changes. This guard is the
     # first operation in the write transaction so even a hallucinated
@@ -8131,7 +8780,7 @@ def complete_task(
     # care about", and a success resets that question.
     _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
-    recompute_ready(conn)
+    recompute_ready(conn, board=board_slug)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
@@ -9278,7 +9927,7 @@ def specify_triage_task(
     # logic the dispatcher would on its next tick, so a specified task
     # with no open parents flips straight to 'ready' here instead of
     # idling in 'todo' until the next sweep.
-    recompute_ready(conn)
+    recompute_ready(conn, board=_dependency_board(conn))
     return True
 
 
@@ -9511,7 +10160,7 @@ def decompose_triage_task(
     # stay in 'todo' until the user manually promotes them — useful
     # for manual-review-first workflows.
     if auto_promote:
-        recompute_ready(conn)
+        recompute_ready(conn, board=_dependency_board(conn))
     return child_ids
 
 
@@ -9541,7 +10190,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
-    recompute_ready(conn)
+    recompute_ready(conn, board=_dependency_board(conn))
     return True
 
 
@@ -9594,7 +10243,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
-    recompute_ready(conn)
+    recompute_ready(conn, board=_dependency_board(conn))
     return True
 
 
@@ -9720,21 +10369,131 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+def _git_resolved_object(repo_root: Path, expression: str) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--verify", expression],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    value = (result.stdout or "").strip()
+    return value or None
+
+
+def _verify_workspace_base_pin(repo_root: Path, path: Path, pin: KanbanWorkspaceBasePin) -> None:
+    """Fail closed unless ``path`` is exactly the pinned commit/tree."""
+    head = _git_resolved_object(path, "HEAD^{commit}")
+    tree = _git_resolved_object(path, "HEAD^{tree}")
+    if head != pin.head or tree != pin.tree:
+        raise RuntimeError(
+            f"workspace base pin mismatch at {path}: expected "
+            f"{pin.head}/{pin.tree}, got {head or '<missing>'}/{tree or '<missing>'}"
+        )
+    repo_head = _git_resolved_object(repo_root, f"{pin.head}^{{commit}}")
+    repo_tree = _git_resolved_object(repo_root, f"{pin.head}^{{tree}}")
+    if repo_head != pin.head or repo_tree != pin.tree:
+        raise RuntimeError(
+            f"workspace base pin object is unavailable or has the wrong tree "
+            f"in repository {repo_root}"
+        )
+
+
+def _workspace_base_pin_for_task(
+    task: Task,
+    *,
+    board: Optional[str] = None,
+) -> Optional[KanbanWorkspaceBasePin]:
+    binding = task.dependency_binding
+    if not binding:
+        return None
+    if not isinstance(binding, dict):
+        raise RuntimeError(f"task {task.id} has a malformed dependency binding")
+    expected_board = _dependency_board_for_workspace(board)
+    if binding.get("board") != expected_board:
+        raise RuntimeError(
+            f"task {task.id} dependency binding belongs to board "
+            f"{binding.get('board')!r}, not {expected_board!r}"
+        )
+    dependencies = binding.get("dependencies")
+    if not isinstance(dependencies, list):
+        raise RuntimeError(f"task {task.id} dependency binding has no dependency list")
+    for dependency in dependencies:
+        if not isinstance(dependency, dict) or dependency.get("child_id") != task.id:
+            raise RuntimeError(f"task {task.id} dependency binding has wrong task identity")
+        if not dependency.get("generation"):
+            raise RuntimeError(f"task {task.id} dependency binding has no provider generation")
+    raw_pin = binding.get("workspace_base")
+    if raw_pin is None:
+        return None
+    if task.workspace_kind != "worktree":
+        raise RuntimeError(
+            f"task {task.id} carries a workspace base pin but is not a worktree task"
+        )
+    if not isinstance(raw_pin, dict):
+        raise RuntimeError(f"task {task.id} has a malformed workspace base pin")
+    try:
+        return KanbanWorkspaceBasePin(
+            head=raw_pin["head"],
+            tree=raw_pin["tree"],
+            receipt_generation=raw_pin["receipt_generation"],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"task {task.id} has a malformed workspace base pin") from exc
+
+
+def _dependency_board_for_workspace(board: Optional[str]) -> str:
+    return _normalize_board_slug(board) or get_current_board()
+
+
+def _ensure_git_worktree(
+    repo_root: Path,
+    target: Path,
+    branch_name: str,
+    *,
+    base_pin: Optional[KanbanWorkspaceBasePin] = None,
+) -> None:
+    """Materialize ``target`` as a linked worktree at an optional exact pin."""
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
+    if base_pin is not None:
+        repo_head = _git_resolved_object(repo_root, f"{base_pin.head}^{{commit}}")
+        repo_tree = _git_resolved_object(repo_root, f"{base_pin.head}^{{tree}}")
+        if repo_head != base_pin.head or repo_tree != base_pin.tree:
+            raise RuntimeError(
+                f"workspace base pin object is unavailable or has the wrong tree "
+                f"in repository {repo_root}"
+            )
     if target.exists() and repo_common is not None:
         target_common = _git_common_dir(target)
         if target_common == repo_common:
+            if base_pin is not None:
+                _verify_workspace_base_pin(repo_root, target, base_pin)
             return
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
+        if base_pin is not None:
+            branch_head = _git_resolved_object(
+                repo_root,
+                f"refs/heads/{branch_name}^{{commit}}",
+            )
+            if branch_head != base_pin.head:
+                raise RuntimeError(
+                    f"existing worktree branch {branch_name!r} is not pinned head "
+                    f"{base_pin.head}"
+                )
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
     else:
         cmd = [
             "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), "HEAD",
+            str(target), base_pin.head if base_pin is not None else "HEAD",
         ]
     result = subprocess.run(
         cmd,
@@ -9748,6 +10507,8 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
         )
+    if base_pin is not None:
+        _verify_workspace_base_pin(repo_root, target, base_pin)
 
 
 def _resolve_worktree_workspace(
@@ -9769,6 +10530,7 @@ def _resolve_worktree_workspace(
     anywhere, we fail loudly rather than guess.
     """
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    base_pin = _workspace_base_pin_for_task(task, board=board)
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
         # The dispatcher's CWD is incidental (gateway launch dir) and using it
@@ -9796,7 +10558,12 @@ def _resolve_worktree_workspace(
             )
         target = repo_root / ".worktrees" / task.id
         if materialize:
-            _ensure_git_worktree(repo_root, target, branch_name)
+            _ensure_git_worktree(
+                repo_root,
+                target,
+                branch_name,
+                base_pin=base_pin,
+            )
         return target, branch_name
 
     requested = Path(task.workspace_path).expanduser()
@@ -9810,6 +10577,13 @@ def _resolve_worktree_workspace(
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
+            if base_pin is not None:
+                repo_root = _repo_root_for_worktree_target(requested.parent)
+                if repo_root is None:
+                    raise RuntimeError(
+                        f"cannot verify pinned worktree {requested}: repository unavailable"
+                    )
+                _verify_workspace_base_pin(repo_root, requested, base_pin)
             return requested_resolved, actual_branch
         # The requested path is an existing checkout of a DIFFERENT
         # task's branch. Decompose children inherit the root's
@@ -9823,18 +10597,33 @@ def _resolve_worktree_workspace(
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
                 if materialize:
-                    _ensure_git_worktree(fallback_root, fallback, branch_name)
+                    _ensure_git_worktree(
+                        fallback_root,
+                        fallback,
+                        branch_name,
+                        base_pin=base_pin,
+                    )
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this
         # task's own canonical worktree): keep the legacy reuse rather
-        # than failing dispatch.
+        # than failing dispatch for ordinary tasks. A pinned task cannot
+        # reuse an unverified checkout, because that would defeat admission.
+        if base_pin is not None:
+            raise RuntimeError(
+                f"cannot verify pinned worktree {requested}: repository unavailable"
+            )
         return requested_resolved, actual_branch or branch_name
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
         if materialize:
-            _ensure_git_worktree(repo_root, target, branch_name)
+            _ensure_git_worktree(
+                repo_root,
+                target,
+                branch_name,
+                base_pin=base_pin,
+            )
         return target, branch_name
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
@@ -9844,7 +10633,12 @@ def _resolve_worktree_workspace(
             "and does not point at a git repo root"
         )
     if materialize:
-        _ensure_git_worktree(repo_root, requested, branch_name)
+        _ensure_git_worktree(
+            repo_root,
+            requested,
+            branch_name,
+            base_pin=base_pin,
+        )
     return requested, branch_name
 
 
@@ -9877,6 +10671,9 @@ def resolve_workspace(
     so subsequent runs reuse the same directory.
     """
     kind = task.workspace_kind or "scratch"
+    # Validate any admitted provider binding even for non-worktree workspace
+    # kinds. A provider cannot smuggle an unused pin through admission.
+    _workspace_base_pin_for_task(task, board=board)
     if kind == "scratch":
         if task.workspace_path:
             # Legacy scratch tasks that were set to an explicit path get the
@@ -13141,7 +13938,11 @@ def _dispatch_once_locked(
         result.rate_limited.extend(_crash_rate_limited)
     if not dry_run:
         result.timed_out = enforce_max_runtime(conn)
-        result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+        result.promoted = recompute_ready(
+            conn,
+            failure_limit=failure_limit,
+            board=board,
+        )
     # Reconcile documented ``review-required:`` handoffs that were promoted
     # into generic ``ready`` back into the reviewer lane on the SAME card,
     # before the ready loop can hand them to a programmer (or the respawn
@@ -13382,7 +14183,12 @@ def _dispatch_once_locked(
                     _per_profile_running.get(_dry_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            board=board,
+        )
         if claimed is None:
             continue
         try:

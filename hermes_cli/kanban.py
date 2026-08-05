@@ -81,6 +81,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "dependency_binding": t.dependency_binding,
     }
 
 
@@ -333,6 +334,21 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
+    p_create.add_argument(
+        "--dependency-kind",
+        default="completion",
+        help="Generic dependency kind for all --parent edges (default: completion)",
+    )
+    p_create.add_argument(
+        "--provider-name",
+        default=None,
+        help="Provider name for a non-completion dependency kind",
+    )
+    p_create.add_argument(
+        "--dependency-metadata",
+        default=None,
+        help="Bounded JSON object passed as opaque provider metadata",
+    )
     p_create.add_argument("--workspace", default="scratch",
                           help="scratch | worktree | worktree:<path> | dir:<path> "
                                "(default: scratch)")
@@ -550,6 +566,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_link = sub.add_parser("link", help="Add a parent->child dependency")
     p_link.add_argument("parent_id")
     p_link.add_argument("child_id")
+    p_link.add_argument("--dependency-kind", default="completion")
+    p_link.add_argument("--provider-name", default=None)
+    p_link.add_argument(
+        "--metadata",
+        default=None,
+        help="Bounded JSON object passed as provider metadata",
+    )
     p_unlink = sub.add_parser("unlink", help="Remove a parent->child dependency")
     p_unlink.add_argument("parent_id")
     p_unlink.add_argument("child_id")
@@ -1551,6 +1574,20 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    dependency_metadata = None
+    raw_dependency_metadata = getattr(args, "dependency_metadata", None)
+    if raw_dependency_metadata:
+        try:
+            dependency_metadata = json.loads(raw_dependency_metadata)
+        except json.JSONDecodeError as exc:
+            print(
+                f"kanban: --dependency-metadata must be valid JSON: {exc}",
+                file=sys.stderr,
+            )
+            return 2
+        if not isinstance(dependency_metadata, dict):
+            print("kanban: --dependency-metadata must be a JSON object", file=sys.stderr)
+            return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1575,6 +1612,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            dependency_kind=getattr(args, "dependency_kind", "completion"),
+            provider_name=getattr(args, "provider_name", None),
+            dependency_metadata=dependency_metadata,
+            board=getattr(args, "board", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -1634,7 +1675,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         # Cheap "mini-dispatch": recompute ready so list output reflects
         # dependencies that may have cleared since the last dispatcher tick.
-        kb.recompute_ready(conn)
+        kb.recompute_ready(conn, board=getattr(args, "board", None))
         tasks = kb.list_tasks(
             conn,
             assignee=assignee,
@@ -1657,7 +1698,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
     except Exception:
         all_boards = []
     if len(all_boards) > 1:
-        current = kb.get_current_board()
+        current = getattr(args, "board", None) or kb.get_current_board()
         other_count = len(all_boards) - 1
         print(
             f"Board: {current} "
@@ -1689,6 +1730,16 @@ def _cmd_show(args: argparse.Namespace) -> int:
         events = kb.list_events(conn, args.task_id)
         parents = kb.parent_ids(conn, args.task_id)
         children = kb.child_ids(conn, args.task_id)
+        dependency_links = kb.list_dependency_links(
+            conn,
+            args.task_id,
+            board=getattr(args, "board", None),
+        )
+        dependency_evidence = kb.task_dependency_evidence(
+            conn,
+            args.task_id,
+            board=getattr(args, "board", None),
+        )
         runs = kb.list_runs(conn, args.task_id, **rsk)
         # Workers hand off via ``task_runs.summary``; ``tasks.result`` is left NULL unless the caller explicitly passed
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
@@ -1701,6 +1752,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
             "latest_summary": latest_summary,
             "parents": parents,
             "children": children,
+            "dependency_links": dependency_links,
+            "dependency_evidence": dependency_evidence,
             "comments": [
                 {"author": c.author, "body": c.body, "created_at": c.created_at}
                 for c in comments
@@ -1724,6 +1777,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
                     "summary": r.summary,
                     "error": r.error,
                     "metadata": r.metadata,
+                    "dependency_binding": r.dependency_binding,
                     "worker_pid": r.worker_pid,
                     "started_at": r.started_at,
                     "ended_at": r.ended_at,
@@ -1799,6 +1853,16 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  parents:   {', '.join(parents)}")
     if children:
         print(f"  children:  {', '.join(children)}")
+    if dependency_evidence:
+        print("  dependencies:")
+        for evidence in dependency_evidence:
+            provider = (
+                f" {evidence['provider_name']}" if evidence.get("provider_name") else ""
+            )
+            print(
+                f"    {evidence['parent_id']} -> {evidence['status']} "
+                f"({evidence['dependency_kind']}{provider})"
+            )
     if task.body:
         print()
         print("Body:")
@@ -2050,15 +2114,38 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
 
 
 def _cmd_link(args: argparse.Namespace) -> int:
+    metadata = None
+    if getattr(args, "metadata", None):
+        try:
+            metadata = json.loads(args.metadata)
+        except json.JSONDecodeError as exc:
+            print(f"kanban: --metadata must be valid JSON: {exc}", file=sys.stderr)
+            return 2
+        if not isinstance(metadata, dict):
+            print("kanban: --metadata must be a JSON object", file=sys.stderr)
+            return 2
     with kb.connect_closing() as conn:
-        kb.link_tasks(conn, args.parent_id, args.child_id)
+        kb.link_tasks(
+            conn,
+            args.parent_id,
+            args.child_id,
+            dependency_kind=getattr(args, "dependency_kind", "completion"),
+            provider_name=getattr(args, "provider_name", None),
+            metadata=metadata,
+            board=getattr(args, "board", None),
+        )
     print(f"Linked {args.parent_id} -> {args.child_id}")
     return 0
 
 
 def _cmd_unlink(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
-        ok = kb.unlink_tasks(conn, args.parent_id, args.child_id)
+        ok = kb.unlink_tasks(
+            conn,
+            args.parent_id,
+            args.child_id,
+            board=getattr(args, "board", None),
+        )
     if not ok:
         print(f"No such link: {args.parent_id} -> {args.child_id}", file=sys.stderr)
         return 1
@@ -2068,7 +2155,13 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 def _cmd_claim(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
-        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
+        task = kb.claim_task(
+            conn,
+            args.task_id,
+            ttl_seconds=args.ttl,
+            claimer=getattr(args, "claimer", None),
+            board=getattr(args, "board", None),
+        )
         if task is None:
             # Report why
             existing = kb.get_task(conn, args.task_id)
@@ -2081,7 +2174,7 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        workspace = kb.resolve_workspace(task)
+        workspace = kb.resolve_workspace(task, board=getattr(args, "board", None))
         kb.set_workspace_path(conn, task.id, str(workspace))
     print(f"Claimed {task.id}")
     print(f"Workspace: {workspace}")
@@ -2275,6 +2368,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 summary=summary,
                 metadata=metadata,
                 expected_run_id=_worker_run_id_for(tid),
+                board=getattr(args, "board", None),
             ):
                 failed.append(tid)
                 print(f"cannot complete {tid} (unknown id or terminal state)", file=sys.stderr)

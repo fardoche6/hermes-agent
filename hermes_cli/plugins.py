@@ -1174,6 +1174,61 @@ class PluginContext:
             display_name,
         )
 
+    # -- Kanban dependency-provider registration ----------------------------
+
+    def register_kanban_dependency_provider(
+        self,
+        dependency_kind: str,
+        provider_name: str,
+        callback: Callable,
+        *,
+        timeout_seconds: float = 2.0,
+    ) -> None:
+        """Register a bounded, plugin-safe typed Kanban dependency provider.
+
+        ``callback`` receives a frozen
+        :class:`hermes_cli.kanban_dependencies.KanbanDependencyContext` and
+        returns a ``KanbanDependencyResult`` (or its documented JSON shape).
+        It never receives a SQLite connection, plugin manager, or mutable task
+        object. Missing providers, callback errors, malformed results, and
+        timeouts fail closed during readiness and claim.
+        """
+        from hermes_cli.kanban_dependencies import (
+            register_kanban_dependency_provider,
+        )
+
+        owner = self.manifest.key or self.manifest.name
+        register_kanban_dependency_provider(
+            dependency_kind,
+            provider_name,
+            callback,
+            timeout_seconds=timeout_seconds,
+            owner=owner,
+        )
+        logger.debug(
+            "Plugin %s registered Kanban dependency provider: %s/%s",
+            self.manifest.name,
+            dependency_kind,
+            provider_name,
+        )
+
+    def unregister_kanban_dependency_provider(
+        self,
+        dependency_kind: str,
+        provider_name: str,
+    ) -> bool:
+        """Remove one Kanban dependency provider owned by this plugin."""
+        from hermes_cli.kanban_dependencies import (
+            unregister_kanban_dependency_provider,
+        )
+
+        owner = self.manifest.key or self.manifest.name
+        return unregister_kanban_dependency_provider(
+            dependency_kind,
+            provider_name,
+            owner=owner,
+        )
+
     def register_hook(self, hook_name: str, callback: Callable) -> None:
         """Register a lifecycle hook callback.
 
@@ -1309,6 +1364,17 @@ class PluginManager:
             self._discovered = True
             return
         if force:
+            from hermes_cli.kanban_dependencies import (
+                unregister_kanban_dependency_providers,
+            )
+
+            # Providers are process-global because the DB resolver is shared
+            # by all board connections. Force discovery reconstructs plugin
+            # registrations, but must not delete providers registered directly
+            # by an application or by a different PluginManager instance.
+            for loaded in self._plugins.values():
+                owner = loaded.manifest.key or loaded.manifest.name
+                unregister_kanban_dependency_providers(owner=owner)
             self._plugins.clear()
             self._hooks.clear()
             self._middleware.clear()
@@ -1841,12 +1907,53 @@ class PluginManager:
                 )
 
         except Exception as exc:
+            # A plugin may register a provider before a later registration step
+            # fails. Do not leave that process-global provider active behind a
+            # failed plugin load; it would affect every board connection.
+            from hermes_cli.kanban_dependencies import (
+                unregister_kanban_dependency_providers,
+            )
+            unregister_kanban_dependency_providers(
+                owner=manifest.key or manifest.name,
+            )
             loaded.error = str(exc)
             logger.warning(
                 "Failed to load plugin '%s': %s",
                 manifest.name, exc, exc_info=_PLUGINS_DEBUG,
             )
         self._plugins[manifest.key or manifest.name] = loaded
+
+    def unload_plugin(self, plugin: str) -> bool:
+        """Unload one discovered plugin's provider registrations.
+
+        Plugin registries historically have process-wide teardown semantics
+        during a forced discovery refresh.  This narrow public unload surface
+        gives callers the same provider isolation for one plugin without
+        clearing direct registrations or providers owned by other plugins.
+        """
+        key = str(plugin).strip()
+        if not key:
+            return False
+        found_key = None
+        loaded = None
+        for candidate, candidate_loaded in self._plugins.items():
+            if candidate == key or candidate_loaded.manifest.name == key:
+                found_key = candidate
+                loaded = candidate_loaded
+                break
+        if loaded is None or found_key is None:
+            return False
+        from hermes_cli.kanban_dependencies import (
+            unregister_kanban_dependency_providers,
+        )
+        unregister_kanban_dependency_providers(
+            owner=loaded.manifest.key or loaded.manifest.name,
+        )
+        self._plugins.pop(found_key, None)
+        module = loaded.module
+        if module is not None:
+            sys.modules.pop(module.__name__, None)
+        return True
 
     def _load_directory_module(self, manifest: PluginManifest) -> types.ModuleType:
         """Import a directory-based plugin as ``hermes_plugins.<slug>``.
@@ -2063,6 +2170,11 @@ def discover_plugins(force: bool = False) -> None:
     manifests and reload state in the current process.
     """
     get_plugin_manager().discover_and_load(force=force)
+
+
+def unload_plugin(plugin: str) -> bool:
+    """Unload one plugin's owned provider registrations."""
+    return get_plugin_manager().unload_plugin(plugin)
 
 
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:

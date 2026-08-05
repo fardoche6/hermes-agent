@@ -486,6 +486,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "started_at": task.started_at,
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
+        "dependency_binding": task.dependency_binding,
         "model_override": task.model_override,
         "provider_override": task.provider_override,
         "parents": parents,
@@ -519,6 +520,12 @@ def _handle_show(args: dict, **kw) -> str:
             runs = kb.list_runs(conn, tid)
             parents = kb.parent_ids(conn, tid)
             children = kb.child_ids(conn, tid)
+            dependency_links = kb.list_dependency_links(conn, tid, board=board)
+            dependency_evidence = kb.task_dependency_evidence(
+                conn,
+                tid,
+                board=board,
+            )
 
             def _task_dict(t):
                 return {
@@ -532,6 +539,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "completed_at": t.completed_at,
                     "result": t.result,
                     "current_run_id": t.current_run_id,
+                    "dependency_binding": t.dependency_binding,
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
                 }
@@ -542,6 +550,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "status": r.status, "outcome": r.outcome,
                     "summary": r.summary, "error": r.error,
                     "metadata": r.metadata,
+                    "dependency_binding": r.dependency_binding,
                     "started_at": r.started_at, "ended_at": r.ended_at,
                 }
 
@@ -549,6 +558,8 @@ def _handle_show(args: dict, **kw) -> str:
                 "task": _task_dict(task),
                 "parents": parents,
                 "children": children,
+                "dependency_links": dependency_links,
+                "dependency_evidence": dependency_evidence,
                 "comments": [
                     {"author": c.author, "body": c.body,
                      "created_at": c.created_at}
@@ -604,7 +615,7 @@ def _handle_list(args: dict, **kw) -> str:
         try:
             # Match CLI list: dependencies that cleared since the last
             # dispatcher tick should be visible to orchestrators immediately.
-            promoted = kb.recompute_ready(conn)
+            promoted = kb.recompute_ready(conn, board=board)
             # Fetch one extra row so model-facing output can report that
             # a bounded listing was truncated without dumping the board.
             rows = kb.list_tasks(
@@ -778,6 +789,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    board=board,
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -1414,6 +1426,9 @@ def _handle_create(args: dict, **kw) -> str:
     goal_max_turns = args.get("goal_max_turns")
     model_override = args.get("model")
     provider_override = args.get("provider")
+    dependency_kind = args.get("dependency_kind") or "completion"
+    dependency_provider = args.get("provider_name")
+    dependency_metadata = args.get("dependency_metadata")
     if provider_override and not model_override:
         return tool_error("'provider' requires 'model' to be set as well")
     if isinstance(parents, str):
@@ -1464,6 +1479,12 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                dependency_kind=str(dependency_kind),
+                provider_name=(
+                    str(dependency_provider) if dependency_provider is not None else None
+                ),
+                dependency_metadata=dependency_metadata,
+                board=board,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1653,8 +1674,21 @@ def _handle_link(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
-            kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
-            return _ok(parent_id=parent_id, child_id=child_id)
+            kb.link_tasks(
+                conn,
+                parent_id=parent_id,
+                child_id=child_id,
+                dependency_kind=args.get("dependency_kind") or "completion",
+                provider_name=args.get("provider_name"),
+                metadata=args.get("metadata"),
+                board=board,
+            )
+            return _ok(
+                parent_id=parent_id,
+                child_id=child_id,
+                dependency_kind=args.get("dependency_kind") or "completion",
+                provider_name=args.get("provider_name"),
+            )
         finally:
             conn.close()
     except ValueError as e:
@@ -2134,6 +2168,25 @@ KANBAN_CREATE_SCHEMA = {
                     "synthesizer task."
                 ),
             },
+            "dependency_kind": {
+                "type": "string",
+                "description": (
+                    "Generic dependency kind for every parent edge created "
+                    "here. Omit for ordinary completion dependencies."
+                ),
+            },
+            "provider_name": {
+                "type": "string",
+                "description": (
+                    "Provider name paired with a non-completion dependency kind."
+                ),
+            },
+            "dependency_metadata": {
+                "type": "object",
+                "description": (
+                    "Bounded opaque JSON metadata passed to the registered provider."
+                ),
+            },
             "tenant": {
                 "type": "string",
                 "description": (
@@ -2302,6 +2355,18 @@ KANBAN_LINK_SCHEMA = {
         "properties": {
             "parent_id": {"type": "string", "description": "Parent task id."},
             "child_id":  {"type": "string", "description": "Child task id."},
+            "dependency_kind": {
+                "type": "string",
+                "description": "Generic dependency kind; omit for completion.",
+            },
+            "provider_name": {
+                "type": "string",
+                "description": "Provider paired with a non-completion kind.",
+            },
+            "metadata": {
+                "type": "object",
+                "description": "Bounded opaque JSON metadata for the provider.",
+            },
             "board": _board_schema_prop(),
         },
         "required": ["parent_id", "child_id"],
