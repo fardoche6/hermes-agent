@@ -84,6 +84,32 @@ def _start_followup_review(conn, task_id: str, *, reviewer="code-reviewer", host
     return review
 
 
+def _terminal_decision(conn, task_id, review, *, kind, trusted):
+    if kind == "request_changes":
+        return kb.request_changes(
+            conn, task_id, "programmer", reviewer=None if trusted else "code-reviewer",
+            reason="test decision", expected_claim=None if trusted else review.claim_lock,
+            expected_run_id=None if trusted else review.current_run_id,
+            trusted_operator=trusted,
+        )
+    return kb.approve_review(
+        conn, task_id, reviewer="code-reviewer", summary="test decision",
+        head_sha=HEAD_SHA, expected_claim=None if trusted else review.claim_lock,
+        expected_run_id=None if trusted else review.current_run_id,
+        trusted_operator=trusted,
+    )
+
+
+def _assert_no_mutation(conn, task_id, before_events, before_runs, review):
+    assert _events(conn, task_id) == before_events
+    assert conn.execute(
+        "SELECT id, status, outcome, ended_at FROM task_runs "
+        "WHERE task_id=? ORDER BY id", (task_id,),
+    ).fetchall() == before_runs
+    current = kb.get_task(conn, task_id)
+    assert current is not None and current.current_run_id == review.current_run_id
+
+
 def test_claimed_reviewer_stays_in_review_column(kanban_home):
     with kb.connect() as conn:
         task_id, review, _ = _review_card(conn)
@@ -269,6 +295,102 @@ def test_running_reviewer_rejects_expired_claim_without_mutation(kanban_home):
         assert current is not None
         assert current.current_run_id == review.current_run_id
         assert _events(conn, task_id) == before_events
+
+
+@pytest.mark.parametrize("kind", ["request_changes", "approve"])
+@pytest.mark.parametrize(
+    "payload",
+    ["[", "[]", "{}", '{"reviewer": null}', '{"reviewer": "   "}'],
+)
+def test_malformed_latest_review_authority_fails_closed(kanban_home, kind, payload):
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        authority = conn.execute(
+            "SELECT id FROM task_events WHERE task_id=? "
+            "AND kind='submitted_for_review' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert authority is not None
+        conn.execute(
+            "UPDATE task_events SET payload=? WHERE id=?", (payload, authority["id"]),
+        )
+        conn.commit()
+        before_events = _events(conn, task_id)
+        before_runs = conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id=? ORDER BY id", (task_id,),
+        ).fetchall()
+
+        with pytest.raises(RuntimeError, match="reviewer generation|reviewer lane"):
+            _terminal_decision(conn, task_id, review, kind=kind, trusted=kind == "approve")
+
+        _assert_no_mutation(conn, task_id, before_events, before_runs, review)
+
+
+@pytest.mark.parametrize("kind", ["request_changes", "approve"])
+def test_missing_latest_failover_authority_fails_closed(kanban_home, kind):
+    with kb.connect() as conn:
+        task_id, review, host = _review_card(conn, reviewer="reviewer-a")
+        assert kb.failover_review_task(conn, task_id, "reviewer-b", error="handoff")
+        replacement = kb.claim_review_task(conn, task_id, claimer=f"{host}:replacement")
+        assert replacement is not None
+        authority = conn.execute(
+            "SELECT id FROM task_events WHERE task_id=? AND kind='review_failover' "
+            "ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        assert authority is not None
+        conn.execute(
+            "UPDATE task_events SET payload=? WHERE id=?",
+            (json.dumps({"other": "missing"}), authority["id"]),
+        )
+        conn.commit()
+        before_events = _events(conn, task_id)
+        before_runs = conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id=? ORDER BY id", (task_id,),
+        ).fetchall()
+
+        with pytest.raises(RuntimeError, match="reviewer generation|reviewer lane"):
+            _terminal_decision(
+                conn, task_id, replacement, kind=kind, trusted=kind == "approve",
+            )
+
+        _assert_no_mutation(conn, task_id, before_events, before_runs, replacement)
+
+
+@pytest.mark.parametrize("kind", ["request_changes", "approve"])
+@pytest.mark.parametrize(
+    "null_side",
+    ["task", "run", "both", "task_boundary", "run_boundary"],
+)
+def test_missing_or_nonfresh_claim_expiry_fails_closed(kanban_home, kind, null_side):
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        expiry = int(time.time())
+        task_expiry = None if null_side in {"task", "both"} else expiry
+        run_expiry = None if null_side in {"run", "both"} else expiry
+        if null_side == "task_boundary":
+            task_expiry = expiry
+            run_expiry = expiry + 60
+        elif null_side == "run_boundary":
+            task_expiry = expiry + 60
+            run_expiry = expiry
+        conn.execute("UPDATE tasks SET claim_expires=? WHERE id=?", (task_expiry, task_id))
+        conn.execute(
+            "UPDATE task_runs SET claim_expires=? WHERE id=?",
+            (run_expiry, review.current_run_id),
+        )
+        conn.commit()
+        before_events = _events(conn, task_id)
+        before_runs = conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id=? ORDER BY id", (task_id,),
+        ).fetchall()
+
+        with pytest.raises(RuntimeError, match="reviewer generation"):
+            _terminal_decision(conn, task_id, review, kind=kind, trusted=kind == "approve")
+
+        _assert_no_mutation(conn, task_id, before_events, before_runs, review)
 
 
 def test_trusted_request_changes_rejects_reassigned_review_owner(kanban_home):

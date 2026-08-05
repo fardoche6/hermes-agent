@@ -4641,7 +4641,10 @@ def _authoritative_reviewer(
             if row["kind"] == "review_failover"
             else payload.get("reviewer")
         )
-        reviewer = _canonical_assignee(candidate if isinstance(candidate, str) else None)
+        try:
+            reviewer = _canonical_assignee(candidate if isinstance(candidate, str) else None)
+        except (TypeError, ValueError):
+            return None
         if reviewer:
             return reviewer
     return None
@@ -4678,12 +4681,12 @@ def _active_review_generation(
         or not run["profile"]
         or not run["claim_lock"]
         or (
-            run["claim_expires"] is not None
-            and int(run["claim_expires"]) <= now
+            run["claim_expires"] is None
+            or int(run["claim_expires"]) <= now
         )
         or (
-            task_row["claim_expires"] is not None
-            and int(task_row["claim_expires"]) <= now
+            task_row["claim_expires"] is None
+            or int(task_row["claim_expires"]) <= now
         )
         or task_row["claim_lock"] != run["claim_lock"]
         or not authoritative
@@ -5047,24 +5050,7 @@ def request_changes(
             )
 
         if not trusted_operator:
-            submitted = None
-            for event in conn.execute(
-                "SELECT payload FROM task_events WHERE task_id=? "
-                "AND kind IN ('submitted_for_review', 'review_failover') "
-                "ORDER BY id DESC",
-                (task_id,),
-            ):
-                try:
-                    payload = json.loads(event["payload"]) if event["payload"] else {}
-                except (TypeError, ValueError):
-                    payload = {}
-                if isinstance(payload, dict):
-                    lane = payload.get("next_reviewer") or payload.get("reviewer")
-                    submitted = _canonical_assignee(
-                        lane if isinstance(lane, str) else None
-                    )
-                    if submitted:
-                        break
+            submitted = _authoritative_reviewer(conn, task_id)
             if submitted != reviewer_name:
                 raise RuntimeError(
                     f"cannot request changes for {task_id}: caller "
@@ -5244,24 +5230,7 @@ def approve_review(
                 "review claim"
             )
 
-        submitted = None
-        for event in conn.execute(
-            "SELECT payload FROM task_events WHERE task_id=? "
-            "AND kind IN ('submitted_for_review', 'review_failover') "
-            "ORDER BY id DESC",
-            (task_id,),
-        ):
-            try:
-                payload = json.loads(event["payload"]) if event["payload"] else {}
-            except (TypeError, ValueError):
-                payload = {}
-            if isinstance(payload, dict):
-                lane = payload.get("next_reviewer") or payload.get("reviewer")
-                submitted = _canonical_assignee(
-                    lane if isinstance(lane, str) else None
-                )
-                if submitted:
-                    break
+        submitted = _authoritative_reviewer(conn, task_id)
         if submitted != reviewer_name:
             raise RuntimeError(
                 f"cannot approve {task_id}: caller {reviewer_name!r} does not "
