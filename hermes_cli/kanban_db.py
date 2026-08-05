@@ -995,6 +995,11 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Set when a claimed launch cannot be safely retired.  Recovery-required
+    # claims are fail-closed: no reclaim, reassignment, or successor spawn may
+    # clear the physical-ownership uncertainty.
+    recovery_required: bool = False
+    recovery_reason: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1088,6 +1093,14 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            recovery_required=(
+                bool(row["recovery_required"])
+                if "recovery_required" in keys and row["recovery_required"] is not None
+                else False
+            ),
+            recovery_reason=(
+                row["recovery_reason"] if "recovery_reason" in keys else None
             ),
         )
 
@@ -1276,7 +1289,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Physical launch-gate retirement failed.  This is intentionally separate
+    -- from ``status``: a recovery-required claim must not be made spawnable by
+    -- a stale-claim or reviewer failover transition.
+    recovery_required    INTEGER NOT NULL DEFAULT 0,
+    recovery_reason      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1331,6 +1349,28 @@ CREATE TABLE IF NOT EXISTS task_runs (
     error               TEXT
 );
 
+-- Physical reviewer launch gates.  A row is created only after a dormant
+-- subprocess exists and is attached under the same BEGIN IMMEDIATE lock as
+-- the task/run PID update.  Every identity component is persisted so a later
+-- failover/reclaim cannot mistake a stale child for the current generation.
+CREATE TABLE IF NOT EXISTS task_launch_gates (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id        TEXT NOT NULL,
+    run_id         INTEGER NOT NULL,
+    claim_lock     TEXT NOT NULL,
+    assignee       TEXT NOT NULL,
+    authority_id   INTEGER NOT NULL,
+    gate_token     TEXT NOT NULL UNIQUE,
+    gate_pid       INTEGER NOT NULL,
+    state          TEXT NOT NULL,
+    workspace_path TEXT,
+    workspace_kind TEXT,
+    workspace_created INTEGER NOT NULL DEFAULT 0,
+    created_at     INTEGER NOT NULL,
+    closed_at      INTEGER,
+    reason         TEXT
+);
+
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
 -- this row carries metadata + the absolute ``stored_path`` so the
@@ -1374,6 +1414,8 @@ CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, c
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
+CREATE INDEX IF NOT EXISTS idx_launch_gates_task    ON task_launch_gates(task_id, id);
+CREATE INDEX IF NOT EXISTS idx_launch_gates_pid     ON task_launch_gates(gate_pid, state);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
@@ -2474,6 +2516,21 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "tasks",
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
+        )
+
+    if "recovery_required" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "recovery_required",
+            "recovery_required INTEGER NOT NULL DEFAULT 0",
+        )
+    if "recovery_reason" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "recovery_reason",
+            "recovery_reason TEXT",
         )
 
     # Indexes over additive ``tasks`` columns must be created after the
@@ -4331,6 +4388,8 @@ def claim_task(
                SET status        = 'running',
                    claim_lock    = ?,
                    claim_expires = ?,
+                   recovery_required = 0,
+                   recovery_reason = NULL,
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
                AND status = 'ready'
@@ -4432,13 +4491,14 @@ def claim_review_task(
             return None
     with write_txn(conn):
         task_row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id=?",
+            "SELECT status, claim_lock, assignee, recovery_required FROM tasks WHERE id=?",
             (task_id,),
         ).fetchone()
         if (
             task_row is None
             or task_row["status"] != "review"
             or task_row["claim_lock"] is not None
+            or bool(task_row["recovery_required"])
         ):
             return None
 
@@ -4505,6 +4565,8 @@ def claim_review_task(
                SET status        = 'review',
                    claim_lock    = ?,
                    claim_expires = ?,
+                   recovery_required = 0,
+                   recovery_reason = NULL,
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
                AND status = 'review'
@@ -5947,6 +6009,7 @@ def failover_review_task(
     *,
     error: Optional[str] = None,
     attempted: Optional[list[dict[str, str]]] = None,
+    expected_run_id: Optional[int] = None,
 ) -> Optional[Task]:
     """Keep a failed reviewer handoff in ``review`` or block it terminally.
 
@@ -5957,11 +6020,63 @@ def failover_review_task(
     reviewer = _canonical_assignee(reviewer) if reviewer else None
     bounded = _bounded_review_error(error) if error else None
     sanitized_attempted = _sanitize_review_attempts(attempted)
+
+    # A reviewer transition is not allowed to create a successor while the
+    # current physical owner is uncertain.  Retire the dormant/released gate
+    # before opening the lifecycle transaction; the helper itself records
+    # recovery_required when termination cannot be proven.
+    preflight = conn.execute(
+        "SELECT status, current_run_id, claim_lock, worker_pid, recovery_required "
+        "FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    if preflight is None or preflight["status"] != "review":
+        return None
+    if (
+        expected_run_id is not None
+        and preflight["current_run_id"] != int(expected_run_id)
+    ):
+        return None
+    if bool(preflight["recovery_required"]):
+        return None
+    if preflight["claim_lock"] is not None:
+        if not _retire_review_launch_gate(
+            conn,
+            task_id,
+            preflight["claim_lock"],
+            reason="review failover",
+        ):
+            return None
+        # Legacy/custom reviewer hooks have no durable gate row.  They still
+        # need the same authoritative termination rule before replacement.
+        remaining_pid = conn.execute(
+            "SELECT worker_pid FROM tasks WHERE id=? AND claim_lock=?",
+            (task_id, preflight["claim_lock"]),
+        ).fetchone()
+        if remaining_pid is not None and remaining_pid["worker_pid"]:
+            termination = _terminate_reclaimed_worker(
+                int(remaining_pid["worker_pid"]), preflight["claim_lock"],
+            )
+            if _worker_survived_termination(termination):
+                _mark_recovery_required(
+                    conn,
+                    task_id,
+                    preflight["claim_lock"],
+                    reason="review failover worker termination was not proven",
+                    termination=termination,
+                )
+                return None
+
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, current_run_id FROM tasks WHERE id=?", (task_id,)
+            "SELECT status, current_run_id, claim_lock, recovery_required FROM tasks WHERE id=?",
+            (task_id,),
         ).fetchone()
-        if row is None or row["status"] != "review":
+        if (
+            row is None
+            or row["status"] != "review"
+            or bool(row["recovery_required"])
+        ):
             return None
         attempted_profiles = {
             _canonical_assignee(item.get("profile"))
@@ -5996,7 +6111,8 @@ def failover_review_task(
         if reviewer:
             conn.execute(
                 "UPDATE tasks SET status='review', assignee=?, claim_lock=NULL, "
-                "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+                "claim_expires=NULL, worker_pid=NULL, recovery_required=0, "
+                "recovery_reason=NULL WHERE id=?",
                 (reviewer, task_id),
             )
             _append_event(
@@ -6019,7 +6135,7 @@ def failover_review_task(
             conn.execute(
                 "UPDATE tasks SET status='blocked', assignee=NULL, claim_lock=NULL, "
                 "claim_expires=NULL, worker_pid=NULL, block_kind='capability', "
-                "last_failure_error=? WHERE id=?",
+                "recovery_required=0, recovery_reason=NULL, last_failure_error=? WHERE id=?",
                 (_bounded_review_error(reason), task_id),
             )
             _append_event(
@@ -6136,7 +6252,8 @@ def release_stale_claims(
     review_reclaimed: dict[str, str] = {}
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, status, claim_lock, worker_pid, claim_expires, last_heartbeat_at "
+        "SELECT id, status, claim_lock, worker_pid, claim_expires, last_heartbeat_at, "
+        "recovery_required "
         "FROM tasks "
         "WHERE status IN ('running', 'review') AND ("
         "  (claim_expires IS NOT NULL AND claim_expires < ?) OR "
@@ -6161,6 +6278,7 @@ def release_stale_claims(
             and row["worker_pid"]
             and _pid_alive(row["worker_pid"])
             and not heartbeat_stale
+            and not bool(row["recovery_required"])
         ):
             new_expires = now + _resolve_claim_ttl_seconds()
             with write_txn(conn):
@@ -6208,16 +6326,30 @@ def release_stale_claims(
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
         if _worker_survived_termination(termination):
+            _mark_recovery_required(
+                conn,
+                row["id"],
+                row["claim_lock"],
+                reason="stale claim worker termination was not proven",
+                termination=termination,
+            )
             _defer_reclaim_for_live_worker(
                 conn, row["id"], row["claim_lock"], now, termination,
                 reason="ttl_expired_worker_alive",
             )
             continue
+        gate_to_retire = conn.execute(
+            "SELECT * FROM task_launch_gates WHERE task_id=? AND gate_pid=? "
+            "AND claim_lock=? AND state IN ('attached', 'authorized', 'prepared', 'released', 'revalidation_failed') "
+            "ORDER BY id DESC LIMIT 1",
+            (row["id"], row["worker_pid"], row["claim_lock"]),
+        ).fetchone()
         with write_txn(conn):
             release_status = "review" if row["status"] == "review" else "ready"
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
+                "claim_expires = NULL, worker_pid = NULL, recovery_required=0, "
+                "recovery_reason=NULL "
                 "WHERE id = ? AND status = ? AND claim_lock IS ? "
                 "AND ("
                 "  (claim_expires IS NOT NULL AND claim_expires < ?) OR "
@@ -6230,6 +6362,15 @@ def release_stale_claims(
             )
             if cur.rowcount != 1:
                 continue
+            if gate_to_retire is not None:
+                conn.execute(
+                    "UPDATE task_launch_gates SET state='retired', closed_at=?, "
+                    "reason=? WHERE id=? AND state IN "
+                    "('attached', 'authorized', 'prepared', 'released', 'revalidation_failed')",
+                    (
+                        int(time.time()), "stale claim reclaimed", gate_to_retire["id"],
+                    ),
+                )
             terminal_error = _bounded_review_error(
                 f"stale_lock={row['claim_lock']}"
             )
@@ -6260,6 +6401,10 @@ def release_stale_claims(
                 payload,
                 run_id=run_id,
             )
+            if gate_to_retire is not None:
+                if gate_to_retire["state"] in ("attached", "authorized", "prepared", "revalidation_failed"):
+                    _cleanup_review_launch_workspace(gate_to_retire)
+                _REVIEW_LAUNCH_HANDLES.pop(int(gate_to_retire["gate_pid"]), None)
             reclaimed += 1
             if row["status"] == "review":
                 review_reclaimed[row["id"]] = terminal_error
@@ -6291,7 +6436,7 @@ def reclaim_task(
     reclaimable state (not running, or doesn't exist).
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?",
+        "SELECT status, claim_lock, worker_pid, recovery_required FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
@@ -6303,16 +6448,39 @@ def reclaim_task(
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
+    if _worker_survived_termination(termination):
+        _mark_recovery_required(
+            conn,
+            task_id,
+            prev_lock,
+            reason="manual reclaim worker termination was not proven",
+            termination=termination,
+        )
+        return False
+    gate_to_retire = conn.execute(
+        "SELECT * FROM task_launch_gates WHERE task_id=? AND gate_pid=? "
+        "AND claim_lock=? AND state IN ('attached', 'authorized', 'prepared', 'released', 'revalidation_failed') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, row["worker_pid"], prev_lock),
+    ).fetchone()
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = CASE WHEN status = 'review' THEN 'review' ELSE 'ready' END, claim_lock = NULL, "
-            "claim_expires = NULL, worker_pid = NULL "
+            "claim_expires = NULL, worker_pid = NULL, recovery_required=0, "
+            "recovery_reason=NULL "
             "WHERE id = ? AND status IN ('running', 'review', 'ready', 'blocked') "
             "AND claim_lock IS ?",
             (task_id, prev_lock),
         )
         if cur.rowcount != 1:
             return False
+        if gate_to_retire is not None:
+            conn.execute(
+                "UPDATE task_launch_gates SET state='retired', closed_at=?, "
+                "reason=? WHERE id=? AND state IN "
+                "('attached', 'authorized', 'prepared', 'released', 'revalidation_failed')",
+                (int(time.time()), "manual reclaim", gate_to_retire["id"]),
+            )
         run_id = _end_run(
             conn, task_id,
             outcome="reclaimed", status="reclaimed",
@@ -6338,6 +6506,10 @@ def reclaim_task(
     # a fresh budget. (_clear_failure_counter opens its own write_txn,
     # so it runs after the enclosing one commits.)
     _clear_failure_counter(conn, task_id)
+    if gate_to_retire is not None:
+        if gate_to_retire["state"] in ("attached", "authorized", "prepared", "revalidation_failed"):
+            _cleanup_review_launch_workspace(gate_to_retire)
+        _REVIEW_LAUNCH_HANDLES.pop(int(gate_to_retire["gate_pid"]), None)
     return True
 
 
@@ -8329,9 +8501,14 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
 
 
 def _resolve_worktree_workspace(
-    task: Task, *, board: Optional[str] = None
+    task: Task, *, board: Optional[str] = None, materialize: bool = True
 ) -> tuple[Path, str]:
-    """Resolve + materialize a linked git worktree for ``task``.
+    """Resolve a linked git worktree for ``task``.
+
+    ``materialize=False`` is the side-effect-free planning path used by the
+    review launch gate. It may inspect the anchor repository and existing
+    checkout, but it must not create a worktree until the gate's generation
+    authorization has committed.
 
     When ``task.workspace_path`` is unset, the anchor is the board's
     ``default_workdir`` (a persistent project checkout). This keeps every
@@ -8368,7 +8545,8 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        if materialize:
+            _ensure_git_worktree(repo_root, target, branch_name)
         return target, branch_name
 
     requested = Path(task.workspace_path).expanduser()
@@ -8394,7 +8572,8 @@ def _resolve_worktree_workspace(
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
+                if materialize:
+                    _ensure_git_worktree(fallback_root, fallback, branch_name)
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this
         # task's own canonical worktree): keep the legacy reuse rather
@@ -8404,7 +8583,8 @@ def _resolve_worktree_workspace(
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        if materialize:
+            _ensure_git_worktree(repo_root, target, branch_name)
         return target, branch_name
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
@@ -8413,11 +8593,14 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
+    if materialize:
+        _ensure_git_worktree(repo_root, requested, branch_name)
     return requested, branch_name
 
 
-def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
+def resolve_workspace(
+    task: Task, *, board: Optional[str] = None, materialize: bool = True
+) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
     - ``scratch``: a fresh dir under ``<board-root>/workspaces/<id>/``,
@@ -8457,7 +8640,8 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
                 )
         else:
             p = workspaces_root(board=board) / task.id
-        p.mkdir(parents=True, exist_ok=True)
+        if materialize:
+            p.mkdir(parents=True, exist_ok=True)
         return p
     if kind == "dir":
         if not task.workspace_path:
@@ -8471,10 +8655,13 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
                 f"{task.workspace_path!r}; use an absolute path "
                 f"(relative paths are ambiguous against the dispatcher's CWD)"
             )
-        p.mkdir(parents=True, exist_ok=True)
+        if materialize:
+            p.mkdir(parents=True, exist_ok=True)
         return p
     if kind == "worktree":
-        p, _branch_name = _resolve_worktree_workspace(task, board=board)
+        p, _branch_name = _resolve_worktree_workspace(
+            task, board=board, materialize=materialize,
+        )
         return p
     raise ValueError(f"unknown workspace_kind: {kind}")
 
@@ -8894,19 +9081,53 @@ def _terminate_reclaimed_worker(
 
 
 def _worker_survived_termination(termination: dict) -> bool:
-    """True when we tried to kill our own host-local worker and it is still alive.
+    """True when termination did not produce authoritative death proof.
 
-    Reclaiming in this state would release the claim and let the dispatcher
-    spawn a second worker while the first is still running — the duplication
-    loop. Only host-local workers we actually signalled count: a non-local
-    claim lock or a no-op attempt (no ``os.kill`` available) must fall through
-    to the normal release path, since we cannot manage that worker anyway.
+    A false ``terminated`` result is fail-closed even when the PID is remote or
+    the signal hook was unavailable.  The dispatcher must never turn an
+    uncertain physical owner into a successor spawn opportunity.
     """
-    return bool(
-        termination.get("termination_attempted")
-        and termination.get("host_local")
-        and not termination.get("terminated")
-    )
+    return bool(termination.get("prev_pid") and not termination.get("terminated"))
+
+
+def _mark_recovery_required(
+    conn: sqlite3.Connection,
+    task_id: str,
+    claim_lock: Optional[str],
+    *,
+    reason: str,
+    termination: Optional[dict[str, Any]] = None,
+) -> None:
+    """Persist an unresolved physical-owner failure without releasing claim.
+
+    This is deliberately not a normal failure/reclaim transition.  Until an
+    operator or a later liveness pass proves the child retired, the claim,
+    run, and reviewer authority remain intact and no successor may be
+    assigned.
+    """
+    bounded = _bounded_review_error(reason)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id=? AND claim_lock IS ? "
+            "AND status IN ('running', 'review')",
+            (task_id, claim_lock),
+        ).fetchone()
+        if row is None:
+            return
+        conn.execute(
+            "UPDATE tasks SET recovery_required=1, recovery_reason=?, "
+            "last_failure_error=? WHERE id=? AND claim_lock IS ?",
+            (bounded, bounded, task_id, claim_lock),
+        )
+        run_id = row["current_run_id"]
+        payload: dict[str, Any] = {
+            "reason": bounded,
+            "claim_lock": claim_lock,
+            "run_id": int(run_id) if run_id is not None else None,
+        }
+        if termination:
+            payload.update(termination)
+        _append_event(conn, task_id, "recovery_required", payload, run_id=run_id)
 
 
 def _defer_reclaim_for_live_worker(
@@ -8929,9 +9150,10 @@ def _defer_reclaim_for_live_worker(
     grace = now + RECLAIM_DEFER_GRACE_SECONDS
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE tasks SET claim_expires = ? "
+            "UPDATE tasks SET claim_expires = ?, recovery_required=1, "
+            "recovery_reason=? "
             "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
-            (grace, task_id, claim_lock),
+            (grace, "worker termination not proven", task_id, claim_lock),
         )
         if cur.rowcount != 1:
             return
@@ -9086,18 +9308,47 @@ def enforce_max_runtime(
                     killed = True
                 except (ProcessLookupError, OSError):
                     pass
+        termination = {
+            "prev_pid": pid,
+            "termination_attempted": kill is not None,
+            "terminated": not _pid_alive(pid),
+            "sigkill": killed,
+        }
+        if not termination["terminated"]:
+            _mark_recovery_required(
+                conn,
+                tid,
+                lock,
+                reason="max-runtime worker termination was not proven",
+                termination=termination,
+            )
+            continue
+        gate_to_retire = conn.execute(
+            "SELECT * FROM task_launch_gates WHERE task_id=? AND gate_pid=? "
+            "AND claim_lock=? AND state IN ('attached', 'authorized', 'prepared', 'released', 'revalidation_failed') "
+            "ORDER BY id DESC LIMIT 1",
+            (tid, pid, lock),
+        ).fetchone()
 
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = CASE WHEN status = 'review' "
                 "THEN 'review' ELSE 'ready' END, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
+                "recovery_required=0, recovery_reason=NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status IN ('running', 'review') "
                 "  AND worker_pid = ? AND claim_lock IS ?",
                 (tid, pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
+                if gate_to_retire is not None:
+                    conn.execute(
+                        "UPDATE task_launch_gates SET state='retired', closed_at=?, "
+                        "reason=? WHERE id=? AND state IN "
+                        "('attached', 'authorized', 'prepared', 'released', 'revalidation_failed')",
+                        (int(time.time()), "max runtime", gate_to_retire["id"]),
+                    )
                 payload = {
                     "pid": pid,
                     "elapsed_seconds": int(elapsed),
@@ -9113,6 +9364,10 @@ def enforce_max_runtime(
                 _append_event(
                     conn, tid, "timed_out", payload, run_id=run_id,
                 )
+                if gate_to_retire is not None:
+                    if gate_to_retire["state"] in ("attached", "authorized", "prepared", "revalidation_failed"):
+                        _cleanup_review_launch_workspace(gate_to_retire)
+                    _REVIEW_LAUNCH_HANDLES.pop(int(gate_to_retire["gate_pid"]), None)
                 timed_out.append(tid)
                 if row["status"] == "review":
                     review_timeouts[tid] = (
@@ -9221,17 +9476,31 @@ def detect_stale_running(
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
         if _worker_survived_termination(termination):
+            _mark_recovery_required(
+                conn,
+                tid,
+                lock,
+                reason="heartbeat-stale worker termination was not proven",
+                termination=termination,
+            )
             _defer_reclaim_for_live_worker(
                 conn, tid, lock, now, termination,
                 reason="heartbeat_stale_worker_alive",
             )
             continue
 
+        gate_to_retire = conn.execute(
+            "SELECT * FROM task_launch_gates WHERE task_id=? AND gate_pid=? "
+            "AND claim_lock=? AND state IN ('attached', 'authorized', 'prepared', 'released', 'revalidation_failed') "
+            "ORDER BY id DESC LIMIT 1",
+            (tid, pid, lock),
+        ).fetchone()
         with write_txn(conn):
             cur = conn.execute(
                 "UPDATE tasks SET status = CASE WHEN status = 'review' "
                 "THEN 'review' ELSE 'ready' END, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
+                "recovery_required=0, recovery_reason=NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status IN ('running', 'review') "
                 "  AND claim_lock IS ?",
@@ -9239,6 +9508,13 @@ def detect_stale_running(
             )
             if cur.rowcount != 1:
                 continue
+            if gate_to_retire is not None:
+                conn.execute(
+                    "UPDATE task_launch_gates SET state='retired', closed_at=?, "
+                    "reason=? WHERE id=? AND state IN "
+                    "('attached', 'authorized', 'prepared', 'released', 'revalidation_failed')",
+                    (int(time.time()), "heartbeat stale", gate_to_retire["id"]),
+                )
 
             payload = {
                 "elapsed_seconds": int(elapsed),
@@ -9269,6 +9545,10 @@ def detect_stale_running(
             _append_event(
                 conn, tid, "stale", payload, run_id=run_id,
             )
+            if gate_to_retire is not None:
+                if gate_to_retire["state"] in ("attached", "authorized", "prepared", "revalidation_failed"):
+                    _cleanup_review_launch_workspace(gate_to_retire)
+                _REVIEW_LAUNCH_HANDLES.pop(int(gate_to_retire["gate_pid"]), None)
             reclaimed.append(tid)
             if row["status"] == "review":
                 review_stale[tid] = terminal_error
@@ -9508,14 +9788,29 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_code"] = code
 
             source_status = "review" if row["status"] == "review" else "ready"
+            gate_row = conn.execute(
+                "SELECT * FROM task_launch_gates WHERE task_id=? AND gate_pid=? "
+                "AND claim_lock=? AND state IN "
+                "('attached', 'authorized', 'prepared', 'released', 'revalidation_failed') "
+                "ORDER BY id DESC LIMIT 1",
+                (row["id"], pid, row["claim_lock"]),
+            ).fetchone()
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
+                "claim_expires = NULL, worker_pid = NULL, recovery_required=0, "
+                "recovery_reason=NULL "
                 "WHERE id = ? AND status = ? "
                 "  AND worker_pid = ? AND claim_lock IS ?",
                 (source_status, row["id"], row["status"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
+                if gate_row is not None:
+                    conn.execute(
+                        "UPDATE task_launch_gates SET state='retired', closed_at=?, "
+                        "reason=? WHERE id=? AND state IN "
+                        "('attached', 'authorized', 'prepared', 'released', 'revalidation_failed')",
+                        (int(time.time()), "worker exited", gate_row["id"]),
+                    )
                 # Rate-limited requeues are a clean release, not a crash —
                 # record the run outcome as ``rate_limited`` so the board
                 # history doesn't show a phantom crash for a quota wall.
@@ -9531,6 +9826,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload,
                     run_id=run_id,
                 )
+                if gate_row is not None:
+                    if gate_row["state"] in ("attached", "authorized", "prepared", "revalidation_failed"):
+                        _cleanup_review_launch_workspace(gate_row)
+                    _REVIEW_LAUNCH_HANDLES.pop(int(gate_row["gate_pid"]), None)
                 if rate_limited_exit:
                     # Stamp the failure-error column so ``check_respawn_guard``
                     # recognizes this as a quota blocker and defers the
@@ -9852,6 +10151,247 @@ class _ReviewSpawnCASRejected(Exception):
     """Internal rollback sentinel for a stale reviewer child attachment."""
 
 
+@dataclass
+class _ReviewLaunchGateHandle:
+    """Parent-side handle for a subprocess that is still physically dormant."""
+
+    pid: int
+    token: str
+    stdin: Any
+
+    def close(self) -> bool:
+        try:
+            if self.stdin is not None:
+                self.stdin.close()
+            return True
+        except (BrokenPipeError, OSError, ValueError):
+            return False
+
+    def release(self) -> bool:
+        try:
+            if self.stdin is None:
+                return False
+            self.stdin.write((self.token + "\n").encode("utf-8"))
+            self.stdin.flush()
+            self.stdin.close()
+            return True
+        except (BrokenPipeError, OSError, ValueError):
+            return False
+
+
+_REVIEW_LAUNCH_HANDLES: dict[int, _ReviewLaunchGateHandle] = {}
+
+# This program is intentionally a waiter, not a shell wrapper.  Until the
+# parent writes the one-time token it does no import of worker code, no cwd
+# change, no log/worktree creation, and no exec.  Linux parent-death signaling
+# closes the crash window; the parent-pid check is the portable fallback.
+_REVIEW_LAUNCH_GATE_SCRIPT = r'''
+import ctypes
+import json
+import os
+import select
+import signal
+import sys
+from pathlib import Path
+
+
+def _parent_death_guard(parent_pid):
+    if os.name != "nt":
+        try:
+            libc = ctypes.CDLL(None)
+            # PR_SET_PDEATHSIG = 1.  The signal is armed before the first
+            # blocking read, then the explicit parent check closes the fork
+            # versus prctl race.
+            libc.prctl(1, signal.SIGTERM)
+        except (AttributeError, OSError, TypeError):
+            pass
+    return os.getppid() == parent_pid
+
+
+def _exit_without_starting():
+    os._exit(125)
+
+
+parent_pid = int(os.environ["HERMES_LAUNCH_GATE_PARENT_PID"])
+if not _parent_death_guard(parent_pid):
+    _exit_without_starting()
+
+expected = os.environ["HERMES_LAUNCH_GATE_TOKEN"]
+stream = sys.stdin.buffer
+while True:
+    if os.getppid() != parent_pid:
+        _exit_without_starting()
+    if os.name != "nt":
+        ready, _, _ = select.select([stream], [], [], 0.2)
+        if not ready:
+            continue
+    line = stream.readline()
+    if not line:
+        _exit_without_starting()
+    if line.decode("utf-8", "replace").strip() != expected:
+        _exit_without_starting()
+    break
+
+from hermes_cli.kanban_db import (
+    _review_launch_startup_failed,
+    _review_launch_startup_matches,
+)
+
+if not _review_launch_startup_matches(
+    Path(os.environ["HERMES_LAUNCH_GATE_DB"]),
+    os.environ["HERMES_LAUNCH_GATE_TASK_ID"],
+    int(os.environ["HERMES_LAUNCH_GATE_RUN_ID"]),
+    os.environ["HERMES_LAUNCH_GATE_CLAIM"],
+    os.environ["HERMES_LAUNCH_GATE_ASSIGNEE"],
+    int(os.environ["HERMES_LAUNCH_GATE_AUTHORITY_ID"]),
+    expected,
+    os.getpid(),
+):
+    _review_launch_startup_failed(
+        Path(os.environ["HERMES_LAUNCH_GATE_DB"]),
+        os.environ["HERMES_LAUNCH_GATE_TASK_ID"],
+        int(os.environ["HERMES_LAUNCH_GATE_RUN_ID"]),
+        os.environ["HERMES_LAUNCH_GATE_CLAIM"],
+        os.environ["HERMES_LAUNCH_GATE_TOKEN"],
+        os.getpid(),
+    )
+    _exit_without_starting()
+
+workspace = os.environ.get("HERMES_KANBAN_WORKSPACE", "")
+if not workspace or not os.path.isdir(workspace):
+    _exit_without_starting()
+os.chdir(workspace)
+os.environ["TERMINAL_CWD"] = workspace
+
+log_path = os.environ.get("HERMES_LAUNCH_GATE_LOG_PATH", "")
+if log_path:
+    log = Path(log_path)
+    log.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(log, "ab")
+    os.dup2(handle.fileno(), 1)
+    os.dup2(handle.fileno(), 2)
+    handle.close()
+
+command = json.loads(os.environ["HERMES_LAUNCH_GATE_COMMAND"])
+for key in tuple(os.environ):
+    if key.startswith("HERMES_LAUNCH_GATE_"):
+        os.environ.pop(key, None)
+os.execvpe(command[0], command, os.environ)
+'''
+
+
+def _review_launch_handle(pid: Optional[int]) -> Optional[_ReviewLaunchGateHandle]:
+    """Return the local pipe handle for ``pid`` without trusting it as authority."""
+    if not pid:
+        return None
+    return _REVIEW_LAUNCH_HANDLES.get(int(pid))
+
+
+def _review_launch_startup_matches(
+    db_path: Path,
+    task_id: str,
+    run_id: int,
+    claim_lock: str,
+    assignee: str,
+    authority_id: int,
+    gate_token: str,
+    gate_pid: int,
+) -> bool:
+    """Revalidate the complete launch generation inside the child process."""
+    child_conn: Optional[sqlite3.Connection] = None
+    try:
+        child_conn = connect(db_path=db_path)
+        gate = child_conn.execute(
+            "SELECT g.task_id, g.run_id, g.claim_lock, g.assignee, "
+            "g.authority_id, g.gate_token, g.gate_pid, g.state, "
+            "t.status, t.current_run_id, t.claim_lock AS task_claim, "
+            "t.assignee AS task_assignee, t.worker_pid, t.recovery_required, "
+            "r.status AS run_status, r.worker_pid AS run_pid "
+            "FROM task_launch_gates g "
+            "JOIN tasks t ON t.id = g.task_id "
+            "JOIN task_runs r ON r.id = g.run_id AND r.task_id = g.task_id "
+            "WHERE g.gate_token=? AND g.gate_pid=?",
+            (gate_token, int(gate_pid)),
+        ).fetchone()
+        if gate is None:
+            return False
+        if (
+            gate["task_id"] != task_id
+            or int(gate["run_id"]) != int(run_id)
+            or gate["claim_lock"] != claim_lock
+            or _canonical_assignee(gate["assignee"]) != _canonical_assignee(assignee)
+            or int(gate["authority_id"]) != int(authority_id)
+            or gate["state"] not in ("authorized", "prepared", "released")
+            or gate["status"] != "review"
+            or gate["current_run_id"] != int(run_id)
+            or gate["task_claim"] != claim_lock
+            or _canonical_assignee(gate["task_assignee"]) != _canonical_assignee(assignee)
+            or int(gate["worker_pid"]) != int(gate_pid)
+            or bool(gate["recovery_required"])
+            or gate["run_status"] != "running"
+            or int(gate["run_pid"]) != int(gate_pid)
+        ):
+            return False
+        return _latest_unconsumed_reviewer_authority(child_conn, task_id) == (
+            int(authority_id),
+            _canonical_assignee(assignee),
+        )
+    except (OSError, sqlite3.Error, TypeError, ValueError, RuntimeError):
+        return False
+    finally:
+        if child_conn is not None:
+            child_conn.close()
+
+
+def _review_launch_startup_failed(
+    db_path: Path,
+    task_id: str,
+    run_id: int,
+    claim_lock: str,
+    gate_token: str,
+    gate_pid: int,
+) -> None:
+    """Close a released gate when its child rejects startup revalidation."""
+    child_conn: Optional[sqlite3.Connection] = None
+    try:
+        child_conn = connect(db_path=db_path)
+        with write_txn(child_conn):
+            gate = child_conn.execute(
+                "SELECT id FROM task_launch_gates WHERE task_id=? AND run_id=? "
+                "AND claim_lock=? AND gate_token=? AND gate_pid=? "
+                "AND state='released'",
+                (task_id, int(run_id), claim_lock, gate_token, int(gate_pid)),
+            ).fetchone()
+            if gate is None:
+                return
+            child_conn.execute(
+                "UPDATE task_launch_gates SET state='revalidation_failed', "
+                "closed_at=?, reason=? WHERE id=? AND state='released'",
+                (
+                    int(time.time()),
+                    "child startup revalidation failed before task exec",
+                    gate["id"],
+                ),
+            )
+            _append_event(
+                child_conn,
+                task_id,
+                "review_launch_revalidation_failed",
+                {
+                    "pid": int(gate_pid),
+                    "run_id": int(run_id),
+                    "claim_lock": claim_lock,
+                    "gate_token": gate_token,
+                },
+                run_id=int(run_id),
+            )
+    except (OSError, sqlite3.Error, TypeError, ValueError, RuntimeError):
+        _log.debug("review launch startup failure could not be persisted", exc_info=True)
+    finally:
+        if child_conn is not None:
+            child_conn.close()
+
+
 def _review_spawn_cas_matches(
     conn: sqlite3.Connection,
     task_id: str,
@@ -9860,14 +10400,14 @@ def _review_spawn_cas_matches(
     expected_claim: Optional[str],
     expected_assignee: Optional[str],
     expected_authority: Optional[tuple[int, str]],
+    expected_worker_pid: Optional[int] = None,
 ) -> bool:
     """Prove that a reviewer claim is still spawnable under one DB lock.
 
-    The dispatcher deliberately invokes this twice: once immediately before
-    calling the model spawn function, and once when the returned PID is
-    attached. The second check is the important boundary: failover/reclaim
-    may commit while an external process is being created, and a stale PID
-    must never be attached to the successor run.
+    The dispatcher invokes this at every physical boundary.  With no expected
+    PID it proves the claim is pre-spawnable; with a PID it proves that the
+    already-attached dormant gate still belongs to the same run, claim,
+    assignee, and authority generation.
     """
     if (
         expected_run_id is None
@@ -9891,7 +10431,7 @@ def _review_spawn_cas_matches(
 
     task = conn.execute(
         "SELECT status, claim_lock, claim_expires, worker_pid, "
-        "current_run_id, assignee FROM tasks WHERE id=?",
+        "current_run_id, assignee, recovery_required FROM tasks WHERE id=?",
         (task_id,),
     ).fetchone()
     if task is None:
@@ -9900,7 +10440,12 @@ def _review_spawn_cas_matches(
         task["status"] != "review"
         or task["current_run_id"] != run_id
         or task["claim_lock"] != expected_claim
-        or task["worker_pid"] is not None
+        or bool(task["recovery_required"])
+        or (
+            task["worker_pid"] != int(expected_worker_pid)
+            if expected_worker_pid is not None
+            else task["worker_pid"] is not None
+        )
     ):
         return False
     try:
@@ -9927,7 +10472,11 @@ def _review_spawn_cas_matches(
         or run["status"] != "running"
         or run["ended_at"] is not None
         or run["claim_lock"] != expected_claim
-        or run["worker_pid"] is not None
+        or (
+            run["worker_pid"] != int(expected_worker_pid)
+            if expected_worker_pid is not None
+            else run["worker_pid"] is not None
+        )
     ):
         return False
     try:
@@ -9986,9 +10535,65 @@ def _authorize_review_spawn(
     expected_claim: Optional[str],
     expected_assignee: Optional[str],
     expected_authority: Optional[tuple[int, str]],
+    gate_token: Optional[str] = None,
+    gate_pid: Optional[int] = None,
 ) -> bool:
-    """CAS-check the reviewer generation immediately before model spawn."""
+    """CAS-check or commit authorization for one reviewer generation.
+
+    The no-gate form is the pre-Popen admission check retained for legacy
+    custom spawn hooks.  The gate form is the real authority commit: it binds
+    the dormant PID/token to the exact run, claim, assignee, and reviewer
+    authority before the release pipe can be written.
+    """
     with write_txn(conn):
+        if gate_token is not None or gate_pid is not None:
+            if not gate_token or gate_pid is None:
+                return False
+            gate = conn.execute(
+                "SELECT * FROM task_launch_gates WHERE gate_token=? AND gate_pid=?",
+                (gate_token, int(gate_pid)),
+            ).fetchone()
+            if gate is None or gate["state"] != "attached":
+                return False
+            if not _review_spawn_cas_matches(
+                conn,
+                task_id,
+                expected_run_id=expected_run_id,
+                expected_claim=expected_claim,
+                expected_assignee=expected_assignee,
+                expected_authority=expected_authority,
+                expected_worker_pid=int(gate_pid),
+            ):
+                return False
+            if (
+                gate["task_id"] != task_id
+                or int(gate["run_id"]) != int(expected_run_id)
+                or gate["claim_lock"] != expected_claim
+                or _canonical_assignee(gate["assignee"])
+                != _canonical_assignee(expected_assignee)
+                or int(gate["authority_id"]) != int(expected_authority[0])
+            ):
+                return False
+            conn.execute(
+                "UPDATE task_launch_gates SET state='authorized' WHERE id=? "
+                "AND state='attached'",
+                (gate["id"],),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "review_launch_authorized",
+                {
+                    "pid": int(gate_pid),
+                    "gate_token": gate_token,
+                    "run_id": int(expected_run_id),
+                    "claim_lock": expected_claim,
+                    "assignee": expected_assignee,
+                    "review_authority_id": int(expected_authority[0]),
+                },
+                run_id=int(expected_run_id),
+            )
+            return True
         return _review_spawn_cas_matches(
             conn,
             task_id,
@@ -9997,6 +10602,331 @@ def _authorize_review_spawn(
             expected_assignee=expected_assignee,
             expected_authority=expected_authority,
         )
+
+
+def _spawn_review_gate_and_attach(
+    conn: sqlite3.Connection,
+    task: Task,
+    workspace: Path,
+    *,
+    board: Optional[str],
+    authority: tuple[int, str],
+) -> Optional[tuple[int, str]]:
+    """Spawn a dormant child and attach it while the claim CAS is locked.
+
+    Popen happens inside the same immediate transaction that records the
+    gate.  A failover/reclaim writer therefore cannot commit in the
+    post-Popen/pre-attach window.  If attach fails, this function closes and
+    reaps the child before releasing the SQLite writer lock.
+    """
+    token = secrets.token_urlsafe(32)
+    pid: Optional[int] = None
+    handle: Optional[_ReviewLaunchGateHandle] = None
+    try:
+        with write_txn(conn):
+            if not _review_spawn_cas_matches(
+                conn,
+                task.id,
+                expected_run_id=task.current_run_id,
+                expected_claim=task.claim_lock,
+                expected_assignee=task.assignee,
+                expected_authority=authority,
+            ):
+                return None
+            pid = _default_spawn(
+                task,
+                str(workspace),
+                board=board,
+                launch_gate=True,
+                launch_token=token,
+                launch_authority_id=int(authority[0]),
+            )
+            if pid is None:
+                raise RuntimeError("review launch gate returned no PID")
+            handle = _review_launch_handle(pid)
+            if handle is None:
+                raise RuntimeError("review launch gate PID was not locally attached")
+            task_cur = conn.execute(
+                "UPDATE tasks SET worker_pid=? WHERE id=? AND status='review' "
+                "AND current_run_id=? AND claim_lock=? AND assignee=? "
+                "AND worker_pid IS NULL AND recovery_required=0",
+                (
+                    int(pid), task.id, int(task.current_run_id), task.claim_lock,
+                    task.assignee,
+                ),
+            )
+            if task_cur.rowcount != 1:
+                raise _ReviewSpawnCASRejected
+            run_cur = conn.execute(
+                "UPDATE task_runs SET worker_pid=? WHERE id=? AND task_id=? "
+                "AND status='running' AND ended_at IS NULL AND claim_lock=? "
+                "AND worker_pid IS NULL",
+                (int(pid), int(task.current_run_id), task.id, task.claim_lock),
+            )
+            if run_cur.rowcount != 1:
+                raise _ReviewSpawnCASRejected
+            now = int(time.time())
+            conn.execute(
+                "INSERT INTO task_launch_gates "
+                "(task_id, run_id, claim_lock, assignee, authority_id, gate_token, "
+                "gate_pid, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'attached', ?)",
+                (
+                    task.id, int(task.current_run_id), task.claim_lock,
+                    task.assignee, int(authority[0]), token, int(pid), now,
+                ),
+            )
+            _append_event(
+                conn,
+                task.id,
+                "review_launch_gate_attached",
+                {
+                    "pid": int(pid),
+                    "gate_token": token,
+                    "run_id": int(task.current_run_id),
+                    "claim_lock": task.claim_lock,
+                    "assignee": task.assignee,
+                    "review_authority_id": int(authority[0]),
+                },
+                run_id=int(task.current_run_id),
+            )
+        return int(pid), token
+    except BaseException as exc:
+        if handle is not None:
+            handle.close()
+        if pid is not None:
+            termination = _terminate_reclaimed_worker(int(pid), task.claim_lock)
+            if _worker_survived_termination(termination):
+                _mark_recovery_required(
+                    conn,
+                    task.id,
+                    task.claim_lock,
+                    reason=f"review launch attach failed and child {pid} survived: {exc}",
+                    termination=termination,
+                )
+        raise
+
+
+def _materialize_review_launch_workspace(
+    conn: sqlite3.Connection,
+    task: Task,
+    planned_workspace: Path,
+    *,
+    board: Optional[str],
+    pid: int,
+    gate_token: str,
+    authority: tuple[int, str],
+) -> bool:
+    """Materialize only an authorized generation, under the DB writer lock."""
+    with write_txn(conn):
+        gate = conn.execute(
+            "SELECT * FROM task_launch_gates WHERE task_id=? AND gate_pid=? "
+            "AND gate_token=?",
+            (task.id, int(pid), gate_token),
+        ).fetchone()
+        if gate is None or gate["state"] != "authorized":
+            return False
+        if not _review_spawn_cas_matches(
+            conn,
+            task.id,
+            expected_run_id=task.current_run_id,
+            expected_claim=task.claim_lock,
+            expected_assignee=task.assignee,
+            expected_authority=authority,
+            expected_worker_pid=int(pid),
+        ):
+            return False
+        current = get_task(conn, task.id)
+        if current is None:
+            return False
+        before_exists = planned_workspace.exists()
+        if current.workspace_kind == "worktree":
+            actual, branch_name = _resolve_worktree_workspace(
+                current, board=board, materialize=True,
+            )
+        else:
+            actual = resolve_workspace(current, board=board, materialize=True)
+            branch_name = current.branch_name
+        if actual.resolve(strict=False) != planned_workspace.resolve(strict=False):
+            raise RuntimeError(
+                "review launch workspace plan changed before materialization"
+            )
+        created = int(not before_exists and actual.exists())
+        conn.execute(
+            "UPDATE tasks SET workspace_path=?, branch_name=? WHERE id=? "
+            "AND worker_pid=? AND current_run_id=? AND claim_lock=?",
+            (
+                str(actual), branch_name, task.id, int(pid),
+                int(task.current_run_id), task.claim_lock,
+            ),
+        )
+        conn.execute(
+            "UPDATE task_launch_gates SET state='prepared', workspace_path=?, "
+            "workspace_kind=?, workspace_created=? WHERE id=? AND state='authorized'",
+            (str(actual), current.workspace_kind or "scratch", created, gate["id"]),
+        )
+        _append_event(
+            conn,
+            task.id,
+            "review_launch_workspace_materialized",
+            {
+                "pid": int(pid),
+                "gate_token": gate_token,
+                "path": str(actual),
+                "created": created,
+            },
+            run_id=int(task.current_run_id),
+        )
+        return True
+
+
+def _release_review_launch(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    pid: int,
+    gate_token: str,
+    authority: tuple[int, str],
+) -> bool:
+    """Commit release state, then send the one-time token to the child."""
+    handle = _review_launch_handle(pid)
+    if handle is None:
+        return False
+    with write_txn(conn):
+        gate = conn.execute(
+            "SELECT * FROM task_launch_gates WHERE task_id=? AND gate_pid=? "
+            "AND gate_token=?",
+            (task.id, int(pid), gate_token),
+        ).fetchone()
+        if gate is None or gate["state"] != "prepared":
+            return False
+        if not _review_spawn_cas_matches(
+            conn,
+            task.id,
+            expected_run_id=task.current_run_id,
+            expected_claim=task.claim_lock,
+            expected_assignee=task.assignee,
+            expected_authority=authority,
+            expected_worker_pid=int(pid),
+        ):
+            return False
+        conn.execute(
+            "UPDATE task_launch_gates SET state='released' WHERE id=? AND state='prepared'",
+            (gate["id"],),
+        )
+        conn.execute(
+            "UPDATE tasks SET recovery_required=0, recovery_reason=NULL WHERE id=? "
+            "AND worker_pid=? AND current_run_id=? AND claim_lock=?",
+            (task.id, int(pid), int(task.current_run_id), task.claim_lock),
+        )
+        _append_event(
+            conn,
+            task.id,
+            "review_launch_released",
+            {
+                "pid": int(pid),
+                "gate_token": gate_token,
+                "run_id": int(task.current_run_id),
+                "claim_lock": task.claim_lock,
+                "assignee": task.assignee,
+                "review_authority_id": int(authority[0]),
+            },
+            run_id=int(task.current_run_id),
+        )
+        _append_event(
+            conn,
+            task.id,
+            "spawned",
+            {
+                "pid": int(pid),
+                "run_id": int(task.current_run_id),
+                "claim_lock": task.claim_lock,
+                "assignee": task.assignee,
+                "review_authority_id": int(authority[0]),
+                "launch_gate": True,
+            },
+            run_id=int(task.current_run_id),
+        )
+    if not handle.release():
+        return False
+    _REVIEW_LAUNCH_HANDLES.pop(int(pid), None)
+    return True
+
+
+def _cleanup_review_launch_workspace(gate: sqlite3.Row) -> None:
+    """Remove only a workspace created by a gate that never reached release."""
+    if not bool(gate["workspace_created"]) or not gate["workspace_path"]:
+        return
+    path = Path(str(gate["workspace_path"]))
+    kind = str(gate["workspace_kind"] or "scratch")
+    if kind == "worktree":
+        repo_root = _repo_root_for_worktree_target(path.parent)
+        if repo_root is not None:
+            subprocess.run(
+                ["git", "-C", str(repo_root), "worktree", "remove", "--force", str(path)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
+                check=False,
+            )
+    if path.exists():
+        try:
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        except OSError:
+            _log.warning("kanban: failed to clean stale review workspace %s", path)
+
+
+def _retire_review_launch_gate(
+    conn: sqlite3.Connection,
+    task_id: str,
+    claim_lock: Optional[str],
+    *,
+    reason: str,
+) -> bool:
+    """Close/reap one gate before any lifecycle transition may proceed."""
+    gate = conn.execute(
+        "SELECT * FROM task_launch_gates WHERE task_id=? "
+        "AND state IN ('attached', 'authorized', 'prepared', 'released', 'revalidation_failed') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if gate is None:
+        return True
+    if gate["claim_lock"] != claim_lock:
+        return False
+    handle = _review_launch_handle(int(gate["gate_pid"]))
+    if handle is not None:
+        handle.close()
+    termination = _terminate_reclaimed_worker(int(gate["gate_pid"]), claim_lock)
+    if _worker_survived_termination(termination):
+        _mark_recovery_required(
+            conn,
+            task_id,
+            claim_lock,
+            reason=f"{reason}; review launch gate child survived retirement",
+            termination=termination,
+        )
+        return False
+    with write_txn(conn):
+        current = conn.execute(
+            "SELECT claim_lock, worker_pid, current_run_id FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        if current is None or current["claim_lock"] != claim_lock:
+            return False
+        conn.execute(
+            "UPDATE task_launch_gates SET state='retired', closed_at=?, reason=? "
+            "WHERE id=? AND state IN ('attached', 'authorized', 'prepared', 'released', 'revalidation_failed')",
+            (int(time.time()), _bounded_review_error(reason), gate["id"]),
+        )
+    if gate["state"] in ("attached", "authorized", "prepared", "revalidation_failed"):
+        _cleanup_review_launch_workspace(gate)
+    _REVIEW_LAUNCH_HANDLES.pop(int(gate["gate_pid"]), None)
+    return True
 
 
 def _set_worker_pid(
@@ -10980,15 +11910,26 @@ def _dispatch_once_locked(
                 dispatch_deferred = True
                 break
             try:
+                # The real/default reviewer path plans the workspace without
+                # touching disk.  Only the custom test hook retains the legacy
+                # eager materialization semantics.
                 resolved_branch_name = None
-                if claimed.workspace_kind == "worktree":
-                    workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+                if spawn_fn is None:
+                    if claimed.workspace_kind == "worktree":
+                        workspace, resolved_branch_name = _resolve_worktree_workspace(
+                            claimed, board=board, materialize=False,
+                        )
+                    else:
+                        workspace = resolve_workspace(
+                            claimed, board=board, materialize=False,
+                        )
+                elif claimed.workspace_kind == "worktree":
+                    workspace, resolved_branch_name = _resolve_worktree_workspace(
+                        claimed, board=board,
+                    )
                 else:
                     workspace = resolve_workspace(claimed, board=board)
-                set_workspace_path(conn, claimed.id, str(workspace))
-                if claimed.workspace_kind == "worktree":
-                    set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
-                _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+
                 claimed.skills = ["sdlc-review"]
                 if not _authorize_review_spawn(
                     conn,
@@ -11007,49 +11948,127 @@ def _dispatch_once_locked(
                     )
                     dispatch_deferred = True
                     break
-                _spawn = spawn_fn if spawn_fn is not None else _default_spawn
-                import inspect
-                try:
-                    sig = inspect.signature(_spawn)
-                    if "board" in sig.parameters:
-                        pid = _spawn(claimed, str(workspace), board=board)
-                    else:
-                        pid = _spawn(claimed, str(workspace))
-                except (TypeError, ValueError):
-                    pid = _spawn(claimed, str(workspace))
-                if pid:
-                    pid = int(pid)
-                    attached = _set_worker_pid(
+
+                if spawn_fn is None:
+                    gate_binding = _spawn_review_gate_and_attach(
                         conn,
-                        claimed.id,
-                        pid,
-                        expected_run_id=claimed.current_run_id,
-                        expected_claim=claimed.claim_lock,
-                        expected_assignee=claimed.assignee,
-                        expected_authority=expected_authority,
+                        claimed,
+                        workspace,
+                        board=board,
+                        authority=expected_authority,
                     )
-                    if not attached:
-                        # The child was created, but another lifecycle writer
-                        # won before attachment. It is never an authoritative
-                        # worker; terminate the stale child and let the next
-                        # tick claim the surviving reviewer generation.
-                        try:
-                            _terminate_reclaimed_worker(pid, claimed.claim_lock)
-                        except Exception:
-                            _log.warning(
-                                "kanban review: stale child %s could not be terminated",
-                                pid,
-                                exc_info=True,
-                            )
+                    if gate_binding is None:
                         attempted.append({
                             "profile": reviewer,
-                            "error": "review PID attachment CAS refused",
+                            "error": "review launch gate attachment CAS refused",
                         })
                         result.respawn_guarded.append(
                             (claimed.id, "review_spawn_attachment_changed")
                         )
                         dispatch_deferred = True
                         break
+                    pid, gate_token = gate_binding
+                    if not _authorize_review_spawn(
+                        conn,
+                        claimed.id,
+                        expected_run_id=claimed.current_run_id,
+                        expected_claim=claimed.claim_lock,
+                        expected_assignee=claimed.assignee,
+                        expected_authority=expected_authority,
+                        gate_token=gate_token,
+                        gate_pid=pid,
+                    ):
+                        _retire_review_launch_gate(
+                            conn,
+                            claimed.id,
+                            claimed.claim_lock,
+                            reason="review launch authorization changed before release",
+                        )
+                        attempted.append({
+                            "profile": reviewer,
+                            "error": "review launch authorization commit refused",
+                        })
+                        result.respawn_guarded.append(
+                            (claimed.id, "review_spawn_authorization_changed")
+                        )
+                        dispatch_deferred = True
+                        break
+                    if not _materialize_review_launch_workspace(
+                        conn,
+                        claimed,
+                        workspace,
+                        board=board,
+                        pid=pid,
+                        gate_token=gate_token,
+                        authority=expected_authority,
+                    ):
+                        raise RuntimeError("review launch workspace preparation CAS refused")
+                    if not _release_review_launch(
+                        conn,
+                        claimed,
+                        pid=pid,
+                        gate_token=gate_token,
+                        authority=expected_authority,
+                    ):
+                        raise RuntimeError("review launch gate release failed")
+                else:
+                    # Legacy/custom spawn hooks are retained for tests and
+                    # embedders, but still use the exact reviewer CAS attach.
+                    set_workspace_path(conn, claimed.id, str(workspace))
+                    if claimed.workspace_kind == "worktree":
+                        set_branch_name(
+                            conn,
+                            claimed.id,
+                            resolved_branch_name
+                            or (claimed.branch_name or "").strip()
+                            or f"wt/{claimed.id}",
+                        )
+                    _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+                    _spawn = spawn_fn
+                    import inspect
+                    try:
+                        sig = inspect.signature(_spawn)
+                        if "board" in sig.parameters:
+                            pid = _spawn(claimed, str(workspace), board=board)
+                        else:
+                            pid = _spawn(claimed, str(workspace))
+                    except (TypeError, ValueError):
+                        pid = _spawn(claimed, str(workspace))
+                    if pid:
+                        pid = int(pid)
+                        attached = _set_worker_pid(
+                            conn,
+                            claimed.id,
+                            pid,
+                            expected_run_id=claimed.current_run_id,
+                            expected_claim=claimed.claim_lock,
+                            expected_assignee=claimed.assignee,
+                            expected_authority=expected_authority,
+                        )
+                        if not attached:
+                            termination = _terminate_reclaimed_worker(
+                                pid, claimed.claim_lock,
+                            )
+                            if _worker_survived_termination(termination):
+                                _mark_recovery_required(
+                                    conn,
+                                    claimed.id,
+                                    claimed.claim_lock,
+                                    reason=(
+                                        "stale reviewer child attachment could not be "
+                                        "retired"
+                                    ),
+                                    termination=termination,
+                                )
+                            attempted.append({
+                                "profile": reviewer,
+                                "error": "review PID attachment CAS refused",
+                            })
+                            result.respawn_guarded.append(
+                                (claimed.id, "review_spawn_attachment_changed")
+                            )
+                            dispatch_deferred = True
+                            break
                 result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
                 spawned += 1
                 if _per_profile_cap is not None and claimed.assignee:
@@ -11070,6 +12089,7 @@ def _dispatch_once_locked(
                 failed_over = failover_review_task(
                     conn, claimed.id, next_reviewer,
                     error=_bounded_review_error(exc), attempted=attempted,
+                    expected_run_id=claimed.current_run_id,
                 )
                 if failed_over is None or failed_over.status != "review":
                     dispatch_deferred = True
@@ -11390,6 +12410,9 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
+    launch_gate: bool = False,
+    launch_token: Optional[str] = None,
+    launch_authority_id: Optional[int] = None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -11410,6 +12433,14 @@ def _default_spawn(
     from hermes_cli.profiles import normalize_profile_name
 
     profile_arg = normalize_profile_name(task.assignee)
+
+    if launch_gate:
+        if not launch_token:
+            raise ValueError("launch_gate requires a non-empty launch_token")
+        if task.current_run_id is None or not task.claim_lock:
+            raise ValueError("launch_gate requires an attached reviewer run and claim")
+        if launch_authority_id is None:
+            raise ValueError("launch_gate requires reviewer authority")
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
@@ -11563,13 +12594,48 @@ def _default_spawn(
         # turn, prints text, exits rc=0, and the dispatcher records a
         # protocol violation (incident 2026-06-09 t_d9cbe312).
         cmd.append("-Q")
-    # Redirect output to a per-task log under <board-root>/logs/.
-    # Anchored at the board root (not the shared kanban root), so
-    # `hermes kanban log` on a specific board reads its own file and
-    # logs don't collide across boards that happen to share task ids.
+    # Redirect output to a per-task log under <board-root>/logs/.  A dormant
+    # gate must not create the log directory or open the file yet; the gate
+    # child performs that work only after startup revalidation and release.
     log_dir = worker_logs_dir(board=board)
-    log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{task.id}.log"
+
+    if launch_gate:
+        gate_env = {
+            "HERMES_LAUNCH_GATE_PARENT_PID": str(os.getpid()),
+            "HERMES_LAUNCH_GATE_TOKEN": str(launch_token),
+            "HERMES_LAUNCH_GATE_DB": str(kanban_db_path(board=board)),
+            "HERMES_LAUNCH_GATE_TASK_ID": task.id,
+            "HERMES_LAUNCH_GATE_RUN_ID": str(task.current_run_id),
+            "HERMES_LAUNCH_GATE_CLAIM": str(task.claim_lock),
+            "HERMES_LAUNCH_GATE_ASSIGNEE": str(task.assignee),
+            "HERMES_LAUNCH_GATE_AUTHORITY_ID": str(int(launch_authority_id)),
+            "HERMES_LAUNCH_GATE_COMMAND": json.dumps(cmd),
+            "HERMES_LAUNCH_GATE_LOG_PATH": str(log_path),
+        }
+        env.update(gate_env)
+        proc = subprocess.Popen(  # noqa: S603 -- fixed gate interpreter + script
+            [sys.executable, "-c", _REVIEW_LAUNCH_GATE_SCRIPT],
+            cwd=None,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
+        )
+        if proc.stdin is None:
+            proc.kill()
+            proc.wait(timeout=5)
+            raise RuntimeError("review launch gate did not expose an attach pipe")
+        _REVIEW_LAUNCH_HANDLES[proc.pid] = _ReviewLaunchGateHandle(
+            pid=proc.pid,
+            token=str(launch_token),
+            stdin=proc.stdin,
+        )
+        return proc.pid
+
+    log_dir.mkdir(parents=True, exist_ok=True)
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
 

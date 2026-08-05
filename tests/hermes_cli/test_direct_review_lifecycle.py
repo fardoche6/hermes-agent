@@ -7,6 +7,9 @@ current main: a claimed reviewer has no first-class terminal decision path.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -137,6 +140,484 @@ def _assert_no_mutation(conn, task_id, before, review):
     assert _snapshot(conn, task_id) == before
     current = kb.get_task(conn, task_id)
     assert current is not None and current.current_run_id == review.current_run_id
+
+
+def test_real_review_child_is_dormant_until_authorized_release(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    """The default reviewer launch must not run task code before release."""
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(
+        profiles,
+        "list_profiles",
+        lambda: [SimpleNamespace(name="code-reviewer")],
+    )
+    sentinel = tmp_path / "review-child-ran"
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        "from pathlib import Path\n"
+        "import os\n"
+        "Path(os.environ['REVIEW_SENTINEL']).write_text('ran')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        kb,
+        "_resolve_hermes_argv",
+        lambda: [sys.executable, str(worker)],
+    )
+    monkeypatch.setenv("REVIEW_SENTINEL", str(sentinel))
+
+    with kb.connect() as conn:
+        task_id, _host = _unclaimed_review_card(conn, reviewer="code-reviewer")
+        planned = kb.get_task(conn, task_id)
+        assert planned is not None
+
+        original_release = kb._release_review_launch
+
+        def inspect_boundary(*args, **kwargs):
+            gate = conn.execute(
+                "SELECT state, workspace_path FROM task_launch_gates "
+                "WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            assert gate is not None and gate["state"] == "prepared"
+            assert gate["workspace_path"]
+            assert Path(gate["workspace_path"]).is_dir()
+            assert not sentinel.exists()
+            assert conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='spawned'",
+                (task_id,),
+            ).fetchone()[0] == 0
+            return original_release(*args, **kwargs)
+
+        monkeypatch.setattr(kb, "_release_review_launch", inspect_boundary)
+        result = kb.dispatch_once(conn)
+        assert result.spawned == [(task_id, "code-reviewer", str(kb.workspaces_root() / task_id))]
+        gate = conn.execute(
+            "SELECT state, gate_pid, gate_token FROM task_launch_gates "
+            "WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert gate is not None
+        assert gate["state"] == "released"
+        assert gate["gate_pid"] is not None
+        assert gate["gate_token"]
+
+        deadline = time.time() + 5
+        while not sentinel.exists() and time.time() < deadline:
+            time.sleep(0.02)
+        assert sentinel.read_text(encoding="utf-8") == "ran"
+        assert kb.get_task(conn, task_id).status == "review"
+
+
+def test_real_review_gate_failure_reaps_child_and_removes_unreleased_workspace(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(
+        profiles, "list_profiles",
+        lambda: [SimpleNamespace(name="code-reviewer")],
+    )
+    sentinel = tmp_path / "stale-child-ran"
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        "from pathlib import Path\n"
+        "import os\n"
+        "Path(os.environ['REVIEW_SENTINEL']).write_text('ran')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: [sys.executable, str(worker)])
+    monkeypatch.setenv("REVIEW_SENTINEL", str(sentinel))
+
+    with kb.connect() as conn:
+        task_id, _host = _unclaimed_review_card(conn, reviewer="code-reviewer")
+
+        def deny_release(*_args, **_kwargs):
+            gate = conn.execute(
+                "SELECT state FROM task_launch_gates WHERE task_id=? "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            assert gate is not None and gate["state"] == "prepared"
+            raise RuntimeError("injected release failure")
+
+        monkeypatch.setattr(kb, "_release_review_launch", deny_release)
+        result = kb.dispatch_once(conn)
+        current = kb.get_task(conn, task_id)
+        assert result.spawned == []
+        assert current is not None
+        assert current.status == "blocked"
+        assert current.claim_lock is None
+        assert current.worker_pid is None
+        assert not sentinel.exists()
+        gate = conn.execute(
+            "SELECT state, workspace_path FROM task_launch_gates WHERE task_id=? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert gate is not None and gate["state"] == "retired"
+        assert gate["workspace_path"]
+        assert not Path(gate["workspace_path"]).exists()
+
+
+def test_real_review_gate_false_termination_preserves_recovery_and_blocks_successor(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(
+        profiles, "list_profiles",
+        lambda: [SimpleNamespace(name="code-reviewer")],
+    )
+    sentinel = tmp_path / "surviving-child-ran"
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        "from pathlib import Path\n"
+        "import os\n"
+        "Path(os.environ['REVIEW_SENTINEL']).write_text('ran')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: [sys.executable, str(worker)])
+    monkeypatch.setenv("REVIEW_SENTINEL", str(sentinel))
+
+    def deny_termination(pid, claim_lock, **_kwargs):
+        return {
+            "prev_pid": int(pid),
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": False,
+            "sigkill": False,
+        }
+
+    with kb.connect() as conn:
+        task_id, _host = _unclaimed_review_card(conn, reviewer="code-reviewer")
+        monkeypatch.setattr(kb, "_terminate_reclaimed_worker", deny_termination)
+        monkeypatch.setattr(
+            kb,
+            "_release_review_launch",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("inject retirement path")
+            ),
+        )
+
+        result = kb.dispatch_once(conn)
+        current = kb.get_task(conn, task_id)
+        assert result.spawned == []
+        assert current is not None
+        assert current.status == "review"
+        assert current.claim_lock is not None
+        assert current.worker_pid is not None
+        assert current.recovery_required is True
+        assert not sentinel.exists()
+        # The claim remains occupied, so a later tick cannot create a successor.
+        later = kb.dispatch_once(conn)
+        assert later.spawned == []
+        assert kb.get_task(conn, task_id).recovery_required is True
+
+
+def test_real_review_gate_allows_one_successor_only_after_retirement(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(
+        profiles, "list_profiles",
+        lambda: [
+            SimpleNamespace(name="code-reviewer-a"),
+            SimpleNamespace(name="code-reviewer-b"),
+        ],
+    )
+    sentinel = tmp_path / "successor-ran"
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        "from pathlib import Path\n"
+        "import os\n"
+        "Path(os.environ['REVIEW_SENTINEL']).write_text('ran')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: [sys.executable, str(worker)])
+    monkeypatch.setenv("REVIEW_SENTINEL", str(sentinel))
+
+    with kb.connect() as conn:
+        task_id, _host = _unclaimed_review_card(conn, reviewer="code-reviewer-a")
+        original_release = kb._release_review_launch
+        raced = False
+
+        def retire_before_release(*args, **kwargs):
+            nonlocal raced
+            if not raced:
+                raced = True
+                assert kb.failover_review_task(
+                    conn,
+                    task_id,
+                    "code-reviewer-b",
+                    error="new authority won before release",
+                ) is not None
+                return False
+            return original_release(*args, **kwargs)
+
+        monkeypatch.setattr(kb, "_release_review_launch", retire_before_release)
+        first = kb.dispatch_once(conn)
+        assert first.spawned == []
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.status == "review"
+        assert current.assignee == "code-reviewer-b"
+        assert current.claim_lock is None
+        assert not sentinel.exists()
+
+        monkeypatch.setattr(kb, "_release_review_launch", original_release)
+        second = kb.dispatch_once(conn)
+        assert second.spawned == [
+            (task_id, "code-reviewer-b", str(kb.workspaces_root() / task_id)),
+        ]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='spawned'",
+            (task_id,),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_launch_gates WHERE task_id=? AND state='released'",
+            (task_id,),
+        ).fetchone()[0] == 1
+        deadline = time.time() + 5
+        while not sentinel.exists() and time.time() < deadline:
+            time.sleep(0.02)
+        assert sentinel.exists()
+
+
+def test_real_review_attach_failure_has_no_workspace_or_task_side_effect(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(
+        profiles, "list_profiles",
+        lambda: [SimpleNamespace(name="code-reviewer")],
+    )
+    sentinel = tmp_path / "attach-failure-child-ran"
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        "from pathlib import Path\n"
+        "import os\n"
+        "Path(os.environ['REVIEW_SENTINEL']).write_text('ran')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: [sys.executable, str(worker)])
+    monkeypatch.setenv("REVIEW_SENTINEL", str(sentinel))
+    original_handle = kb._review_launch_handle
+    spawned_pid = None
+
+    def hide_first_attachment(pid):
+        nonlocal spawned_pid
+        spawned_pid = int(pid)
+        kb._review_launch_handle = original_handle
+        return None
+
+    monkeypatch.setattr(kb, "_review_launch_handle", hide_first_attachment)
+    with kb.connect() as conn:
+        task_id, _host = _unclaimed_review_card(conn, reviewer="code-reviewer")
+        result = kb.dispatch_once(conn)
+        current = kb.get_task(conn, task_id)
+        assert result.spawned == []
+        assert current is not None and current.status == "blocked"
+        assert current.worker_pid is None
+        assert not sentinel.exists()
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_launch_gates WHERE task_id=?",
+            (task_id,),
+        ).fetchone()[0] == 0
+    assert spawned_pid is not None
+    deadline = time.time() + 5
+    while kb._pid_alive(spawned_pid) and time.time() < deadline:
+        time.sleep(0.02)
+    assert not kb._pid_alive(spawned_pid)
+
+
+def test_real_review_stale_gate_does_not_leave_a_worktree(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(
+        profiles, "list_profiles",
+        lambda: [SimpleNamespace(name="code-reviewer")],
+    )
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "README").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "README"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+
+    sentinel = tmp_path / "stale-worktree-child-ran"
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        "from pathlib import Path\n"
+        "import os\n"
+        "Path(os.environ['REVIEW_SENTINEL']).write_text('ran')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: [sys.executable, str(worker)])
+    monkeypatch.setenv("REVIEW_SENTINEL", str(sentinel))
+
+    with kb.connect() as conn:
+        task_id, _review, _host = _review_card(conn, reviewer="code-reviewer")
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='worktree', workspace_path=? WHERE id=?",
+            (str(repo), task_id),
+        )
+        conn.commit()
+        assert kb.reclaim_task(conn, task_id, reason="prepare worktree gate test")
+        target = repo / ".worktrees" / task_id
+        assert not target.exists()
+
+        def deny_release(*_args, **_kwargs):
+            raise RuntimeError("stale worktree generation")
+
+        monkeypatch.setattr(kb, "_release_review_launch", deny_release)
+        result = kb.dispatch_once(conn)
+        current = kb.get_task(conn, task_id)
+        assert result.spawned == []
+        assert current is not None and current.status == "blocked"
+        assert not sentinel.exists()
+        assert not target.exists()
+
+
+def test_real_review_parent_crash_retires_attached_gate_without_exec(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
+    sentinel = tmp_path / "parent-crash-child-ran"
+    pid_file = tmp_path / "gate.pid"
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        "from pathlib import Path\n"
+        "import os\n"
+        "Path(os.environ['REVIEW_SENTINEL']).write_text('ran')\n",
+        encoding="utf-8",
+    )
+
+    with kb.connect() as conn:
+        task_id, review, _host = _review_card(conn, reviewer="code-reviewer")
+        db_path = kb.kanban_db_path()
+        script = "\n".join([
+            "import os, sys",
+            "from pathlib import Path",
+            "from hermes_cli import kanban_db as k",
+            "conn = k.connect(db_path=Path(os.environ['KDB']))",
+            "task = k.get_task(conn, os.environ['TASK'])",
+            "authority = k._latest_unconsumed_reviewer_authority(conn, task.id)",
+            "workspace = k.resolve_workspace(task, materialize=False)",
+            "token = 'parent-crash-gate-token'",
+            "pid = k._default_spawn(task, str(workspace), launch_gate=True, launch_token=token, launch_authority_id=authority[0])",
+            "with k.write_txn(conn):",
+            "    conn.execute(\"UPDATE tasks SET worker_pid=? WHERE id=? AND worker_pid IS NULL\", (pid, task.id))",
+            "    conn.execute(\"UPDATE task_runs SET worker_pid=? WHERE id=? AND worker_pid IS NULL\", (pid, task.current_run_id))",
+            "    conn.execute(\"INSERT INTO task_launch_gates (task_id, run_id, claim_lock, assignee, authority_id, gate_token, gate_pid, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'attached', strftime('%s','now'))\", (task.id, task.current_run_id, task.claim_lock, task.assignee, authority[0], token, pid))",
+            "Path(os.environ['PIDFILE']).write_text(str(pid))",
+            "os._exit(0)",
+        ])
+        env = dict(__import__('os').environ)
+        env.update({
+            "KDB": str(db_path),
+            "TASK": task_id,
+            "PIDFILE": str(pid_file),
+            "REVIEW_SENTINEL": str(sentinel),
+            "HERMES_KANBAN_DB": str(db_path),
+            "HERMES_LAUNCH_TEST_WORKER": str(worker),
+        })
+        parent = subprocess.Popen(
+            [sys.executable, "-c", script],
+            cwd=str(Path.cwd()),
+            env=env,
+        )
+        assert parent.wait(timeout=10) == 0
+
+        deadline = time.time() + 5
+        while not pid_file.exists() and time.time() < deadline:
+            time.sleep(0.02)
+        assert pid_file.exists()
+        gate_pid = int(pid_file.read_text(encoding="utf-8"))
+        while kb._pid_alive(gate_pid) and time.time() < deadline:
+            time.sleep(0.02)
+        assert not kb._pid_alive(gate_pid)
+        assert not sentinel.exists()
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert task_id in crashed
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.worker_pid is None
+        gate = conn.execute(
+            "SELECT state, workspace_path FROM task_launch_gates WHERE task_id=? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert gate is not None and gate["state"] == "retired"
+        assert gate["workspace_path"] is None
+
+
+def test_real_review_startup_revalidation_failure_never_executes_task_code(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(
+        profiles, "list_profiles",
+        lambda: [SimpleNamespace(name="code-reviewer")],
+    )
+    monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
+    sentinel = tmp_path / "revalidation-child-ran"
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        "from pathlib import Path\n"
+        "import os\n"
+        "Path(os.environ['REVIEW_SENTINEL']).write_text('ran')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: [sys.executable, str(worker)])
+    monkeypatch.setenv("REVIEW_SENTINEL", str(sentinel))
+    original_release = kb._ReviewLaunchGateHandle.release
+
+    with kb.connect() as conn:
+        task_id, _host = _unclaimed_review_card(conn, reviewer="code-reviewer")
+
+        def stale_before_pipe(handle):
+            conn.execute(
+                "UPDATE tasks SET assignee='stale-reviewer' WHERE id=?",
+                (task_id,),
+            )
+            conn.commit()
+            return original_release(handle)
+
+        monkeypatch.setattr(kb._ReviewLaunchGateHandle, "release", stale_before_pipe)
+        result = kb.dispatch_once(conn)
+        assert result.spawned == [
+            (task_id, "code-reviewer", str(kb.workspaces_root() / task_id)),
+        ]
+        deadline = time.time() + 5
+        while True:
+            gate = conn.execute(
+                "SELECT state, gate_pid, workspace_path FROM task_launch_gates "
+                "WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if gate is not None and gate["state"] == "revalidation_failed":
+                break
+            if time.time() >= deadline:
+                raise AssertionError("startup revalidation did not fail")
+            time.sleep(0.02)
+        assert not sentinel.exists()
+        while kb._pid_alive(int(gate["gate_pid"])) and time.time() < deadline:
+            time.sleep(0.02)
+        assert not kb._pid_alive(int(gate["gate_pid"]))
+        assert kb.detect_crashed_workers(conn) == [task_id]
+        assert gate["workspace_path"]
+        assert not Path(gate["workspace_path"]).exists()
 
 
 def test_claimed_reviewer_stays_in_review_column(kanban_home):
