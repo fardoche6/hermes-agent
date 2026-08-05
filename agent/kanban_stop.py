@@ -28,9 +28,6 @@ _IMPLEMENTATION_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
 _REVIEW_DECISION_KANBAN_TOOLS = frozenset(
     {"kanban_approve", "kanban_request_changes"}
 )
-_TERMINAL_KANBAN_TOOLS = (
-    _IMPLEMENTATION_KANBAN_TOOLS | _REVIEW_DECISION_KANBAN_TOOLS
-)
 
 _DEFAULT_MAX_ATTEMPTS = 2
 
@@ -111,6 +108,7 @@ def _last_landed_tool(
     wanted: frozenset[str],
     *,
     unknown_counts: bool,
+    require_call_match: bool,
 ) -> Optional[str]:
     """Return the last landed tool in ``wanted``.
 
@@ -136,10 +134,18 @@ def _last_landed_tool(
             continue
 
         call_id = str(msg.get("tool_call_id") or "")
-        name = str(msg.get("name") or msg.get("tool_name") or "")
-        if not name:
-            name = pending.get(call_id, "")
-        pending.pop(call_id, None)
+        result_name = str(msg.get("name") or msg.get("tool_name") or "")
+        if require_call_match:
+            if not call_id:
+                continue
+            name = pending.pop(call_id, None)
+            if name is None:
+                continue
+            if result_name and result_name != name:
+                continue
+        else:
+            name = result_name or pending.get(call_id, "")
+            pending.pop(call_id, None)
         if name not in wanted:
             continue
 
@@ -161,11 +167,17 @@ def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
         return False
     messages = list(messages)
     if _last_landed_tool(
-        messages, _REVIEW_DECISION_KANBAN_TOOLS, unknown_counts=False,
+        messages,
+        _REVIEW_DECISION_KANBAN_TOOLS,
+        unknown_counts=False,
+        require_call_match=True,
     ) is not None:
         return True
     return _last_landed_tool(
-        messages, _IMPLEMENTATION_KANBAN_TOOLS, unknown_counts=True,
+        messages,
+        _IMPLEMENTATION_KANBAN_TOOLS,
+        unknown_counts=True,
+        require_call_match=False,
     ) is not None
 
 
