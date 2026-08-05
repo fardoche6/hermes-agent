@@ -4743,6 +4743,19 @@ def _review_authority_is_unconsumed(
     ).fetchone()
     return row is None
 
+
+def _latest_unconsumed_reviewer_authority(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[tuple[int, str]]:
+    """Return the current reviewer authority, ignoring assignment events."""
+    authority = _latest_reviewer_authority(conn, task_id)
+    if authority is None or not _review_authority_is_unconsumed(
+        conn, task_id, authority[0],
+    ):
+        return None
+    return authority
+
+
 def _active_review_generation(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5765,8 +5778,8 @@ def _reviewer_candidates(
         str(p.name) for p in profiles
         if str(p.name).startswith("code-reviewer")
     ]
-    # The task's current assignee is the reviewer authorized by the latest
-    # ``submitted_for_review``/``review_failover`` event.  Keep that reviewer
+    # The caller supplies the reviewer authorized by the latest
+    # ``submitted_for_review``/``review_failover`` event. Keep that reviewer
     # first even when profile discovery returns the candidates in a different
     # order; assigning an older candidate before a new authority event would
     # create a generation that cannot legally decide the review.
@@ -5854,8 +5867,11 @@ def failover_review_task(
         current_row = conn.execute(
             "SELECT assignee FROM tasks WHERE id=?", (task_id,),
         ).fetchone()
-        current_profile = _canonical_assignee(
-            current_row["assignee"] if current_row else None
+        authority = _latest_unconsumed_reviewer_authority(conn, task_id)
+        current_profile = (
+            authority[1]
+            if authority is not None
+            else _canonical_assignee(current_row["assignee"] if current_row else None)
         )
         if current_profile:
             attempted_profiles.add(current_profile)
@@ -5924,8 +5940,11 @@ def _failover_review_after_recovery(
     task = get_task(conn, task_id)
     if task is None or task.status != "review":
         return task
-    candidates, preflight = _reviewer_candidates(task.assignee)
-    current = _canonical_assignee(task.assignee)
+    authority = _latest_unconsumed_reviewer_authority(conn, task_id)
+    if authority is None:
+        return task
+    current = authority[1]
+    candidates, preflight = _reviewer_candidates(current)
     attempts = _review_attempts_for_generation(conn, task_id)
     attempted_names = {
         _canonical_assignee(item.get("profile")) for item in attempts
@@ -10517,27 +10536,19 @@ def _dispatch_once_locked(
     for row in review_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
-        if not row["assignee"]:
-            result.skipped_unassigned.append(row["id"])
+        authority = _latest_unconsumed_reviewer_authority(conn, row["id"])
+        if authority is None:
+            if row["assignee"]:
+                result.skipped_nonspawnable.append(row["id"])
+            else:
+                result.skipped_unassigned.append(row["id"])
             continue
-        candidates, preflight_failures = _reviewer_candidates(row["assignee"])
+        current_reviewer = authority[1]
+        candidates, preflight_failures = _reviewer_candidates(current_reviewer)
         if not candidates:
             if not dry_run:
                 failover_review_task(
                     conn, row["id"], None,
-                    attempted=preflight_failures,
-                )
-            else:
-                result.skipped_nonspawnable.append(row["id"])
-            continue
-        current_reviewer = _canonical_assignee(row["assignee"])
-        if not current_reviewer:
-            if not dry_run:
-                failover_review_task(
-                    conn,
-                    row["id"],
-                    None,
-                    error="reviewer authority identity is invalid",
                     attempted=preflight_failures,
                 )
             else:
@@ -10563,30 +10574,50 @@ def _dispatch_once_locked(
                 result.skipped_nonspawnable.append(row["id"])
             continue
         if _per_profile_cap is not None:
-            current = _per_profile_running.get(candidates[0], 0)
+            current = _per_profile_running.get(current_reviewer, 0)
             if current >= _per_profile_cap:
                 result.skipped_per_profile_capped.append(
-                    (row["id"], candidates[0], current)
+                    (row["id"], current_reviewer, current)
                 )
                 continue
         if dry_run:
-            result.spawned.append((row["id"], candidates[0], ""))
+            result.spawned.append((row["id"], current_reviewer, ""))
             if _per_profile_cap is not None:
-                _per_profile_running[candidates[0]] = (
-                    _per_profile_running.get(candidates[0], 0) + 1
+                _per_profile_running[current_reviewer] = (
+                    _per_profile_running.get(current_reviewer, 0) + 1
                 )
             continue
 
         attempted = list(preflight_failures)
         spawned_review = False
+        dispatch_deferred = False
         for candidate_index, reviewer in enumerate(candidates):
+            # Only the latest unconsumed authority may be claimed.  An
+            # assignment-only write can change the task row without creating
+            # a new reviewer generation, so never fall through to that stale
+            # row assignee after an authority mismatch or assignment race.
+            live_authority = _latest_unconsumed_reviewer_authority(
+                conn, row["id"],
+            )
+            if (
+                live_authority is None
+                or live_authority[1] != _canonical_assignee(reviewer)
+            ):
+                attempted.append({
+                    "profile": reviewer,
+                    "error": "review authority changed",
+                })
+                dispatch_deferred = True
+                break
             if reviewer != row["assignee"] and not assign_task(conn, row["id"], reviewer):
                 attempted.append({"profile": reviewer, "error": "assignment refused"})
-                continue
+                dispatch_deferred = True
+                break
             claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
             if claimed is None:
                 attempted.append({"profile": reviewer, "error": "review claim refused"})
-                continue
+                dispatch_deferred = True
+                break
             try:
                 resolved_branch_name = None
                 if claimed.workspace_kind == "worktree":
@@ -10632,7 +10663,13 @@ def _dispatch_once_locked(
                     error=_bounded_review_error(exc), attempted=attempted,
                 )
         current_review = get_task(conn, row["id"])
-        if not spawned_review and candidates and current_review and current_review.status == "review":
+        if (
+            not spawned_review
+            and not dispatch_deferred
+            and candidates
+            and current_review
+            and current_review.status == "review"
+        ):
             failover_review_task(
                 conn, row["id"], None,
                 attempted=attempted or [

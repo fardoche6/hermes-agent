@@ -953,6 +953,121 @@ def test_dispatch_failover_claims_only_the_authorized_replacement_generation(
         ) == 1
 
 
+@pytest.mark.parametrize("decision", ["request_changes", "approve"])
+def test_dispatch_ignores_assignment_only_reset_after_review_failover(
+    kanban_home, all_assignees_spawnable, monkeypatch, decision,
+):
+    """An assignment event cannot replace the latest review authority.
+
+    This is the adversarial sequence from the stale-assignee incident:
+    reviewer A fails over to B, an assignment-only write puts A back on the
+    task row, then the dispatcher must reconcile B before claiming a run.
+    """
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(
+        profiles,
+        "list_profiles",
+        lambda: [
+            SimpleNamespace(name="code-reviewer-a"),
+            SimpleNamespace(name="code-reviewer-b"),
+            SimpleNamespace(name="code-reviewer-c"),
+        ],
+    )
+    spawned = []
+
+    def spawn(task, workspace):
+        spawned.append((task.id, task.assignee))
+        return 1400 + len(spawned)
+
+    with kb.connect() as conn:
+        task_id, _, _ = _review_card(conn, reviewer="code-reviewer-a")
+        assert kb.failover_review_task(
+            conn, task_id, "code-reviewer-b", error="reviewer-a failed",
+        ) is not None
+        assert kb.assign_task(conn, task_id, "code-reviewer-a")
+
+        before_dispatch = kb.get_task(conn, task_id)
+        assert before_dispatch is not None
+        assert before_dispatch.assignee == "code-reviewer-a"
+        authority = kb._latest_reviewer_authority(conn, task_id)
+        assert authority is not None and authority[1] == "code-reviewer-b"
+
+        kb.dispatch_once(conn, spawn_fn=spawn)
+        replacement = kb.get_task(conn, task_id)
+        assert replacement is not None
+        assert replacement.assignee == "code-reviewer-b"
+        assert spawned == [(task_id, "code-reviewer-b")]
+
+        with pytest.raises(
+            RuntimeError,
+            match="reviewer generation|reviewer lane|active review run|expected run",
+        ):
+            if decision == "request_changes":
+                kb.request_changes(
+                    conn,
+                    task_id,
+                    "programmer",
+                    reviewer="code-reviewer-a",
+                    reason="stale assignment-only reviewer",
+                    expected_claim=replacement.claim_lock,
+                    expected_run_id=replacement.current_run_id,
+                )
+            else:
+                kb.approve_review(
+                    conn,
+                    task_id,
+                    reviewer="code-reviewer-a",
+                    summary="stale assignment-only reviewer",
+                    head_sha=HEAD_SHA,
+                    expected_claim=replacement.claim_lock,
+                    expected_run_id=replacement.current_run_id,
+                )
+
+        if decision == "request_changes":
+            decided = kb.request_changes(
+                conn,
+                task_id,
+                "programmer",
+                reviewer="code-reviewer-b",
+                reason="replacement reviewer decision",
+                expected_claim=replacement.claim_lock,
+                expected_run_id=replacement.current_run_id,
+            )
+            replay = kb.request_changes(
+                conn,
+                task_id,
+                "programmer",
+                reviewer="code-reviewer-b",
+                reason="replacement reviewer decision",
+                expected_claim=replacement.claim_lock,
+                expected_run_id=replacement.current_run_id,
+            )
+        else:
+            decided = kb.approve_review(
+                conn,
+                task_id,
+                reviewer="code-reviewer-b",
+                summary="replacement reviewer decision",
+                head_sha=HEAD_SHA,
+                expected_claim=replacement.claim_lock,
+                expected_run_id=replacement.current_run_id,
+            )
+            replay = kb.approve_review(
+                conn,
+                task_id,
+                reviewer="code-reviewer-b",
+                summary="replacement reviewer decision",
+                head_sha=HEAD_SHA,
+                expected_claim=replacement.claim_lock,
+                expected_run_id=replacement.current_run_id,
+            )
+        assert decided is not None and replay is not None
+        assert _events(conn, task_id).count(
+            "changes_requested" if decision == "request_changes" else "review_approved"
+        ) == 1
+
+
 def test_dispatch_failover_does_not_reassign_when_authority_preflight_fails(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):
@@ -988,6 +1103,9 @@ def test_dispatch_failover_does_not_reassign_when_authority_preflight_fails(
             "code-reviewer-b",
             error="reviewer-a timed out",
         )
+        # Preflight must also use the B authority when an assignment-only
+        # write has put the stale A profile back on the task row.
+        assert kb.assign_task(conn, task_id, "code-reviewer-a")
 
         kb.dispatch_once(conn, spawn_fn=spawn)
         failed_over = kb.get_task(conn, task_id)
