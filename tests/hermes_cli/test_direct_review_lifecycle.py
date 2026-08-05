@@ -100,12 +100,27 @@ def _terminal_decision(conn, task_id, review, *, kind, trusted):
     )
 
 
-def _assert_no_mutation(conn, task_id, before_events, before_runs, review):
-    assert _events(conn, task_id) == before_events
-    assert conn.execute(
-        "SELECT id, status, outcome, ended_at FROM task_runs "
-        "WHERE task_id=? ORDER BY id", (task_id,),
-    ).fetchall() == before_runs
+def _snapshot(conn, task_id):
+    """Full row snapshot of every table a decision could mutate.
+
+    Complete rows (``SELECT *``) are captured so status, assignee, claim
+    lock, expiration, worker pid, current_run_id, every run row and every
+    event row + payload are all covered without asserting on schema shape.
+    """
+    def _rows(sql):
+        return [tuple(row) for row in conn.execute(sql, (task_id,)).fetchall()]
+
+    return {
+        "tasks": _rows("SELECT * FROM tasks WHERE id=?"),
+        "task_runs": _rows("SELECT * FROM task_runs WHERE task_id=? ORDER BY id"),
+        "task_events": _rows(
+            "SELECT * FROM task_events WHERE task_id=? ORDER BY id"
+        ),
+    }
+
+
+def _assert_no_mutation(conn, task_id, before, review):
+    assert _snapshot(conn, task_id) == before
     current = kb.get_task(conn, task_id)
     assert current is not None and current.current_run_id == review.current_run_id
 
@@ -262,7 +277,7 @@ def test_running_reviewer_rejects_wrong_claim_without_mutation(kanban_home):
         task_id, review, _ = _review_card(conn)
         conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
         conn.commit()
-        before_events = _events(conn, task_id)
+        before = _snapshot(conn, task_id)
 
         with pytest.raises(RuntimeError, match="no longer holds"):
             kb.request_changes(
@@ -280,7 +295,7 @@ def test_running_reviewer_rejects_wrong_claim_without_mutation(kanban_home):
         assert current.status == "running"
         assert current.current_run_id == review.current_run_id
         assert current.claim_lock == review.claim_lock
-        assert _events(conn, task_id) == before_events
+        assert _snapshot(conn, task_id) == before
 
 
 def test_trusted_request_changes_rejects_successor_programmer_run(kanban_home):
@@ -292,7 +307,7 @@ def test_trusted_request_changes_rejects_successor_programmer_run(kanban_home):
         ) is not None
         correction = kb.claim_task(conn, task_id, claimer="host:programmer")
         assert correction is not None
-        before_events = _events(conn, task_id)
+        before = _snapshot(conn, task_id)
         before_run = conn.execute(
             "SELECT status, outcome, ended_at FROM task_runs WHERE id=?",
             (correction.current_run_id,),
@@ -308,7 +323,7 @@ def test_trusted_request_changes_rejects_successor_programmer_run(kanban_home):
         assert current is not None
         assert current.status == "running"
         assert current.current_run_id == correction.current_run_id
-        assert _events(conn, task_id) == before_events
+        assert _snapshot(conn, task_id) == before
         assert conn.execute(
             "SELECT status, outcome, ended_at FROM task_runs WHERE id=?",
             (correction.current_run_id,),
@@ -324,7 +339,7 @@ def test_trusted_approve_rejects_successor_programmer_run(kanban_home):
         ) is not None
         finalizer = kb.claim_task(conn, task_id, claimer="host:programmer")
         assert finalizer is not None
-        before_events = _events(conn, task_id)
+        before = _snapshot(conn, task_id)
         before_run = conn.execute(
             "SELECT status, outcome, ended_at FROM task_runs WHERE id=?",
             (finalizer.current_run_id,),
@@ -340,7 +355,7 @@ def test_trusted_approve_rejects_successor_programmer_run(kanban_home):
         assert current is not None
         assert current.status == "running"
         assert current.current_run_id == finalizer.current_run_id
-        assert _events(conn, task_id) == before_events
+        assert _snapshot(conn, task_id) == before
         assert conn.execute(
             "SELECT status, outcome, ended_at FROM task_runs WHERE id=?",
             (finalizer.current_run_id,),
@@ -355,7 +370,7 @@ def test_running_reviewer_rejects_expired_claim_without_mutation(kanban_home):
             (int(time.time()) - 1, task_id),
         )
         conn.commit()
-        before_events = _events(conn, task_id)
+        before = _snapshot(conn, task_id)
 
         with pytest.raises(RuntimeError, match="reviewer generation"):
             kb.request_changes(
@@ -367,7 +382,7 @@ def test_running_reviewer_rejects_expired_claim_without_mutation(kanban_home):
         current = kb.get_task(conn, task_id)
         assert current is not None
         assert current.current_run_id == review.current_run_id
-        assert _events(conn, task_id) == before_events
+        assert _snapshot(conn, task_id) == before
 
 
 @pytest.mark.parametrize("kind", ["request_changes", "approve"])
@@ -388,16 +403,12 @@ def test_malformed_latest_review_authority_fails_closed(kanban_home, kind, paylo
             "UPDATE task_events SET payload=? WHERE id=?", (payload, authority["id"]),
         )
         conn.commit()
-        before_events = _events(conn, task_id)
-        before_runs = conn.execute(
-            "SELECT id, status, outcome, ended_at FROM task_runs "
-            "WHERE task_id=? ORDER BY id", (task_id,),
-        ).fetchall()
+        before = _snapshot(conn, task_id)
 
         with pytest.raises(RuntimeError, match="reviewer generation|reviewer lane"):
             _terminal_decision(conn, task_id, review, kind=kind, trusted=kind == "approve")
 
-        _assert_no_mutation(conn, task_id, before_events, before_runs, review)
+        _assert_no_mutation(conn, task_id, before, review)
 
 
 @pytest.mark.parametrize("kind", ["request_changes", "approve"])
@@ -423,16 +434,12 @@ def test_newer_malformed_review_authority_overrides_valid_history(
         assert newer is not None
         conn.execute("UPDATE task_events SET payload=? WHERE id=?", (payload, newer["id"]))
         conn.commit()
-        before_events = _events(conn, task_id)
-        before_runs = conn.execute(
-            "SELECT id, status, outcome, ended_at FROM task_runs "
-            "WHERE task_id=? ORDER BY id", (task_id,),
-        ).fetchall()
+        before = _snapshot(conn, task_id)
 
         with pytest.raises(RuntimeError, match="reviewer generation|reviewer lane"):
             _terminal_decision(conn, task_id, review, kind=kind, trusted=trusted)
 
-        _assert_no_mutation(conn, task_id, before_events, before_runs, review)
+        _assert_no_mutation(conn, task_id, before, review)
 
 
 @pytest.mark.parametrize("kind", ["request_changes", "approve"])
@@ -489,18 +496,14 @@ def test_missing_latest_failover_authority_fails_closed(kanban_home, kind):
             (json.dumps({"other": "missing"}), authority["id"]),
         )
         conn.commit()
-        before_events = _events(conn, task_id)
-        before_runs = conn.execute(
-            "SELECT id, status, outcome, ended_at FROM task_runs "
-            "WHERE task_id=? ORDER BY id", (task_id,),
-        ).fetchall()
+        before = _snapshot(conn, task_id)
 
         with pytest.raises(RuntimeError, match="reviewer generation|reviewer lane"):
             _terminal_decision(
                 conn, task_id, replacement, kind=kind, trusted=kind == "approve",
             )
 
-        _assert_no_mutation(conn, task_id, before_events, before_runs, replacement)
+        _assert_no_mutation(conn, task_id, before, replacement)
 
 
 @pytest.mark.parametrize("kind", ["request_changes", "approve"])
@@ -526,16 +529,12 @@ def test_missing_or_nonfresh_claim_expiry_fails_closed(kanban_home, kind, null_s
             (run_expiry, review.current_run_id),
         )
         conn.commit()
-        before_events = _events(conn, task_id)
-        before_runs = conn.execute(
-            "SELECT id, status, outcome, ended_at FROM task_runs "
-            "WHERE task_id=? ORDER BY id", (task_id,),
-        ).fetchall()
+        before = _snapshot(conn, task_id)
 
         with pytest.raises(RuntimeError, match="reviewer generation"):
             _terminal_decision(conn, task_id, review, kind=kind, trusted=kind == "approve")
 
-        _assert_no_mutation(conn, task_id, before_events, before_runs, review)
+        _assert_no_mutation(conn, task_id, before, review)
 
 
 def test_trusted_request_changes_rejects_reassigned_review_owner(kanban_home):
@@ -548,11 +547,7 @@ def test_trusted_request_changes_rejects_reassigned_review_owner(kanban_home):
         assert kb.assign_task(conn, task_id, "reviewer-b")
         review = kb.claim_review_task(conn, task_id, claimer="host:review")
         assert review is not None
-        before_events = _events(conn, task_id)
-        before_runs = conn.execute(
-            "SELECT id, status, outcome, ended_at FROM task_runs "
-            "WHERE task_id=? ORDER BY id", (task_id,),
-        ).fetchall()
+        before = _snapshot(conn, task_id)
 
         with pytest.raises(RuntimeError, match="reviewer generation"):
             kb.request_changes(
@@ -560,13 +555,7 @@ def test_trusted_request_changes_rejects_reassigned_review_owner(kanban_home):
                 trusted_operator=True,
             )
 
-        assert _events(conn, task_id) == before_events
-        assert conn.execute(
-            "SELECT id, status, outcome, ended_at FROM task_runs "
-            "WHERE task_id=? ORDER BY id", (task_id,),
-        ).fetchall() == before_runs
-        current = kb.get_task(conn, task_id)
-        assert current is not None and current.current_run_id == review.current_run_id
+        _assert_no_mutation(conn, task_id, before, review)
 
 
 def test_trusted_approve_rejects_reassigned_review_owner(kanban_home):
@@ -579,11 +568,7 @@ def test_trusted_approve_rejects_reassigned_review_owner(kanban_home):
         assert kb.assign_task(conn, task_id, "reviewer-b")
         review = kb.claim_review_task(conn, task_id, claimer="host:review")
         assert review is not None
-        before_events = _events(conn, task_id)
-        before_runs = conn.execute(
-            "SELECT id, status, outcome, ended_at FROM task_runs "
-            "WHERE task_id=? ORDER BY id", (task_id,),
-        ).fetchall()
+        before = _snapshot(conn, task_id)
 
         with pytest.raises(RuntimeError, match="does not own|reviewer generation"):
             kb.approve_review(
@@ -591,13 +576,7 @@ def test_trusted_approve_rejects_reassigned_review_owner(kanban_home):
                 head_sha=HEAD_SHA, trusted_operator=True,
             )
 
-        assert _events(conn, task_id) == before_events
-        assert conn.execute(
-            "SELECT id, status, outcome, ended_at FROM task_runs "
-            "WHERE task_id=? ORDER BY id", (task_id,),
-        ).fetchall() == before_runs
-        current = kb.get_task(conn, task_id)
-        assert current is not None and current.current_run_id == review.current_run_id
+        _assert_no_mutation(conn, task_id, before, review)
 
 
 def test_old_request_retry_rejects_reclaimed_successor(kanban_home):
@@ -611,11 +590,7 @@ def test_old_request_retry_rejects_reclaimed_successor(kanban_home):
         successor = kb.claim_task(conn, task_id, claimer="host:successor")
         assert successor is not None
         assert kb.reclaim_task(conn, task_id, reason="successor reclaimed")
-        before_events = _events(conn, task_id)
-        before_runs = conn.execute(
-            "SELECT id, status, outcome, ended_at FROM task_runs "
-            "WHERE task_id=? ORDER BY id", (task_id,),
-        ).fetchall()
+        before = _snapshot(conn, task_id)
 
         with pytest.raises(RuntimeError, match="not active"):
             kb.request_changes(
@@ -623,11 +598,7 @@ def test_old_request_retry_rejects_reclaimed_successor(kanban_home):
                 expected_claim=review.claim_lock, expected_run_id=review.current_run_id,
             )
 
-        assert _events(conn, task_id) == before_events
-        assert conn.execute(
-            "SELECT id, status, outcome, ended_at FROM task_runs "
-            "WHERE task_id=? ORDER BY id", (task_id,),
-        ).fetchall() == before_runs
+        assert _snapshot(conn, task_id) == before
 
 
 def test_old_approval_retry_rejects_blocked_successor(kanban_home):
@@ -644,11 +615,7 @@ def test_old_approval_retry_rejects_blocked_successor(kanban_home):
             conn, task_id, reason="successor blocked",
             expected_run_id=successor.current_run_id,
         )
-        before_events = _events(conn, task_id)
-        before_runs = conn.execute(
-            "SELECT id, status, outcome, ended_at FROM task_runs "
-            "WHERE task_id=? ORDER BY id", (task_id,),
-        ).fetchall()
+        before = _snapshot(conn, task_id)
 
         with pytest.raises(RuntimeError, match="not active"):
             kb.approve_review(
@@ -657,11 +624,7 @@ def test_old_approval_retry_rejects_blocked_successor(kanban_home):
                 expected_run_id=review.current_run_id,
             )
 
-        assert _events(conn, task_id) == before_events
-        assert conn.execute(
-            "SELECT id, status, outcome, ended_at FROM task_runs "
-            "WHERE task_id=? ORDER BY id", (task_id,),
-        ).fetchall() == before_runs
+        assert _snapshot(conn, task_id) == before
 
 
 def test_approve_records_exact_head_and_routes_same_card_to_finalizer(kanban_home):
@@ -1352,8 +1315,14 @@ def test_review_heartbeat_stale_fails_over_to_alternate_reviewer(
 # ---------------------------------------------------------------------------
 
 def _make_profile(name: str) -> None:
-    """Materialize a profile directory under the temp home."""
-    (Path.home() / ".hermes" / "profiles" / name).mkdir(parents=True, exist_ok=True)
+    """Materialize a *configured* profile under the temp home.
+
+    A configured profile is a directory holding a ``config.yaml``; a bare
+    directory is deliberately not enough to receive a transferred card.
+    """
+    directory = Path.home() / ".hermes" / "profiles" / name
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "config.yaml").write_text(f"profile: {name}\n", encoding="utf-8")
 
 
 def _request_changes(conn, task_id, review, programmer, *, reason="transfer"):
@@ -1428,16 +1397,12 @@ def test_incompatible_programmer_is_rejected_without_mutation(
 ):
     with kb.connect() as conn:
         task_id, review, _ = _review_card(conn)
-        before_events = _events(conn, task_id)
-        before_runs = conn.execute(
-            "SELECT id, status, outcome, ended_at FROM task_runs "
-            "WHERE task_id=? ORDER BY id", (task_id,),
-        ).fetchall()
+        before = _snapshot(conn, task_id)
 
         with pytest.raises((RuntimeError, ValueError)):
             _request_changes(conn, task_id, review, candidate)
 
-        _assert_no_mutation(conn, task_id, before_events, before_runs, review)
+        _assert_no_mutation(conn, task_id, before, review)
         current = kb.get_task(conn, task_id)
         assert current is not None and current.assignee == "code-reviewer"
 
@@ -1446,43 +1411,64 @@ def test_incompatible_programmer_is_rejected_without_mutation(
 def test_blank_programmer_is_rejected_without_mutation(kanban_home, candidate):
     with kb.connect() as conn:
         task_id, review, _ = _review_card(conn)
-        before_events = _events(conn, task_id)
-        before_runs = conn.execute(
-            "SELECT id, status, outcome, ended_at FROM task_runs "
-            "WHERE task_id=? ORDER BY id", (task_id,),
-        ).fetchall()
+        before = _snapshot(conn, task_id)
 
         with pytest.raises((RuntimeError, ValueError)):
             _request_changes(conn, task_id, review, candidate)
 
-        _assert_no_mutation(conn, task_id, before_events, before_runs, review)
+        _assert_no_mutation(conn, task_id, before, review)
 
 
 def test_unknown_compatible_programmer_profile_is_rejected(kanban_home):
     """Role-shaped but nonexistent profiles fail closed before mutation."""
     with kb.connect() as conn:
         task_id, review, _ = _review_card(conn)
-        before_events = _events(conn, task_id)
-        before_runs = conn.execute(
-            "SELECT id, status, outcome, ended_at FROM task_runs "
-            "WHERE task_id=? ORDER BY id", (task_id,),
-        ).fetchall()
+        before = _snapshot(conn, task_id)
 
         with pytest.raises(RuntimeError):
             _request_changes(conn, task_id, review, "programmer-ghost")
 
-        _assert_no_mutation(conn, task_id, before_events, before_runs, review)
+        _assert_no_mutation(conn, task_id, before, review)
+
+
+def test_unconfigured_programmer_directory_is_rejected(kanban_home):
+    """A bare, role-shaped profile directory is not a configured profile."""
+    bare = Path.home() / ".hermes" / "profiles" / "programmer-empty"
+    bare.mkdir(parents=True)
+    assert not (bare / "config.yaml").exists()
+
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        before = _snapshot(conn, task_id)
+
+        with pytest.raises(RuntimeError, match="unavailable"):
+            _request_changes(conn, task_id, review, "programmer-empty")
+
+        _assert_no_mutation(conn, task_id, before, review)
+        current = kb.get_task(conn, task_id)
+        assert current is not None and current.assignee == "code-reviewer"
+
+
+def test_role_shaped_but_not_programmer_lane_is_rejected(kanban_home):
+    """``programmerfoo`` only looks like the lane; it must be rejected."""
+    _make_profile("programmerfoo")
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        before = _snapshot(conn, task_id)
+
+        with pytest.raises(RuntimeError, match="compatible programmer"):
+            _request_changes(conn, task_id, review, "programmerfoo")
+
+        _assert_no_mutation(conn, task_id, before, review)
+        current = kb.get_task(conn, task_id)
+        assert current is not None and current.assignee == "code-reviewer"
 
 
 def test_transfer_still_requires_run_claim_and_reviewer_lane(kanban_home):
     _make_profile("programmer-luna")
     with kb.connect() as conn:
         task_id, review, _ = _review_card(conn)
-        before_events = _events(conn, task_id)
-        before_runs = conn.execute(
-            "SELECT id, status, outcome, ended_at FROM task_runs "
-            "WHERE task_id=? ORDER BY id", (task_id,),
-        ).fetchall()
+        before = _snapshot(conn, task_id)
 
         # Stale run id.
         with pytest.raises(RuntimeError):
@@ -1506,7 +1492,7 @@ def test_transfer_still_requires_run_claim_and_reviewer_lane(kanban_home):
                 expected_run_id=review.current_run_id,
             )
 
-        _assert_no_mutation(conn, task_id, before_events, before_runs, review)
+        _assert_no_mutation(conn, task_id, before, review)
 
 
 def test_transferred_programmer_becomes_finalizer_after_approval(kanban_home):

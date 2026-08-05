@@ -1335,7 +1335,9 @@ def test_kanban_request_changes_handler_transfers_to_compatible_programmer(
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    (home / "profiles" / "programmer-luna").mkdir(parents=True)
+    luna = home / "profiles" / "programmer-luna"
+    luna.mkdir(parents=True)
+    (luna / "config.yaml").write_text("profile: programmer-luna\n", encoding="utf-8")
     from hermes_cli import kanban_db as kb
     import tools.kanban_tools as kt
 

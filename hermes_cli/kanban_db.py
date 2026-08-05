@@ -5236,9 +5236,14 @@ def request_changes(
                     f"owner {original_owner!r} nor a compatible programmer "
                     f"profile ('programmer' or 'programmer-<name>')"
                 )
-            from hermes_cli.profiles import profile_exists
+            # Admission uses the module's canonical configured-profile
+            # contract (a profile directory holding a ``config.yaml``), not
+            # bare directory existence, so a half-created profile tree can
+            # never receive a card.  Any failure here fails closed.
             try:
-                available = profile_exists(programmer)
+                from hermes_cli.profiles import normalize_profile_name
+                canonical = normalize_profile_name(programmer)
+                available = canonical in list_profiles_on_disk()
             except Exception:
                 available = False
             if not available:
