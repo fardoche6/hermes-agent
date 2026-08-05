@@ -4380,12 +4380,17 @@ def claim_task(
     return claimed
 
 
+_EXPECTED_REVIEW_ASSIGNEE_UNSET = object()
+
+
 def claim_review_task(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    expected_authority: Optional[tuple[int, str]] = None,
+    expected_assignee: object = _EXPECTED_REVIEW_ASSIGNEE_UNSET,
 ) -> Optional[Task]:
     """Atomically claim a ``review`` task without leaving the review column.
 
@@ -4398,11 +4403,96 @@ def claim_review_task(
 
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
+
+    When ``expected_authority`` is supplied, it is the exact
+    ``(task_events.id, reviewer)`` pair observed during candidate discovery.
+    Authority validation, stale-assignee detection, any assignee reconciliation,
+    and the claim CAS all execute under one ``BEGIN IMMEDIATE`` transaction.
+    A writer that changes either the authority generation or the observed task
+    assignee therefore makes this call return ``None`` without creating a run.
     """
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
+    expected_authority_id: Optional[int] = None
+    expected_reviewer: Optional[str] = None
+    if expected_authority is not None:
+        try:
+            expected_authority_id = int(expected_authority[0])
+            expected_reviewer = _canonical_assignee(expected_authority[1])
+        except (IndexError, TypeError, ValueError, RuntimeError):
+            return None
+        if expected_authority_id <= 0 or not expected_reviewer:
+            return None
     with write_txn(conn):
+        task_row = conn.execute(
+            "SELECT status, claim_lock, assignee FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        if (
+            task_row is None
+            or task_row["status"] != "review"
+            or task_row["claim_lock"] is not None
+        ):
+            return None
+
+        authority = _latest_unconsumed_reviewer_authority(conn, task_id)
+        if expected_authority is not None:
+            if authority != (expected_authority_id, expected_reviewer):
+                return None
+            reviewer = expected_reviewer
+        else:
+            # Preserve the legacy path for review rows created before the
+            # reviewer-authority events existed. The dispatcher always uses
+            # expected_authority; unbound direct claims remain subject to the
+            # strict reviewer-generation checks at decision time.
+            reviewer = _canonical_assignee(task_row["assignee"])
+        if not reviewer:
+            return None
+
+        current_assignee = _canonical_assignee(task_row["assignee"])
+        if expected_assignee is not _EXPECTED_REVIEW_ASSIGNEE_UNSET:
+            try:
+                if (
+                    expected_assignee is not None
+                    and not isinstance(expected_assignee, str)
+                ):
+                    return None
+                observed_assignee = _canonical_assignee(expected_assignee)
+            except (TypeError, ValueError, RuntimeError):
+                return None
+            if current_assignee != observed_assignee:
+                return None
+            if current_assignee != reviewer:
+                if observed_assignee is None:
+                    cur = conn.execute(
+                        "UPDATE tasks SET assignee=? WHERE id=? "
+                        "AND status='review' AND claim_lock IS NULL "
+                        "AND assignee IS NULL",
+                        (reviewer, task_id),
+                    )
+                else:
+                    cur = conn.execute(
+                        "UPDATE tasks SET assignee=? WHERE id=? "
+                        "AND status='review' AND claim_lock IS NULL "
+                        "AND assignee=?",
+                        (reviewer, task_id, observed_assignee),
+                    )
+                if cur.rowcount != 1:
+                    return None
+                _append_event(
+                    conn,
+                    task_id,
+                    "assigned",
+                    {
+                        "assignee": reviewer,
+                        "source": "review_authority_reconciliation",
+                    },
+                )
+                current_assignee = reviewer
+        elif current_assignee != reviewer:
+            return None
+
         cur = conn.execute(
             """
             UPDATE tasks
@@ -4413,8 +4503,9 @@ def claim_review_task(
              WHERE id = ?
                AND status = 'review'
                AND claim_lock IS NULL
+               AND assignee = ?
             """,
-            (lock, expires, now, task_id),
+            (lock, expires, now, task_id, reviewer),
         )
         if cur.rowcount != 1:
             return None
@@ -4446,10 +4537,17 @@ def claim_review_task(
             "UPDATE tasks SET current_run_id = ? WHERE id = ?",
             (run_id, task_id),
         )
+        claim_payload = {
+            "lock": lock,
+            "expires": expires,
+            "run_id": run_id,
+            "source_status": "review",
+        }
+        if authority is not None and reviewer == authority[1]:
+            claim_payload["review_authority_id"] = authority[0]
         _append_event(
             conn, task_id, "claimed",
-            {"lock": lock, "expires": expires, "run_id": run_id,
-             "source_status": "review"},
+            claim_payload,
             run_id=run_id,
         )
         return get_task(conn, task_id)
@@ -10591,17 +10689,16 @@ def _dispatch_once_locked(
         attempted = list(preflight_failures)
         spawned_review = False
         dispatch_deferred = False
+        expected_authority = authority
         for candidate_index, reviewer in enumerate(candidates):
-            # Only the latest unconsumed authority may be claimed.  An
-            # assignment-only write can change the task row without creating
-            # a new reviewer generation, so never fall through to that stale
-            # row assignee after an authority mismatch or assignment race.
-            live_authority = _latest_unconsumed_reviewer_authority(
-                conn, row["id"],
-            )
+            # The expected authority id stays fixed from discovery through
+            # this claim attempt. If a concurrent failover commits after
+            # discovery, even when its reviewer is in this candidate list,
+            # the atomic claim CAS below must reject this generation and defer
+            # to the next dispatcher tick.
             if (
-                live_authority is None
-                or live_authority[1] != _canonical_assignee(reviewer)
+                expected_authority is None
+                or expected_authority[1] != _canonical_assignee(reviewer)
             ):
                 attempted.append({
                     "profile": reviewer,
@@ -10609,13 +10706,27 @@ def _dispatch_once_locked(
                 })
                 dispatch_deferred = True
                 break
-            if reviewer != row["assignee"] and not assign_task(conn, row["id"], reviewer):
-                attempted.append({"profile": reviewer, "error": "assignment refused"})
+            candidate_task = get_task(conn, row["id"])
+            if (
+                candidate_task is None
+                or candidate_task.status != "review"
+                or candidate_task.claim_lock is not None
+            ):
+                attempted.append({"profile": reviewer, "error": "review claim refused"})
                 dispatch_deferred = True
                 break
-            claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+            claimed = claim_review_task(
+                conn,
+                row["id"],
+                ttl_seconds=ttl_seconds,
+                expected_authority=expected_authority,
+                expected_assignee=candidate_task.assignee,
+            )
             if claimed is None:
-                attempted.append({"profile": reviewer, "error": "review claim refused"})
+                attempted.append({
+                    "profile": reviewer,
+                    "error": "review claim CAS refused; authority or assignee changed",
+                })
                 dispatch_deferred = True
                 break
             try:
@@ -10658,10 +10769,19 @@ def _dispatch_once_locked(
                     candidates[candidate_index + 1]
                     if candidate_index + 1 < len(candidates) else None
                 )
-                failover_review_task(
+                failed_over = failover_review_task(
                     conn, claimed.id, next_reviewer,
                     error=_bounded_review_error(exc), attempted=attempted,
                 )
+                if failed_over is None or failed_over.status != "review":
+                    dispatch_deferred = True
+                    break
+                expected_authority = _latest_unconsumed_reviewer_authority(
+                    conn, claimed.id,
+                )
+                if expected_authority is None:
+                    dispatch_deferred = True
+                    break
         current_review = get_task(conn, row["id"])
         if (
             not spawned_review

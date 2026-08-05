@@ -7,6 +7,7 @@ current main: a claimed reviewer has no first-class terminal decision path.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -1066,6 +1067,160 @@ def test_dispatch_ignores_assignment_only_reset_after_review_failover(
         assert _events(conn, task_id).count(
             "changes_requested" if decision == "request_changes" else "review_approved"
         ) == 1
+
+
+@pytest.mark.parametrize("race", ["assignment", "failover"])
+@pytest.mark.parametrize("decision", ["request_changes", "approve"])
+def test_dispatch_defers_interleaved_reviewer_mutation_before_claim(
+    kanban_home, all_assignees_spawnable, monkeypatch, race, decision,
+):
+    """A writer between discovery and claim cannot authorize a stale spawn."""
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(
+        profiles,
+        "list_profiles",
+        lambda: [
+            SimpleNamespace(name="code-reviewer-a"),
+            SimpleNamespace(name="code-reviewer-b"),
+            SimpleNamespace(name="code-reviewer-c"),
+        ],
+    )
+    spawned = []
+    mutation_errors = []
+    mutation_fired = False
+
+    def spawn(task, workspace):
+        spawned.append((task.id, task.assignee))
+        return 1800 + len(spawned)
+
+    with kb.connect() as conn:
+        task_id, _, _ = _review_card(conn, reviewer="code-reviewer-a")
+        assert kb.failover_review_task(
+            conn, task_id, "code-reviewer-b", error="reviewer-a failed",
+        ) is not None
+        initial_claims = _events(conn, task_id).count("claimed")
+        db_path = kb.kanban_db_path()
+
+        def mutate_from_other_connection():
+            race_conn = kb.connect(db_path=db_path)
+            try:
+                if race == "assignment":
+                    result = kb.assign_task(
+                        conn=race_conn,
+                        task_id=task_id,
+                        profile="code-reviewer-a",
+                    )
+                else:
+                    result = kb.failover_review_task(
+                        race_conn,
+                        task_id,
+                        "code-reviewer-c",
+                        error="reviewer-b failed during dispatch",
+                    )
+                if result is None:
+                    raise AssertionError(
+                        f"{race} interleaving did not mutate the task"
+                    )
+            except BaseException as exc:  # propagate writer failure to the test thread
+                mutation_errors.append(exc)
+            finally:
+                race_conn.close()
+
+        original_claim = kb.claim_review_task
+
+        def claim_after_interleaving(*args, **kwargs):
+            nonlocal mutation_fired
+            if not mutation_fired:
+                mutation_fired = True
+                writer = threading.Thread(target=mutate_from_other_connection)
+                writer.start()
+                writer.join(timeout=5)
+                assert not writer.is_alive(), "interleaving writer did not finish"
+                if mutation_errors:
+                    raise mutation_errors[0]
+            return original_claim(*args, **kwargs)
+
+        monkeypatch.setattr(kb, "claim_review_task", claim_after_interleaving)
+
+        first_tick = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert first_tick.spawned == []
+        assert mutation_fired is True
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.status == "review"
+        assert current.claim_lock is None
+        assert current.current_run_id is None
+        assert _events(conn, task_id).count("claimed") == initial_claims
+
+        expected_reviewer = (
+            "code-reviewer-b" if race == "assignment" else "code-reviewer-c"
+        )
+        authority = kb._latest_reviewer_authority(conn, task_id)
+        assert authority is not None and authority[1] == expected_reviewer
+        assert current.assignee == (
+            "code-reviewer-a" if race == "assignment" else expected_reviewer
+        )
+
+        spawned.clear()
+        second_tick = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert len(second_tick.spawned) == 1
+        assert second_tick.spawned[0][:2] == (task_id, expected_reviewer)
+        replacement = kb.get_task(conn, task_id)
+        assert replacement is not None
+        assert replacement.assignee == expected_reviewer
+        assert replacement.current_run_id is not None
+        assert spawned == [(task_id, expected_reviewer)]
+        claim_event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='claimed' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert claim_event is not None
+        assert json.loads(claim_event["payload"])["review_authority_id"] == authority[0]
+
+        if decision == "request_changes":
+            decided = kb.request_changes(
+                conn,
+                task_id,
+                "programmer",
+                reviewer=expected_reviewer,
+                reason="interleaving correction",
+                expected_claim=replacement.claim_lock,
+                expected_run_id=replacement.current_run_id,
+            )
+            replay = kb.request_changes(
+                conn,
+                task_id,
+                "programmer",
+                reviewer=expected_reviewer,
+                reason="interleaving correction",
+                expected_claim=replacement.claim_lock,
+                expected_run_id=replacement.current_run_id,
+            )
+            terminal_kind = "changes_requested"
+        else:
+            decided = kb.approve_review(
+                conn,
+                task_id,
+                reviewer=expected_reviewer,
+                summary="interleaving approval",
+                head_sha=HEAD_SHA,
+                expected_claim=replacement.claim_lock,
+                expected_run_id=replacement.current_run_id,
+            )
+            replay = kb.approve_review(
+                conn,
+                task_id,
+                reviewer=expected_reviewer,
+                summary="interleaving approval",
+                head_sha=HEAD_SHA,
+                expected_claim=replacement.claim_lock,
+                expected_run_id=replacement.current_run_id,
+            )
+            terminal_kind = "review_approved"
+        assert decided is not None and replay is not None
+        assert _events(conn, task_id).count(terminal_kind) == 1
 
 
 def test_dispatch_failover_does_not_reassign_when_authority_preflight_fails(
