@@ -3419,8 +3419,9 @@ def list_tasks(
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
     """Assign or reassign a task.  Returns True on success.
 
-    Refuses to reassign a task that's currently running (claim_lock set).
-    Reassign after the current run completes if needed.
+    Refuses to reassign a task that has a live claim, including a reviewer
+    claim that deliberately remains in the ``review`` column. Reassign after
+    the current run completes or reclaim the stale claim first if needed.
     """
     profile = _canonical_assignee(profile)
     with write_txn(conn):
@@ -3429,6 +3430,11 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         ).fetchone()
         if not row:
             return False
+        if row["claim_lock"] is not None and row["status"] == "review":
+            raise RuntimeError(
+                f"cannot reassign {task_id}: currently claimed reviewer "
+                "generation. Wait for completion or reclaim the stale lock first."
+            )
         if row["claim_lock"] is not None and row["status"] == "running":
             raise RuntimeError(
                 f"cannot reassign {task_id}: currently running (claimed). "
@@ -9842,25 +9848,269 @@ def _record_spawn_failure(
     )
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
-    """Record the spawned child's pid + emit a ``spawned`` event.
+class _ReviewSpawnCASRejected(Exception):
+    """Internal rollback sentinel for a stale reviewer child attachment."""
 
-    The event's payload carries the pid so a human reading ``hermes kanban
-    tail`` can correlate log lines with OS-level traces without opening
-    the drawer.
+
+def _review_spawn_cas_matches(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: Optional[int],
+    expected_claim: Optional[str],
+    expected_assignee: Optional[str],
+    expected_authority: Optional[tuple[int, str]],
+) -> bool:
+    """Prove that a reviewer claim is still spawnable under one DB lock.
+
+    The dispatcher deliberately invokes this twice: once immediately before
+    calling the model spawn function, and once when the returned PID is
+    attached. The second check is the important boundary: failover/reclaim
+    may commit while an external process is being created, and a stale PID
+    must never be attached to the successor run.
     """
+    if (
+        expected_run_id is None
+        or expected_claim is None
+        or not isinstance(expected_claim, str)
+        or not expected_claim
+        or expected_assignee is None
+        or not isinstance(expected_assignee, str)
+        or expected_authority is None
+    ):
+        return False
+    try:
+        run_id = int(expected_run_id)
+        authority_id = int(expected_authority[0])
+        reviewer = _canonical_assignee(expected_authority[1])
+        assignee = _canonical_assignee(expected_assignee)
+    except (IndexError, TypeError, ValueError, RuntimeError):
+        return False
+    if run_id <= 0 or authority_id <= 0 or not reviewer or assignee != reviewer:
+        return False
+
+    task = conn.execute(
+        "SELECT status, claim_lock, claim_expires, worker_pid, "
+        "current_run_id, assignee FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    if task is None:
+        return False
+    if (
+        task["status"] != "review"
+        or task["current_run_id"] != run_id
+        or task["claim_lock"] != expected_claim
+        or task["worker_pid"] is not None
+    ):
+        return False
+    try:
+        task_claim_expires = int(task["claim_expires"])
+    except (TypeError, ValueError):
+        return False
+    if task_claim_expires <= int(time.time()):
+        return False
+    try:
+        if _canonical_assignee(task["assignee"]) != assignee:
+            return False
+    except (TypeError, ValueError, RuntimeError):
+        return False
+
+    run = conn.execute(
+        "SELECT task_id, profile, status, claim_lock, claim_expires, "
+        "worker_pid, ended_at FROM task_runs WHERE id=?",
+        (run_id,),
+    ).fetchone()
+    if run is None:
+        return False
+    if (
+        run["task_id"] != task_id
+        or run["status"] != "running"
+        or run["ended_at"] is not None
+        or run["claim_lock"] != expected_claim
+        or run["worker_pid"] is not None
+    ):
+        return False
+    try:
+        if int(run["claim_expires"]) <= int(time.time()):
+            return False
+        if _canonical_assignee(run["profile"]) != reviewer:
+            return False
+    except (TypeError, ValueError, RuntimeError):
+        return False
+
+    authority = _latest_unconsumed_reviewer_authority(conn, task_id)
+    if authority != (authority_id, reviewer):
+        return False
+
+    claim_event = conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id=? AND run_id=? "
+        "AND kind='claimed' ORDER BY id DESC LIMIT 1",
+        (task_id, run_id),
+    ).fetchone()
+    latest_claim = conn.execute(
+        "SELECT id, run_id FROM task_events WHERE task_id=? AND kind='claimed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if (
+        claim_event is None
+        or latest_claim is None
+        or int(latest_claim["id"]) != int(claim_event["id"])
+        or int(latest_claim["run_id"]) != run_id
+    ):
+        return False
+    try:
+        claim_payload = json.loads(claim_event["payload"] or "{}")
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(claim_payload, dict):
+        return False
+    try:
+        bound_authority_id = int(claim_payload.get("review_authority_id"))
+        bound_run_id = int(claim_payload.get("run_id"))
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        claim_payload.get("source_status") == "review"
+        and bound_authority_id == authority_id
+        and bound_run_id == run_id
+        and claim_payload.get("lock") == expected_claim
+    )
+
+
+def _authorize_review_spawn(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: Optional[int],
+    expected_claim: Optional[str],
+    expected_assignee: Optional[str],
+    expected_authority: Optional[tuple[int, str]],
+) -> bool:
+    """CAS-check the reviewer generation immediately before model spawn."""
     with write_txn(conn):
-        conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (int(pid), task_id),
+        return _review_spawn_cas_matches(
+            conn,
+            task_id,
+            expected_run_id=expected_run_id,
+            expected_claim=expected_claim,
+            expected_assignee=expected_assignee,
+            expected_authority=expected_authority,
         )
-        run_id = _current_run_id(conn, task_id)
-        if run_id is not None:
+
+
+def _set_worker_pid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+    *,
+    expected_run_id: Optional[int] = None,
+    expected_claim: Optional[str] = None,
+    expected_assignee: Optional[str] = None,
+    expected_authority: Optional[tuple[int, str]] = None,
+) -> bool:
+    """Attach a spawned PID, optionally with an exact reviewer-generation CAS.
+
+    The legacy no-expectations form remains available for direct callers and
+    non-review workers. Dispatcher review spawns must provide every expected
+    value; the task row, run row, latest authority event, and claim event are
+    then checked and updated in one immediate transaction.
+    """
+    pid = int(pid)
+    if expected_authority is None:
+        # Keep the old helper signature compatible, but do not let an
+        # authority-bound review use that signature as a CAS bypass. Older
+        # non-review workers still take the historical task/run update path.
+        review_row = conn.execute(
+            "SELECT status, current_run_id, claim_lock, assignee "
+            "FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        if (
+            review_row is not None
+            and review_row["status"] == "review"
+            and review_row["current_run_id"] is not None
+            and review_row["claim_lock"] is not None
+            and review_row["assignee"]
+        ):
+            review_authority = _latest_unconsumed_reviewer_authority(conn, task_id)
+            if review_authority is not None:
+                return _set_worker_pid(
+                    conn,
+                    task_id,
+                    pid,
+                    expected_run_id=int(review_row["current_run_id"]),
+                    expected_claim=review_row["claim_lock"],
+                    expected_assignee=review_row["assignee"],
+                    expected_authority=review_authority,
+                )
+        with write_txn(conn):
             conn.execute(
-                "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-                (int(pid), run_id),
+                "UPDATE tasks SET worker_pid = ? WHERE id = ?",
+                (pid, task_id),
             )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+            run_id = _current_run_id(conn, task_id)
+            if run_id is not None:
+                conn.execute(
+                    "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
+                    (pid, run_id),
+                )
+            _append_event(conn, task_id, "spawned", {"pid": pid}, run_id=run_id)
+        return True
+    if expected_run_id is None:
+        return False
+    expected_run_id_value = int(expected_run_id)
+
+    try:
+        with write_txn(conn):
+            if not _review_spawn_cas_matches(
+                conn,
+                task_id,
+                expected_run_id=expected_run_id,
+                expected_claim=expected_claim,
+                expected_assignee=expected_assignee,
+                expected_authority=expected_authority,
+            ):
+                return False
+            cur = conn.execute(
+                "UPDATE tasks SET worker_pid=? WHERE id=? AND status='review' "
+                "AND current_run_id=? AND claim_lock=? AND assignee=? "
+                "AND worker_pid IS NULL",
+                (
+                    pid,
+                    task_id,
+                    expected_run_id_value,
+                    expected_claim,
+                    expected_assignee,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise _ReviewSpawnCASRejected
+            run_cur = conn.execute(
+                "UPDATE task_runs SET worker_pid=? WHERE id=? AND task_id=? "
+                "AND status='running' AND ended_at IS NULL "
+                "AND claim_lock=? AND worker_pid IS NULL",
+                (pid, expected_run_id_value, task_id, expected_claim),
+            )
+            if run_cur.rowcount != 1:
+                raise _ReviewSpawnCASRejected
+            authority_id = int(expected_authority[0])
+            _append_event(
+                conn,
+                task_id,
+                "spawned",
+                {
+                    "pid": pid,
+                    "run_id": expected_run_id_value,
+                    "claim_lock": expected_claim,
+                    "assignee": expected_assignee,
+                    "review_authority_id": authority_id,
+                },
+                run_id=expected_run_id_value,
+            )
+            return True
+    except _ReviewSpawnCASRejected:
+        return False
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -10740,6 +10990,23 @@ def _dispatch_once_locked(
                     set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
                 _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
                 claimed.skills = ["sdlc-review"]
+                if not _authorize_review_spawn(
+                    conn,
+                    claimed.id,
+                    expected_run_id=claimed.current_run_id,
+                    expected_claim=claimed.claim_lock,
+                    expected_assignee=claimed.assignee,
+                    expected_authority=expected_authority,
+                ):
+                    attempted.append({
+                        "profile": reviewer,
+                        "error": "review spawn authorization CAS refused",
+                    })
+                    result.respawn_guarded.append(
+                        (claimed.id, "review_spawn_authorization_changed")
+                    )
+                    dispatch_deferred = True
+                    break
                 _spawn = spawn_fn if spawn_fn is not None else _default_spawn
                 import inspect
                 try:
@@ -10751,7 +11018,38 @@ def _dispatch_once_locked(
                 except (TypeError, ValueError):
                     pid = _spawn(claimed, str(workspace))
                 if pid:
-                    _set_worker_pid(conn, claimed.id, int(pid))
+                    pid = int(pid)
+                    attached = _set_worker_pid(
+                        conn,
+                        claimed.id,
+                        pid,
+                        expected_run_id=claimed.current_run_id,
+                        expected_claim=claimed.claim_lock,
+                        expected_assignee=claimed.assignee,
+                        expected_authority=expected_authority,
+                    )
+                    if not attached:
+                        # The child was created, but another lifecycle writer
+                        # won before attachment. It is never an authoritative
+                        # worker; terminate the stale child and let the next
+                        # tick claim the surviving reviewer generation.
+                        try:
+                            _terminate_reclaimed_worker(pid, claimed.claim_lock)
+                        except Exception:
+                            _log.warning(
+                                "kanban review: stale child %s could not be terminated",
+                                pid,
+                                exc_info=True,
+                            )
+                        attempted.append({
+                            "profile": reviewer,
+                            "error": "review PID attachment CAS refused",
+                        })
+                        result.respawn_guarded.append(
+                            (claimed.id, "review_spawn_attachment_changed")
+                        )
+                        dispatch_deferred = True
+                        break
                 result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
                 spawned += 1
                 if _per_profile_cap is not None and claimed.assignee:

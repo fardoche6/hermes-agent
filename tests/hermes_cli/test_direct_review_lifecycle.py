@@ -86,6 +86,18 @@ def _start_followup_review(conn, task_id: str, *, reviewer="code-reviewer", host
     return review
 
 
+def _unclaimed_review_card(conn, *, reviewer="code-reviewer"):
+    """Create a review generation that is ready for dispatcher claim."""
+    task_id, review, host = _review_card(conn, reviewer=reviewer)
+    assert kb.reclaim_task(conn, task_id, reason="prepare dispatcher race")
+    current = kb.get_task(conn, task_id)
+    assert current is not None
+    assert current.status == "review"
+    assert current.claim_lock is None
+    assert current.current_run_id is None
+    return task_id, host
+
+
 def _terminal_decision(conn, task_id, review, *, kind, trusted):
     if kind == "request_changes":
         return kb.request_changes(
@@ -1221,6 +1233,244 @@ def test_dispatch_defers_interleaved_reviewer_mutation_before_claim(
             terminal_kind = "review_approved"
         assert decided is not None and replay is not None
         assert _events(conn, task_id).count(terminal_kind) == 1
+
+
+@pytest.mark.parametrize("decision", ["request_changes", "approve"])
+def test_claimed_review_rejects_assignment_reset_before_spawn(
+    kanban_home, all_assignees_spawnable, monkeypatch, decision,
+):
+    """Assignment-only writers cannot invalidate a live review claim."""
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(
+        profiles,
+        "list_profiles",
+        lambda: [
+            SimpleNamespace(name="code-reviewer-a"),
+            SimpleNamespace(name="code-reviewer-b"),
+        ],
+    )
+    spawned = []
+    assignment_errors = []
+
+    def spawn(task, workspace):
+        spawned.append((task.id, task.assignee))
+        return 1900
+
+    with kb.connect() as conn:
+        task_id, _host = _unclaimed_review_card(conn, reviewer="code-reviewer-a")
+        original_claim = kb.claim_review_task
+        db_path = kb.kanban_db_path()
+
+        def claim_then_assignment(*args, **kwargs):
+            claimed = original_claim(*args, **kwargs)
+            assert claimed is not None
+            race_conn = kb.connect(db_path=db_path)
+            try:
+                with pytest.raises(RuntimeError, match="currently claimed"):
+                    kb.assign_task(race_conn, task_id, "code-reviewer-b")
+                assignment_errors.append("rejected")
+            finally:
+                race_conn.close()
+            return claimed
+
+        monkeypatch.setattr(kb, "claim_review_task", claim_then_assignment)
+        result = kb.dispatch_once(conn, spawn_fn=spawn)
+        assert len(result.spawned) == 1
+        assert result.spawned[0][:2] == (task_id, "code-reviewer-a")
+        assert assignment_errors == ["rejected"]
+        assert spawned == [(task_id, "code-reviewer-a")]
+
+        review = kb.get_task(conn, task_id)
+        assert review is not None and review.current_run_id is not None
+        if decision == "request_changes":
+            decided = kb.request_changes(
+                conn,
+                task_id,
+                "programmer",
+                reviewer="code-reviewer-a",
+                reason="assignment boundary correction",
+                expected_claim=review.claim_lock,
+                expected_run_id=review.current_run_id,
+            )
+            replay = kb.request_changes(
+                conn,
+                task_id,
+                "programmer",
+                reviewer="code-reviewer-a",
+                reason="assignment boundary correction",
+                expected_claim=review.claim_lock,
+                expected_run_id=review.current_run_id,
+            )
+            terminal_kind = "changes_requested"
+        else:
+            decided = kb.approve_review(
+                conn,
+                task_id,
+                reviewer="code-reviewer-a",
+                summary="assignment boundary approval",
+                head_sha=HEAD_SHA,
+                expected_claim=review.claim_lock,
+                expected_run_id=review.current_run_id,
+            )
+            replay = kb.approve_review(
+                conn,
+                task_id,
+                reviewer="code-reviewer-a",
+                summary="assignment boundary approval",
+                head_sha=HEAD_SHA,
+                expected_claim=review.claim_lock,
+                expected_run_id=review.current_run_id,
+            )
+            terminal_kind = "review_approved"
+        assert decided is not None and replay is not None
+        assert _events(conn, task_id).count(terminal_kind) == 1
+
+
+@pytest.mark.parametrize("mutation", ["failover", "reclaim"])
+@pytest.mark.parametrize("decision", ["request_changes", "approve"])
+def test_review_spawn_pid_attachment_denies_stale_child_after_claim(
+    kanban_home, all_assignees_spawnable, monkeypatch, mutation, decision,
+):
+    """A writer winning before PID attachment cannot authorize the old child."""
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(
+        profiles,
+        "list_profiles",
+        lambda: [
+            SimpleNamespace(name="code-reviewer-a"),
+            SimpleNamespace(name="code-reviewer-b"),
+        ],
+    )
+    spawn_calls = []
+    terminated = []
+
+    def terminate(pid, claim_lock, **kwargs):
+        if pid:
+            terminated.append((pid, claim_lock))
+        return {
+            "prev_pid": int(pid) if pid else None,
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": True,
+            "sigkill": False,
+        }
+
+    with kb.connect() as conn:
+        initial_reviewer = "code-reviewer-a"
+        task_id, host = _unclaimed_review_card(conn, reviewer=initial_reviewer)
+        monkeypatch.setattr(kb, "_terminate_reclaimed_worker", terminate)
+        race_conn = kb.connect(db_path=kb.kanban_db_path())
+        try:
+            def spawn(task, workspace):
+                spawn_calls.append((task.id, task.assignee))
+                if len(spawn_calls) == 1:
+                    if mutation == "failover":
+                        assert kb.failover_review_task(
+                            race_conn,
+                            task_id,
+                            "code-reviewer-b",
+                            error="winner before attachment",
+                        ) is not None
+                    else:
+                        assert kb.reclaim_task(
+                            race_conn,
+                            task_id,
+                            reason="winner before attachment",
+                        )
+                        reclaimed = kb.get_task(race_conn, task_id)
+                        assert reclaimed is not None
+                        assert reclaimed.claim_lock is None
+                        assert reclaimed.current_run_id is None
+                    return 2001
+                return 2002
+
+            first = kb.dispatch_once(conn, spawn_fn=spawn)
+            assert first.spawned == []
+            assert spawn_calls == [(task_id, initial_reviewer)]
+            assert len(terminated) == 1
+            assert terminated[0][0] == 2001
+            assert terminated[0][1].startswith(f"{host}:")
+
+            after_race = kb.get_task(conn, task_id)
+            assert after_race is not None
+            assert after_race.claim_lock is None
+            assert after_race.current_run_id is None
+            if mutation == "failover":
+                assert after_race.assignee == "code-reviewer-b"
+                expected_reviewer = "code-reviewer-b"
+            else:
+                assert after_race.assignee == initial_reviewer
+                expected_reviewer = initial_reviewer
+            assert after_race.worker_pid is None
+            assert conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='spawned'",
+                (task_id,),
+            ).fetchone()[0] == 0
+            assert conn.execute(
+                "SELECT COUNT(*) FROM task_runs WHERE task_id=? AND worker_pid=?",
+                (task_id, 2001),
+            ).fetchone()[0] == 0
+
+            second = kb.dispatch_once(conn, spawn_fn=spawn)
+            assert len(second.spawned) == 1
+            assert second.spawned[0][:2] == (task_id, expected_reviewer)
+            valid = kb.get_task(conn, task_id)
+            assert valid is not None
+            assert valid.assignee == expected_reviewer
+            assert valid.worker_pid == 2002
+            assert valid.current_run_id is not None
+            assert spawn_calls == [(task_id, initial_reviewer), (task_id, expected_reviewer)]
+            assert conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='spawned'",
+                (task_id,),
+            ).fetchone()[0] == 1
+
+            if decision == "request_changes":
+                decided = kb.request_changes(
+                    conn,
+                    task_id,
+                    "programmer",
+                    reviewer=expected_reviewer,
+                    reason="stale child denied",
+                    expected_claim=valid.claim_lock,
+                    expected_run_id=valid.current_run_id,
+                )
+                replay = kb.request_changes(
+                    conn,
+                    task_id,
+                    "programmer",
+                    reviewer=expected_reviewer,
+                    reason="stale child denied",
+                    expected_claim=valid.claim_lock,
+                    expected_run_id=valid.current_run_id,
+                )
+                terminal_kind = "changes_requested"
+            else:
+                decided = kb.approve_review(
+                    conn,
+                    task_id,
+                    reviewer=expected_reviewer,
+                    summary="stale child denied",
+                    head_sha=HEAD_SHA,
+                    expected_claim=valid.claim_lock,
+                    expected_run_id=valid.current_run_id,
+                )
+                replay = kb.approve_review(
+                    conn,
+                    task_id,
+                    reviewer=expected_reviewer,
+                    summary="stale child denied",
+                    head_sha=HEAD_SHA,
+                    expected_claim=valid.claim_lock,
+                    expected_run_id=valid.current_run_id,
+                )
+                terminal_kind = "review_approved"
+            assert decided is not None and replay is not None
+            assert _events(conn, task_id).count(terminal_kind) == 1
+        finally:
+            race_conn.close()
 
 
 def test_dispatch_failover_does_not_reassign_when_authority_preflight_fails(
