@@ -355,6 +355,121 @@ class TestBuildPreloadedSkillsPrompt:
         assert "SECRET DISABLED CONTENT." not in prompt
         assert "enabled-skill" in prompt
 
+    def test_direct_skill_precedes_absorbed_alias(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "legacy-skill", body="Standalone content.")
+            umbrella = _make_skill(tmp_path, "umbrella", body="Umbrella content.")
+            artifact = umbrella / "references" / "absorbed-skills"
+            artifact.mkdir(parents=True)
+            (artifact / "legacy-skill.md").write_text("absorbed record")
+
+            prompt, loaded, missing = build_preloaded_skills_prompt(["legacy-skill"])
+
+        assert loaded == ["legacy-skill"]
+        assert missing == []
+        assert "Standalone content." in prompt
+        assert "Umbrella content." not in prompt
+
+    def test_unique_absorbed_alias_loads_umbrella_prompt(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            umbrella = _make_skill(tmp_path, "umbrella", body="Consolidated prompt content.")
+            artifact = umbrella / "references" / "absorbed-skills"
+            artifact.mkdir(parents=True)
+            (artifact / "legacy-skill.md").write_text("absorbed record")
+
+            prompt, loaded, missing = build_preloaded_skills_prompt(["legacy-skill"])
+
+        assert loaded == ["umbrella"]
+        assert missing == []
+        assert "Consolidated prompt content." in prompt
+        assert "legacy-skill" not in loaded
+
+    def test_direct_and_absorbed_aliases_dedupe_canonical_umbrella(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            umbrella = _make_skill(tmp_path, "umbrella", body="Only once.")
+            artifact = umbrella / "references" / "absorbed-skills"
+            artifact.mkdir(parents=True)
+            (artifact / "legacy-skill.md").write_text("absorbed record")
+
+            prompt, loaded, missing = build_preloaded_skills_prompt(
+                ["umbrella", "legacy-skill"]
+            )
+
+        assert loaded == ["umbrella"]
+        assert missing == []
+        assert prompt.count("Only once.") == 1
+
+    def test_absorbed_alias_requires_unique_match(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            for name in ("first-umbrella", "second-umbrella"):
+                umbrella = _make_skill(tmp_path, name, body=name)
+                artifact = umbrella / "references" / "absorbed-skills"
+                artifact.mkdir(parents=True)
+                (artifact / "legacy-skill.md").write_text("absorbed record")
+
+            prompt, loaded, missing = build_preloaded_skills_prompt(["legacy-skill"])
+
+        assert prompt == ""
+        assert loaded == []
+        assert missing == ["legacy-skill"]
+
+    def test_unknown_preloaded_skill_stays_missing(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            prompt, loaded, missing = build_preloaded_skills_prompt(["not-installed"])
+
+        assert prompt == ""
+        assert loaded == []
+        assert missing == ["not-installed"]
+
+    @pytest.mark.parametrize(
+        "identifier",
+        [
+            "/tmp/outside-alias",
+            "../outside-alias",
+            "nested/alias",
+            r"nested\\alias",
+            ".",
+            "..",
+            "",
+            "bad name",
+        ],
+    )
+    def test_absorbed_alias_rejects_unsafe_identifiers(self, tmp_path, identifier):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            umbrella = _make_skill(tmp_path, "umbrella", body="DO NOT LOAD.")
+            artifact = umbrella / "references" / "absorbed-skills"
+            artifact.mkdir(parents=True)
+            (artifact / "outside-alias.md").write_text("outside record")
+
+            prompt, loaded, missing = build_preloaded_skills_prompt([identifier])
+
+        assert prompt == ""
+        assert loaded == []
+        assert missing == ([] if identifier == "" else [identifier])
+
+    def test_absorbed_alias_dedupes_same_physical_umbrella_across_roots(self, tmp_path, monkeypatch):
+        external_root = tmp_path / "external"
+        skills_root = tmp_path / "skills"
+        skills_root.mkdir()
+        umbrella = _make_skill(external_root, "umbrella", body="Load once.")
+        try:
+            (skills_root / "umbrella").symlink_to(umbrella, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlinks unavailable in test environment: {exc}")
+        artifact = umbrella / "references" / "absorbed-skills"
+        artifact.mkdir(parents=True)
+        (artifact / "legacy-skill.md").write_text("absorbed record")
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", skills_root),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[external_root]),
+        ):
+            prompt, loaded, missing = build_preloaded_skills_prompt(["legacy-skill"])
+
+        assert "Load once." in prompt
+        assert loaded == ["umbrella"]
+        assert missing == []
+
 
 
 class TestBuildSkillInvocationMessage:

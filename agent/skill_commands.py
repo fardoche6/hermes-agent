@@ -208,7 +208,22 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
         return None
 
     if not loaded_skill.get("success"):
-        return None
+        # Consolidated skills retain absorbed skills as exact reference
+        # artifacts. Resolve only a unique active artifact, and only after the
+        # normal direct lookup has failed so a real standalone skill wins.
+        if "Ambiguous skill name" in str(loaded_skill.get("error") or ""):
+            return None
+        canonical = _resolve_absorbed_skill_alias(normalized)
+        if not canonical:
+            return None
+        try:
+            loaded_skill = json.loads(
+                skill_view(canonical, task_id=task_id, preprocess=False)
+            )
+        except Exception:
+            return None
+        if not loaded_skill.get("success"):
+            return None
 
     skill_name = str(loaded_skill.get("name") or normalized)
     skill_path = str(loaded_skill.get("path") or "")
@@ -227,6 +242,78 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
             skill_dir = None
 
     return loaded_skill, skill_dir, skill_name
+
+
+def _resolve_absorbed_skill_alias(requested_name: str) -> str | None:
+    """Return the sole active umbrella containing an exact absorbed artifact.
+
+    This deliberately scans active skill packages rather than inferring an
+    umbrella from its directory name. A missing or ambiguous artifact remains
+    unresolved so callers preserve the existing fail-closed behavior.
+    """
+    try:
+        from agent.skill_utils import (
+            get_disabled_skill_names,
+            get_external_skills_dirs,
+            iter_skill_index_files,
+            parse_frontmatter,
+        )
+        from tools.skills_tool import (
+            SKILLS_DIR,
+            skill_matches_environment,
+            skill_matches_platform,
+        )
+
+        disabled = get_disabled_skill_names()
+        if not isinstance(requested_name, str) or not re.fullmatch(
+            r"[A-Za-z0-9_-]+", requested_name
+        ):
+            return None
+        roots = [SKILLS_DIR] if SKILLS_DIR.exists() else []
+        roots.extend(get_external_skills_dirs())
+        matches: list[tuple[str, Path]] = []
+        seen_candidates: set[Path] = set()
+        artifact = Path("references") / "absorbed-skills" / f"{requested_name}.md"
+        for root in roots:
+            for skill_md in iter_skill_index_files(root, "SKILL.md"):
+                skill_dir = skill_md.parent
+                if (skill_dir / artifact).is_file():
+                    try:
+                        physical_dir = skill_dir.resolve()
+                    except (OSError, RuntimeError):
+                        physical_dir = skill_dir.absolute()
+                    if physical_dir in seen_candidates:
+                        continue
+                    seen_candidates.add(physical_dir)
+                    try:
+                        frontmatter, _ = parse_frontmatter(
+                            skill_md.read_text(encoding="utf-8")
+                        )
+                    except Exception:
+                        continue
+                    if not skill_matches_platform(frontmatter) or not skill_matches_environment(
+                        frontmatter
+                    ):
+                        continue
+                    identity = str(frontmatter.get("name") or "").strip()
+                    if not identity or identity in disabled:
+                        continue
+                    matches.append((identity, skill_dir))
+        if len(matches) == 1:
+            canonical = matches[0][0]
+            logger.info(
+                "Resolved absorbed skill alias '%s' to active umbrella '%s'",
+                requested_name,
+                canonical,
+            )
+            return canonical
+    except Exception:
+        logger.debug(
+            "Unable to resolve absorbed skill alias '%s'",
+            requested_name,
+            exc_info=True,
+        )
+    return None
 
 
 def _inject_skill_config(loaded_skill: dict[str, Any], parts: list[str]) -> None:
@@ -785,6 +872,11 @@ def build_preloaded_skills_prompt(
 
         if skill_name in disabled_names or identifier in disabled_names:
             missing.append(identifier)
+            continue
+
+        # Direct and absorbed aliases can name the same canonical umbrella.
+        # Load its prompt once while reporting the canonical identity.
+        if skill_name in loaded_names:
             continue
 
         # Track active usage for Curator lifecycle management (#17782)
