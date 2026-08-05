@@ -85,8 +85,12 @@ def main() -> int:
             value = callback(KanbanDependencyContext(**context))
             if inspect.isawaitable(value):
                 value = asyncio.run(value)
-            result = normalize_dependency_result(value)
-            envelope = {"outcome": "ok", "result": result.as_dict()}
+            try:
+                result = normalize_dependency_result(value)
+            except Exception:
+                envelope = {"outcome": "malformed"}
+            else:
+                envelope = {"outcome": "ok", "result": result.as_dict()}
         except BaseException:
             envelope = {"outcome": "exception"}
     return _write_envelope(envelope)

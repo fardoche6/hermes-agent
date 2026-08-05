@@ -14,6 +14,7 @@ from types import MappingProxyType
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_dependencies as kd
 from hermes_cli.kanban_dependencies import (
     KanbanDependencyResult,
     KanbanWorkspaceBasePin,
@@ -22,6 +23,105 @@ from hermes_cli.kanban_dependencies import (
     registered_kanban_dependency_providers,
     unregister_kanban_dependency_providers,
 )
+
+
+def _context_provider(context):
+    assert context.board == "alpha"
+    assert isinstance(context.task, MappingProxyType)
+    assert "body" not in context.task
+    with pytest.raises(TypeError):
+        context.task["status"] = "done"
+    assert context.link["metadata"]["ticket"] == "redacted"
+    return {
+        "status": "satisfied",
+        "generation": "g-1",
+        "diagnostics": {
+            "ok": True,
+            "board": context.board,
+            "child_id": context.link["child_id"],
+            "frozen": True,
+        },
+    }
+
+
+def _unsatisfied_provider(_context):
+    return KanbanDependencyResult("unsatisfied")
+
+
+def _unknown_provider(_context):
+    return KanbanDependencyResult("unknown")
+
+
+def _exception_provider(_context):
+    raise RuntimeError("provider failure")
+
+
+def _malformed_provider(_context):
+    return {"status": "satisfied"}
+
+
+def _timeout_provider(_context):
+    time.sleep(0.05)
+    return KanbanDependencyResult("satisfied", generation="late")
+
+
+def _infinite_provider(_context):
+    while True:
+        time.sleep(0.01)
+
+
+def _board_provider(context):
+    return KanbanDependencyResult(
+        "satisfied" if context.board == "alpha" else "unsatisfied",
+        generation=context.board if context.board == "alpha" else None,
+        diagnostics={"board": context.board},
+    )
+
+
+def _file_state_provider(context):
+    state = json.loads(Path(context.link["metadata"]["state_file"]).read_text())
+    if not state["satisfied"]:
+        return KanbanDependencyResult("unsatisfied")
+    return KanbanDependencyResult("satisfied", generation=state["generation"])
+
+
+def _workspace_pin_provider(context):
+    metadata = context.link["metadata"]
+    pin = KanbanWorkspaceBasePin(
+        head=metadata["pin_head"],
+        tree=metadata["pin_tree"],
+        receipt_generation=metadata["pin_receipt"],
+    )
+    return KanbanDependencyResult(
+        "satisfied", generation=metadata["generation"], workspace_base=pin
+    )
+
+
+def _artifact_provider(context):
+    metadata = context.link["metadata"]
+    expected = {
+        "artifact_id": "artifact-42",
+        "head": "a" * 40,
+        "tree": "b" * 40,
+        "provider_generation": "provider-7",
+        "max_stack_depth": 3,
+    }
+    checks = (
+        (metadata.get("state") != "fresh", "stale"),
+        (metadata.get("artifact_id") != expected["artifact_id"], "identity"),
+        (metadata.get("head") != expected["head"], "head"),
+        (metadata.get("tree") != expected["tree"], "tree"),
+        (metadata.get("provider_generation") != expected["provider_generation"], "generation"),
+        (metadata.get("stack_depth", 0) > expected["max_stack_depth"], "stack_depth"),
+    )
+    for failed, reason in checks:
+        if failed:
+            return KanbanDependencyResult("unsatisfied", diagnostics={"reason": reason})
+    return KanbanDependencyResult("satisfied", generation=expected["provider_generation"])
+
+
+def _satisfied_provider(_context):
+    return KanbanDependencyResult("satisfied", generation="g")
 
 
 @pytest.fixture
@@ -94,13 +194,16 @@ def test_legacy_typed_link_migration_and_completion_default(tmp_path, monkeypatc
         run_columns = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
         assert {"dependency_kind", "provider_name", "metadata"} <= columns
         assert "dependency_binding" in run_columns
-        assert kb.list_dependency_links(conn, "c") == [{
-            "parent_id": "p",
-            "child_id": "c",
-            "dependency_kind": "completion",
-            "provider_name": None,
-            "metadata": {},
-        }]
+        links = kb.list_dependency_links(conn, "c")
+        assert len(links) == 1
+        assert links[0]["parent_id"] == "p"
+        assert links[0]["child_id"] == "c"
+        assert links[0]["dependency_kind"] == "completion"
+        assert links[0]["provider_name"] is None
+        assert links[0]["metadata"] == {}
+        assert isinstance(links[0]["metadata_digest"], str)
+        assert isinstance(links[0]["edge_identity"], str)
+        assert links[0]["link_version"] == 1
     finally:
         conn.close()
 
@@ -128,25 +231,7 @@ def test_provider_context_is_frozen_board_explicit_and_opaque_metadata(board_db)
     conn, _ = board_db
     parent = _new_parent(conn)
 
-    def provider(context):
-        assert context.board == "alpha"
-        assert isinstance(context.task, MappingProxyType)
-        assert "body" not in context.task
-        with pytest.raises(TypeError):
-            context.task["status"] = "done"
-        assert context.link["metadata"]["ticket"] == "redacted"
-        return {
-            "status": "satisfied",
-            "generation": "g-1",
-            "diagnostics": {
-                "ok": True,
-                "board": context.board,
-                "child_id": context.link["child_id"],
-                "frozen": True,
-            },
-        }
-
-    register_kanban_dependency_provider("sample.gate", "sample", provider)
+    register_kanban_dependency_provider("sample.gate", "sample", _context_provider, timeout_seconds=5.0)
     child = _new_provider_child(
         conn,
         parent,
@@ -180,23 +265,18 @@ def test_provider_failure_modes_fail_closed(board_db, mode, expected_status, exp
     parent = _new_parent(conn)
 
     if mode != "absent":
-        def provider(_context):
-            if mode == "unsatisfied":
-                return KanbanDependencyResult("unsatisfied")
-            if mode == "unknown":
-                return KanbanDependencyResult("unknown")
-            if mode == "exception":
-                raise RuntimeError("provider failure")
-            if mode == "malformed":
-                return {"status": "satisfied"}
-            time.sleep(0.05)
-            return KanbanDependencyResult("satisfied", generation="late")
-
+        provider = {
+            "unsatisfied": _unsatisfied_provider,
+            "unknown": _unknown_provider,
+            "exception": _exception_provider,
+            "malformed": _malformed_provider,
+            "timeout": _timeout_provider,
+        }[mode]
         register_kanban_dependency_provider(
             "sample.gate",
             "sample",
             provider,
-            timeout_seconds=0.005 if mode == "timeout" else 1.0,
+            timeout_seconds=0.005 if mode == "timeout" else 5.0,
         )
     child = _new_provider_child(conn, parent)
     evidence = kb.task_dependency_evidence(conn, child, board="alpha")[0]
@@ -209,15 +289,10 @@ def test_provider_failure_modes_fail_closed(board_db, mode, expected_status, exp
 def test_provider_timeout_has_no_live_worker_thread_or_child(board_db):
     conn, _ = board_db
     parent = _new_parent(conn)
-    stop = threading.Event()
-
-    def provider(_context):
-        stop.wait()
-
     register_kanban_dependency_provider(
         "sample.gate",
         "sample",
-        provider,
+        _infinite_provider,
         timeout_seconds=0.01,
     )
     child = _new_provider_child(conn, parent)
@@ -232,21 +307,16 @@ def test_provider_timeout_has_no_live_worker_thread_or_child(board_db):
     assert evidence["diagnostics"]["reason"] == "provider_timeout"
     assert leaked_threads == []
     assert multiprocessing.active_children() == []
-    stop.set()
+
 
 
 def test_provider_unload_cancels_inflight_callback(board_db):
     conn, tmp_path = board_db
     parent = _new_parent(conn)
-
-    def provider(_context):
-        while True:
-            time.sleep(0.01)
-
     register_kanban_dependency_provider(
         "sample.gate",
         "sample",
-        provider,
+        _infinite_provider,
         timeout_seconds=5.0,
         owner="plugin-a",
     )
@@ -263,15 +333,15 @@ def test_provider_unload_cancels_inflight_callback(board_db):
     worker = threading.Thread(target=evaluate)
     worker.start()
     deadline = time.monotonic() + 2.0
-    while not multiprocessing.active_children() and time.monotonic() < deadline:
+    while not kd._ACTIVE_INVOCATIONS and time.monotonic() < deadline:
         time.sleep(0.01)
-    assert multiprocessing.active_children()
+    assert kd._ACTIVE_INVOCATIONS
     assert unregister_kanban_dependency_providers(owner="plugin-a") == 1
     worker.join(timeout=2.0)
     assert not worker.is_alive()
     assert result and result[0]["status"] == "unknown"
     assert result[0]["diagnostics"]["reason"] == "provider_unavailable"
-    assert multiprocessing.active_children() == []
+    assert not kd._ACTIVE_INVOCATIONS
 
 
 def test_dependency_resolution_rejects_wrong_board_before_task_lookup(board_db):
@@ -319,22 +389,17 @@ def test_duplicate_typed_link_is_idempotent_but_immutable_conflicts_fail(board_d
 def test_readiness_and_claim_share_claim_time_provider_resolution(board_db):
     conn, tmp_path = board_db
     parent = _new_parent(conn)
-    state = {"satisfied": True, "generation": "g-ready"}
-
-    def provider(_context):
-        if not state["satisfied"]:
-            return KanbanDependencyResult("unsatisfied")
-        return KanbanDependencyResult("satisfied", generation=state["generation"])
-
-    register_kanban_dependency_provider("sample.gate", "sample", provider)
-    child = _new_provider_child(conn, parent)
+    state_file = tmp_path / "provider-state.json"
+    state_file.write_text(json.dumps({"satisfied": True, "generation": "g-ready"}))
+    register_kanban_dependency_provider("sample.gate", "sample", _file_state_provider, timeout_seconds=5.0)
+    child = _new_provider_child(conn, parent, dependency_metadata={"state_file": str(state_file)})
     assert kb.get_task(conn, child).status == "ready"
 
-    state.update(satisfied=False, generation="g-stale")
+    state_file.write_text(json.dumps({"satisfied": False, "generation": "g-stale"}))
     assert kb.claim_task(conn, child, board="alpha", claimer="one") is None
     assert kb.get_task(conn, child).status == "todo"
 
-    state.update(satisfied=True, generation="g-claim")
+    state_file.write_text(json.dumps({"satisfied": True, "generation": "g-claim"}))
     assert kb.recompute_ready(conn, board="alpha") == 1
     claimed = kb.claim_task(conn, child, board="alpha", claimer="one")
     assert claimed is not None
@@ -367,12 +432,12 @@ def test_claim_pin_is_consumed_by_worktree_and_mismatch_fails_closed(board_db):
     _git(repo, "commit", "-qm", "base")
     head = _git(repo, "rev-parse", "HEAD")
     tree = _git(repo, "rev-parse", "HEAD^{tree}")
-    pin = KanbanWorkspaceBasePin(head=head, tree=tree, receipt_generation="receipt-1")
     parent = _new_parent(conn)
     register_kanban_dependency_provider(
         "sample.gate",
         "sample",
-        lambda _context: KanbanDependencyResult("satisfied", generation="g-work", workspace_base=pin),
+        _workspace_pin_provider,
+        timeout_seconds=5.0,
     )
     child = _new_provider_child(
         conn,
@@ -380,18 +445,24 @@ def test_claim_pin_is_consumed_by_worktree_and_mismatch_fails_closed(board_db):
         workspace_kind="worktree",
         workspace_path=str(repo),
         branch_name="wt/pinned",
+        dependency_metadata={
+            "pin_head": head,
+            "pin_tree": tree,
+            "pin_receipt": "receipt-1",
+            "generation": "g-work",
+        },
     )
     claimed = kb.claim_task(conn, child, board="alpha", claimer="worker")
     workspace = kb.resolve_workspace(claimed, board="alpha")
     assert _git(workspace, "rev-parse", "HEAD") == head
     assert _git(workspace, "rev-parse", "HEAD^{tree}") == tree
 
-    bad_pin = KanbanWorkspaceBasePin(head="f" * 40, tree="0" * 40, receipt_generation="receipt-bad")
     unregister_kanban_dependency_providers()
     register_kanban_dependency_provider(
         "sample.gate",
         "sample",
-        lambda _context: KanbanDependencyResult("satisfied", generation="g-bad", workspace_base=bad_pin),
+        _workspace_pin_provider,
+        timeout_seconds=5.0,
     )
     bad_child = _new_provider_child(
         conn,
@@ -399,6 +470,12 @@ def test_claim_pin_is_consumed_by_worktree_and_mismatch_fails_closed(board_db):
         workspace_kind="worktree",
         workspace_path=str(repo),
         branch_name="wt/bad-pin",
+        dependency_metadata={
+            "pin_head": "f" * 40,
+            "pin_tree": "0" * 40,
+            "pin_receipt": "receipt-bad",
+            "generation": "g-bad",
+        },
     )
     bad_claim = kb.claim_task(conn, bad_child, board="alpha", claimer="worker-2")
     with pytest.raises(RuntimeError, match="unavailable|wrong tree"):
@@ -409,14 +486,7 @@ def test_board_explicit_provider_isolation_and_concurrent_claim(tmp_path, monkey
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     unregister_kanban_dependency_providers()
 
-    def provider(context):
-        return KanbanDependencyResult(
-            "satisfied" if context.board == "alpha" else "unsatisfied",
-            generation=context.board if context.board == "alpha" else None,
-            diagnostics={"board": context.board},
-        )
-
-    register_kanban_dependency_provider("sample.gate", "sample", provider)
+    register_kanban_dependency_provider("sample.gate", "sample", _board_provider, timeout_seconds=5.0)
     alpha = kb.connect(db_path=tmp_path / "alpha.db", board="alpha")
     beta = kb.connect(db_path=tmp_path / "beta.db", board="beta")
     try:
@@ -478,7 +548,8 @@ def test_plugin_context_registration_uses_public_provider_surface():
     context.register_kanban_dependency_provider(
         "sample.gate",
         "sample",
-        lambda _context: KanbanDependencyResult("satisfied", generation="g"),
+        _satisfied_provider,
+        timeout_seconds=5.0,
     )
     assert ("sample.gate", "sample") in registered_kanban_dependency_providers()
     unregister_kanban_dependency_providers()
@@ -486,11 +557,12 @@ def test_plugin_context_registration_uses_public_provider_surface():
 
 def test_provider_identity_lifecycle_is_deterministic_and_owner_safe():
     unregister_kanban_dependency_providers()
-    callback = lambda _context: KanbanDependencyResult("satisfied", generation="g")
+    callback = _satisfied_provider
     register_kanban_dependency_provider(
         "example.artifact",
         "registry",
         callback,
+        timeout_seconds=5.0,
         owner="plugin-a",
     )
     assert registered_kanban_dependency_providers() == (("example.artifact", "registry"),)
@@ -524,34 +596,7 @@ def test_generic_artifact_provider_covers_stale_identity_head_tree_generation_an
         "max_stack_depth": 3,
     }
 
-    def provider(context):
-        metadata = context.link["metadata"]
-        checks = (
-            (metadata.get("state") != "fresh", "stale"),
-            (metadata.get("artifact_id") != expected["artifact_id"], "identity"),
-            (metadata.get("head") != expected["head"], "head"),
-            (metadata.get("tree") != expected["tree"], "tree"),
-            (
-                metadata.get("provider_generation") != expected["provider_generation"],
-                "generation",
-            ),
-            (
-                metadata.get("stack_depth", 0) > expected["max_stack_depth"],
-                "stack_depth",
-            ),
-        )
-        for failed, reason in checks:
-            if failed:
-                return KanbanDependencyResult(
-                    "unsatisfied",
-                    diagnostics={"reason": reason},
-                )
-        return KanbanDependencyResult(
-            "satisfied",
-            generation=expected["provider_generation"],
-        )
-
-    register_kanban_dependency_provider("example.artifact", "registry", provider)
+    register_kanban_dependency_provider("example.artifact", "registry", _artifact_provider, timeout_seconds=5.0)
     base = {
         "state": "fresh",
         "artifact_id": expected["artifact_id"],
@@ -597,19 +642,11 @@ def test_generic_artifact_provider_covers_stale_identity_head_tree_generation_an
 def test_workspace_base_pin_is_admission_gated_to_worktree_tasks(board_db):
     conn, _ = board_db
     parent = _new_parent(conn)
-    pin = KanbanWorkspaceBasePin(
-        head="a" * 40,
-        tree="b" * 40,
-        receipt_generation="receipt-1",
-    )
     register_kanban_dependency_provider(
         "example.pin",
         "registry",
-        lambda _context: KanbanDependencyResult(
-            "satisfied",
-            generation="provider-1",
-            workspace_base=pin,
-        ),
+        _workspace_pin_provider,
+        timeout_seconds=5.0,
     )
     child = _new_provider_child(
         conn,
@@ -617,6 +654,12 @@ def test_workspace_base_pin_is_admission_gated_to_worktree_tasks(board_db):
         kind="example.pin",
         provider="registry",
         workspace_kind="scratch",
+        dependency_metadata={
+            "pin_head": "a" * 40,
+            "pin_tree": "b" * 40,
+            "pin_receipt": "receipt-1",
+            "generation": "provider-1",
+        },
     )
     evidence = kb.task_dependency_evidence(conn, child, board="alpha")[0]
     assert evidence["status"] == "unknown"
@@ -635,10 +678,13 @@ def test_plugin_unload_removes_only_that_plugin_provider(tmp_path, monkeypatch):
     (plugin_dir / "__init__.py").write_text(
         "from hermes_cli.kanban_dependencies import KanbanDependencyResult\n"
         "\n"
+        "def provider(_context):\n"
+        "    return KanbanDependencyResult('satisfied', generation='g')\n"
+        "\n"
         "def register(ctx):\n"
         "    ctx.register_kanban_dependency_provider(\n"
         "        'example.plugin', 'provider',\n"
-        "        lambda _context: KanbanDependencyResult('satisfied', generation='g'),\n"
+        "        provider,\n"
         "    )\n"
     )
     (home / "config.yaml").write_text("plugins:\n  enabled:\n    - provider_plugin\n")
