@@ -5103,8 +5103,16 @@ def _profile_is_configured(name: Optional[str]) -> bool:
     profile, or to "assume spawnable".
 
     ``default`` is the implicit root profile (the Hermes installation
-    itself, not a ``profiles/<name>/`` subdirectory); as in
-    :func:`list_profiles_on_disk` it is configured when the root exists.
+    itself, not a ``profiles/<name>/`` subdirectory).  Legacy roots that
+    never materialised a ``config.yaml`` stay admissible — the runtime
+    boots them from built-in defaults — but that compatibility shim is
+    strictly limited to a *genuinely absent* root config.  As soon as a
+    root ``config.yaml`` exists it must satisfy exactly the same checks
+    as a named profile: regular file, readable, valid YAML, mapping
+    document.  A malformed / empty / scalar / unreadable root config
+    makes the runtime silently fall back to ``DEFAULT_CONFIG``, dropping
+    security-relevant operator overrides, so it must never be admitted
+    for dispatch.
     """
     if not isinstance(name, str) or not name.strip():
         return False
@@ -5122,9 +5130,16 @@ def _profile_is_configured(name: Optional[str]) -> bool:
         # Path resolution goes through get_profile_dir so the profile name
         # can never be joined into an arbitrary filesystem location.
         profile_dir = Path(get_profile_dir(canon))
-        if canon == "default":
-            return profile_dir.is_dir()
         config_path = profile_dir / "config.yaml"
+        if canon == "default":
+            # Legacy compatibility ONLY: the canonical default root exists
+            # and holds no config.yaml at all.  Anything present at that
+            # path (including a directory or a broken symlink) falls
+            # through to the strict named-profile checks below.
+            if not profile_dir.is_dir():
+                return False
+            if not config_path.exists() and not config_path.is_symlink():
+                return True
         if not config_path.is_file():
             return False
         import yaml
