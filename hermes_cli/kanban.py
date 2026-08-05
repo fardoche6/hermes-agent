@@ -652,6 +652,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_changes.add_argument("task_id")
     p_changes.add_argument("programmer", help="Programmer profile")
     p_changes.add_argument("reason", nargs="*", help="Review feedback")
+    p_changes.add_argument(
+        "--reviewer",
+        default=None,
+        help="Exact reviewer authority (required with --recover)",
+    )
+    p_changes.add_argument(
+        "--recover",
+        action="store_true",
+        help=(
+            "Recover an unclaimed review only when the exact reviewer has a "
+            "post-authority literal REQUEST_CHANGES comment"
+        ),
+    )
 
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
@@ -2336,10 +2349,20 @@ def _cmd_approve(args: argparse.Namespace) -> int:
 
 def _cmd_request_changes(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
+    recovery = bool(getattr(args, "recover", False))
+    reviewer = getattr(args, "reviewer", None)
+    if recovery and not reviewer:
+        print(
+            f"cannot recover {args.task_id}: --reviewer is required with --recover",
+            file=sys.stderr,
+        )
+        return 1
     with kb.connect_closing() as conn:
         task = kb.request_changes(
             conn, args.task_id, args.programmer, reason=reason,
+            reviewer=reviewer,
             trusted_operator=True,
+            recovery=recovery,
         )
     if task is None:
         print(f"cannot request changes for {args.task_id}: task not found", file=sys.stderr)

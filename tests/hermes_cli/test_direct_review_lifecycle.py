@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -822,6 +823,331 @@ def test_failover_replaces_reviewer_and_rejects_stale_decision(kanban_home):
         assert current.assignee == "reviewer-b"
         assert current.current_run_id == replacement.current_run_id
         assert current.claim_lock == replacement.claim_lock
+
+
+@pytest.mark.parametrize("decision", ["request_changes", "approve"])
+def test_dispatch_failover_claims_only_the_authorized_replacement_generation(
+    kanban_home, all_assignees_spawnable, monkeypatch, decision,
+):
+    """A failover handoff must be claimed by the reviewer named by its event.
+
+    Profile discovery is intentionally ordered with the failed reviewer first.
+    Before the regression fix, the dispatcher reassigned the card to that old
+    profile instead of claiming the new failover authority.
+    """
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(
+        profiles,
+        "list_profiles",
+        lambda: [
+            SimpleNamespace(name="code-reviewer-a"),
+            SimpleNamespace(name="code-reviewer-b"),
+            SimpleNamespace(name="code-reviewer-c"),
+        ],
+    )
+    monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    spawned = []
+
+    def spawn(task, workspace):
+        spawned.append((task.id, task.assignee))
+        return 1200 + len(spawned)
+
+    host = kb._claimer_id().split(":", 1)[0]
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="dispatcher failover", assignee="programmer")
+        assert kb.claim_task(conn, task_id, claimer=f"{host}:implementation")
+        assert kb.submit_task_for_review(
+            conn, task_id, "code-reviewer-a", trusted_operator=True,
+        ) is not None
+
+        kb.dispatch_once(conn, spawn_fn=spawn)
+        first = kb.get_task(conn, task_id)
+        assert first is not None and first.assignee == "code-reviewer-a"
+        assert spawned == [(task_id, "code-reviewer-a")]
+
+        assert task_id in kb.detect_crashed_workers(conn)
+        failed_over = kb.get_task(conn, task_id)
+        assert failed_over is not None
+        assert failed_over.assignee == "code-reviewer-b"
+        authority = kb._latest_reviewer_authority(conn, task_id)
+        assert authority is not None and authority[1] == "code-reviewer-b"
+
+        spawned.clear()
+        kb.dispatch_once(conn, spawn_fn=spawn)
+        replacement = kb.get_task(conn, task_id)
+        assert replacement is not None
+        assert replacement.assignee == "code-reviewer-b"
+        assert spawned == [(task_id, "code-reviewer-b")]
+
+        # A late old-process comment is evidence only; it cannot change the
+        # durable authority or consume the successor's one decision.
+        kb.add_comment(conn, task_id, "code-reviewer-a", "REQUEST_CHANGES late old process")
+        with pytest.raises(
+            RuntimeError,
+            match="reviewer generation|reviewer lane|active review run|expected run",
+        ):
+            if decision == "request_changes":
+                kb.request_changes(
+                    conn,
+                    task_id,
+                    "programmer",
+                    reviewer="code-reviewer-a",
+                    reason="stale feedback",
+                    expected_claim=first.claim_lock,
+                    expected_run_id=first.current_run_id,
+                )
+            else:
+                kb.approve_review(
+                    conn,
+                    task_id,
+                    reviewer="code-reviewer-a",
+                    summary="stale approval",
+                    head_sha=HEAD_SHA,
+                    expected_claim=first.claim_lock,
+                    expected_run_id=first.current_run_id,
+                )
+
+        if decision == "request_changes":
+            result = kb.request_changes(
+                conn,
+                task_id,
+                "programmer",
+                reviewer="code-reviewer-b",
+                reason="replacement feedback",
+                expected_claim=replacement.claim_lock,
+                expected_run_id=replacement.current_run_id,
+            )
+            retried = kb.request_changes(
+                conn,
+                task_id,
+                "programmer",
+                reviewer="code-reviewer-b",
+                reason="replacement feedback",
+                expected_claim=replacement.claim_lock,
+                expected_run_id=replacement.current_run_id,
+            )
+        else:
+            result = kb.approve_review(
+                conn,
+                task_id,
+                reviewer="code-reviewer-b",
+                summary="replacement approval",
+                head_sha=HEAD_SHA,
+                expected_claim=replacement.claim_lock,
+                expected_run_id=replacement.current_run_id,
+            )
+            retried = kb.approve_review(
+                conn,
+                task_id,
+                reviewer="code-reviewer-b",
+                summary="replacement approval",
+                head_sha=HEAD_SHA,
+                expected_claim=replacement.claim_lock,
+                expected_run_id=replacement.current_run_id,
+            )
+        assert result is not None and retried is not None
+        assert _events(conn, task_id).count(
+            "changes_requested" if decision == "request_changes" else "review_approved"
+        ) == 1
+
+
+def test_dispatch_failover_does_not_reassign_when_authority_preflight_fails(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(
+        profiles,
+        "list_profiles",
+        lambda: [
+            SimpleNamespace(name="code-reviewer-a"),
+            SimpleNamespace(name="code-reviewer-b"),
+            SimpleNamespace(name="code-reviewer-c"),
+        ],
+    )
+    monkeypatch.setattr(
+        profiles,
+        "profile_exists",
+        lambda name: name != "code-reviewer-b",
+    )
+    monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    spawned = []
+
+    def spawn(task, workspace):
+        spawned.append((task.id, task.assignee))
+        return 1300 + len(spawned)
+
+    with kb.connect() as conn:
+        task_id, _, _ = _review_card(conn, reviewer="code-reviewer-a")
+        assert kb.failover_review_task(
+            conn,
+            task_id,
+            "code-reviewer-b",
+            error="reviewer-a timed out",
+        )
+
+        kb.dispatch_once(conn, spawn_fn=spawn)
+        failed_over = kb.get_task(conn, task_id)
+        assert failed_over is not None
+        assert failed_over.status == "review"
+        assert failed_over.assignee == "code-reviewer-c"
+        assert failed_over.claim_lock is None
+        assert spawned == []
+        authority = kb._latest_reviewer_authority(conn, task_id)
+        assert authority is not None and authority[1] == "code-reviewer-c"
+        assert _events(conn, task_id).count("review_failover") == 2
+
+        kb.dispatch_once(conn, spawn_fn=spawn)
+        replacement = kb.get_task(conn, task_id)
+        assert replacement is not None
+        assert replacement.assignee == "code-reviewer-c"
+        assert spawned == [(task_id, "code-reviewer-c")]
+
+
+def test_sequential_review_failovers_keep_only_the_newest_authority(kanban_home):
+    with kb.connect() as conn:
+        task_id, first, host = _review_card(conn, reviewer="reviewer-a")
+        second_task = kb.failover_review_task(
+            conn, task_id, "reviewer-b", error="reviewer-a timed out",
+        )
+        assert second_task is not None
+        second = kb.claim_review_task(
+            conn, task_id, claimer=f"{host}:reviewer-b",
+        )
+        assert second is not None
+
+        third_task = kb.failover_review_task(
+            conn, task_id, "reviewer-c", error="reviewer-b protocol violation",
+        )
+        assert third_task is not None
+        third = kb.claim_review_task(
+            conn, task_id, claimer=f"{host}:reviewer-c",
+        )
+        assert third is not None
+        authority = kb._latest_reviewer_authority(conn, task_id)
+        assert authority is not None and authority[1] == "reviewer-c"
+
+        with pytest.raises(
+            RuntimeError,
+            match="reviewer generation|reviewer lane|active review run",
+        ):
+            kb.request_changes(
+                conn,
+                task_id,
+                "programmer",
+                reviewer="reviewer-b",
+                reason="stale successor feedback",
+                expected_claim=second.claim_lock,
+                expected_run_id=second.current_run_id,
+            )
+
+        approved = kb.approve_review(
+            conn,
+            task_id,
+            reviewer="reviewer-c",
+            summary="newest authority approval",
+            head_sha=HEAD_SHA,
+            expected_claim=third.claim_lock,
+            expected_run_id=third.current_run_id,
+        )
+        assert approved is not None and approved.status == "ready"
+        assert _events(conn, task_id).count("review_failover") == 2
+        assert first.current_run_id != second.current_run_id != third.current_run_id
+
+
+def test_cli_recovers_stranded_review_only_from_latest_reviewer_verdict(kanban_home):
+    from hermes_cli import kanban
+
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn, reviewer="reviewer-a")
+        assert kb.reclaim_task(conn, task_id, reason="dead reviewer")
+        stranded = kb.get_task(conn, task_id)
+        assert stranded is not None
+        assert stranded.status == "review"
+        assert stranded.claim_lock is None
+        assert stranded.current_run_id is None
+        kb.add_comment(conn, task_id, "reviewer-a", "REQUEST_CHANGES: fix the failing test")
+
+    output = kanban.run_slash(
+        f"request-changes {task_id} programmer replay the recorded "
+        "REQUEST_CHANGES verdict --recover --reviewer reviewer-a",
+    )
+    assert output.startswith(f"Requested changes on {task_id}")
+
+    with kb.connect() as conn:
+        recovered = kb.get_task(conn, task_id)
+        assert recovered is not None
+        assert recovered.status == "ready"
+        assert recovered.assignee == "programmer"
+        assert recovered.claim_lock is None
+        assert recovered.current_run_id is None
+        assert _payload(conn, task_id, "changes_requested")["recovered"] is True
+        assert _events(conn, task_id).count("changes_requested") == 1
+
+        with pytest.raises(RuntimeError, match="not active|terminal|authority|status"):
+            kb.request_changes(
+                conn,
+                task_id,
+                "programmer",
+                reviewer="reviewer-a",
+                reason="duplicate recovery",
+                trusted_operator=True,
+                recovery=True,
+            )
+
+
+def test_stranded_review_recovery_rejects_live_claim_missing_evidence_and_wrong_owner(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn, reviewer="reviewer-a")
+        with pytest.raises(RuntimeError, match="run or claim is still active"):
+            kb.request_changes(
+                conn,
+                task_id,
+                "programmer",
+                reviewer="reviewer-a",
+                reason="unsafe live recovery",
+                trusted_operator=True,
+                recovery=True,
+            )
+
+        assert kb.reclaim_task(conn, task_id, reason="dead reviewer")
+        with pytest.raises(RuntimeError, match="literal REQUEST_CHANGES"):
+            kb.request_changes(
+                conn,
+                task_id,
+                "programmer",
+                reviewer="reviewer-a",
+                reason="missing evidence",
+                trusted_operator=True,
+                recovery=True,
+            )
+
+        kb.add_comment(conn, task_id, "reviewer-a", "REQUEST_CHANGES: recorded verdict")
+        with pytest.raises(RuntimeError, match="original implementation owner"):
+            kb.request_changes(
+                conn,
+                task_id,
+                "other-programmer",
+                reviewer="reviewer-a",
+                reason="wrong owner",
+                trusted_operator=True,
+                recovery=True,
+            )
+        with pytest.raises(RuntimeError, match="latest authoritative generation"):
+            kb.request_changes(
+                conn,
+                task_id,
+                "programmer",
+                reviewer="reviewer-b",
+                reason="wrong reviewer",
+                trusted_operator=True,
+                recovery=True,
+            )
 
 
 def test_stale_review_run_invalidates_prior_head_approval(kanban_home):

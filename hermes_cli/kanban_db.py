@@ -5181,6 +5181,185 @@ def _is_programmer_role(name: Optional[str]) -> bool:
     return bool(canon[len(_PROGRAMMER_ROLE_PREFIX):])
 
 
+def _stranded_review_has_request_changes_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    authority_id: int,
+    reviewer: str,
+) -> bool:
+    """Prove a stranded review has a current reviewer's literal verdict.
+
+    Comments are deliberately not authority by themselves.  This helper
+    requires a ``commented`` event by the exact latest reviewer *after* the
+    latest authority event, then checks that reviewer's newest post-authority
+    comment for the literal ``REQUEST_CHANGES`` verdict.  It is only used by
+    the explicit operator recovery path; it cannot authorize approval.
+    """
+    authority_event = conn.execute(
+        "SELECT created_at FROM task_events WHERE id=? AND task_id=?",
+        (authority_id, task_id),
+    ).fetchone()
+    if not authority_event:
+        return False
+    authority_created_at = int(authority_event["created_at"] or 0)
+
+    reviewer_comment_event = False
+    for event in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND id>? "
+        "AND kind='commented' ORDER BY id DESC",
+        (task_id, authority_id),
+    ):
+        try:
+            payload = json.loads(event["payload"]) if event["payload"] else {}
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            continue
+        try:
+            author = _canonical_assignee(payload.get("author"))
+        except (TypeError, ValueError, RuntimeError):
+            author = None
+        if author == reviewer:
+            reviewer_comment_event = True
+            break
+    if not reviewer_comment_event:
+        return False
+
+    latest_body: Optional[str] = None
+    for comment in conn.execute(
+        "SELECT author, body, created_at FROM task_comments WHERE task_id=? "
+        "ORDER BY id DESC",
+        (task_id,),
+    ):
+        try:
+            author = _canonical_assignee(comment["author"])
+        except (TypeError, ValueError, RuntimeError):
+            author = None
+        if author == reviewer and int(comment["created_at"] or 0) >= authority_created_at:
+            latest_body = str(comment["body"] or "")
+            break
+    return bool(
+        latest_body
+        and re.search(
+            r"(?<![A-Za-z0-9_])REQUEST_CHANGES(?![A-Za-z0-9_])",
+            latest_body,
+        )
+    )
+
+
+def _recover_stranded_review_changes(
+    conn: sqlite3.Connection,
+    task_id: str,
+    programmer: str,
+    *,
+    reviewer: str,
+    reason: str,
+) -> Optional[Task]:
+    """Return a review card to its original programmer after safe recovery.
+
+    This is intentionally narrower than a reviewer decision: it requires an
+    unclaimed ``review`` card, no live run, the exact latest reviewer identity,
+    an unconsumed authority event, and a post-authority literal
+    ``REQUEST_CHANGES`` comment from that reviewer.  There is no analogous
+    approval recovery path.
+    """
+    row = conn.execute(
+        "SELECT status, claim_lock, claim_expires, worker_pid, current_run_id, "
+        "assignee FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return None
+    if row["status"] != "review":
+        raise RuntimeError(
+            f"cannot recover review for {task_id}: status is {row['status']!r}"
+        )
+    if any(
+        row[key] is not None
+        for key in ("claim_lock", "claim_expires", "worker_pid", "current_run_id")
+    ):
+        raise RuntimeError(
+            f"cannot recover review for {task_id}: a reviewer run or claim is still active"
+        )
+    active_run = conn.execute(
+        "SELECT 1 FROM task_runs WHERE task_id=? AND status='running' "
+        "AND ended_at IS NULL LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if active_run:
+        raise RuntimeError(
+            f"cannot recover review for {task_id}: a reviewer run is still active"
+        )
+
+    authority = _latest_reviewer_authority(conn, task_id)
+    current_assignee = _canonical_assignee(row["assignee"])
+    if (
+        authority is None
+        or authority[1] != reviewer
+        or current_assignee != reviewer
+    ):
+        raise RuntimeError(
+            f"cannot recover review for {task_id}: reviewer identity is not the "
+            "latest authoritative generation"
+        )
+    authority_id = authority[0]
+    if not _review_authority_is_unconsumed(conn, task_id, authority_id):
+        raise RuntimeError(
+            f"cannot recover review for {task_id}: reviewer authority is no longer active"
+        )
+    if not _stranded_review_has_request_changes_evidence(
+        conn,
+        task_id,
+        authority_id=authority_id,
+        reviewer=reviewer,
+    ):
+        raise RuntimeError(
+            f"cannot recover review for {task_id}: no post-authority literal "
+            "REQUEST_CHANGES verdict from the latest reviewer"
+        )
+
+    original_owner = _resolve_finalizer(conn, task_id, reviewer=reviewer)
+    if not original_owner:
+        raise RuntimeError(
+            f"cannot recover review for {task_id}: no original implementation owner "
+            "could be resolved"
+        )
+    if programmer != original_owner:
+        raise RuntimeError(
+            f"cannot recover review for {task_id}: programmer {programmer!r} is not "
+            f"the original implementation owner {original_owner!r}"
+        )
+
+    cur = conn.execute(
+        "UPDATE tasks SET status='ready', assignee=?, claim_lock=NULL, "
+        "claim_expires=NULL, worker_pid=NULL, completed_at=NULL, "
+        "block_kind=NULL WHERE id=? AND status='review' AND claim_lock IS NULL "
+        "AND claim_expires IS NULL AND worker_pid IS NULL AND current_run_id IS NULL",
+        (programmer, task_id),
+    )
+    if cur.rowcount != 1:
+        raise RuntimeError(
+            f"cannot recover review for {task_id}: the card changed while recovery "
+            "was being recorded"
+        )
+    _append_event(
+        conn,
+        task_id,
+        "changes_requested",
+        {
+            "programmer": programmer,
+            "reason": reason,
+            "reviewer": reviewer,
+            "recovered": True,
+            "evidence": "post_authority_reviewer_comment",
+        },
+    )
+    if _has_sticky_block(conn, task_id):
+        _append_event(conn, task_id, "unblocked", {"source": "changes_requested"})
+    return get_task(conn, task_id)
+
+
 def request_changes(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5193,19 +5372,24 @@ def request_changes(
     expected_claim: Optional[str] = None,
     expected_run_id: Optional[int] = None,
     trusted_operator: bool = False,
+    recovery: bool = False,
 ) -> Optional[Task]:
     """Return a review to the programmer on the SAME card via ``ready``.
 
     A worker caller must prove the active reviewer profile, claim, and run.
     The trusted CLI/dashboard mode is intentionally explicit and may operate
-    without those worker credentials.  In either mode this function closes
-    the reviewer run, records one durable correction packet, and leaves the
-    dispatcher to create the next real programmer run.
+    without those worker credentials.  ``recovery=True`` is a narrower trusted
+    operator path for an unclaimed stranded review with a durable literal
+    ``REQUEST_CHANGES`` verdict; it never authorizes approval.
     """
     programmer = _canonical_assignee(programmer)
     reviewer_name = _canonical_assignee(reviewer)
     if not programmer:
         raise ValueError("programmer is required")
+    if recovery and not trusted_operator:
+        raise ValueError("stranded review recovery requires trusted operator mode")
+    if recovery and not reviewer_name:
+        raise ValueError("reviewer is required for stranded review recovery")
     if not reviewer_name and not trusted_operator:
         raise ValueError("reviewer is required")
     reason = _redact_review_text(reason).strip()
@@ -5226,6 +5410,15 @@ def request_changes(
         ).fetchone()
         if not row:
             return None
+
+        if recovery:
+            return _recover_stranded_review_changes(
+                conn,
+                task_id,
+                programmer,
+                reviewer=reviewer_name or "",
+                reason=reason,
+            )
 
         if row["status"] not in _ACTIVE_REVIEW_TASK_STATUSES:
             decision_id, decision_run_id, decision = _latest_event_record(
@@ -5572,8 +5765,14 @@ def _reviewer_candidates(
         str(p.name) for p in profiles
         if str(p.name).startswith("code-reviewer")
     ]
-    if current and current not in names:
-        names.insert(0, current)
+    # The task's current assignee is the reviewer authorized by the latest
+    # ``submitted_for_review``/``review_failover`` event.  Keep that reviewer
+    # first even when profile discovery returns the candidates in a different
+    # order; assigning an older candidate before a new authority event would
+    # create a generation that cannot legally decide the review.
+    current_name = _canonical_assignee(current)
+    if current_name:
+        names.insert(0, current_name)
     names = list(dict.fromkeys(names))
     compatible: list[str] = []
     for name in names:
@@ -10326,6 +10525,38 @@ def _dispatch_once_locked(
             if not dry_run:
                 failover_review_task(
                     conn, row["id"], None,
+                    attempted=preflight_failures,
+                )
+            else:
+                result.skipped_nonspawnable.append(row["id"])
+            continue
+        current_reviewer = _canonical_assignee(row["assignee"])
+        if not current_reviewer:
+            if not dry_run:
+                failover_review_task(
+                    conn,
+                    row["id"],
+                    None,
+                    error="reviewer authority identity is invalid",
+                    attempted=preflight_failures,
+                )
+            else:
+                result.skipped_nonspawnable.append(row["id"])
+            continue
+        if _canonical_assignee(candidates[0]) != current_reviewer:
+            # The current authority failed preflight, so a compatible older
+            # profile must never be assigned directly. Transfer authority via
+            # the normal failover event first; the next dispatcher tick then
+            # claims only the newly authorized reviewer.
+            if not dry_run:
+                _failover_review_after_recovery(
+                    conn,
+                    row["id"],
+                    error=(
+                        preflight_failures[0].get("error")
+                        if preflight_failures
+                        else "current reviewer unavailable"
+                    ),
                     attempted=preflight_failures,
                 )
             else:
