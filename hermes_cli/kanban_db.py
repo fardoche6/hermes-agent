@@ -4624,8 +4624,16 @@ def _authoritative_reviewer(
     conn: sqlite3.Connection, task_id: str,
 ) -> Optional[str]:
     """Resolve reviewer ownership from the latest review-lane generation."""
+    authority = _latest_reviewer_authority(conn, task_id)
+    return authority[1] if authority else None
+
+
+def _latest_reviewer_authority(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[tuple[int, str]]:
+    """Return the latest valid review authority event and canonical reviewer."""
     row = conn.execute(
-        "SELECT kind, payload FROM task_events WHERE task_id=? "
+        "SELECT id, kind, payload FROM task_events WHERE task_id=? "
         "AND kind IN ('submitted_for_review', 'review_failover') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
@@ -4647,8 +4655,84 @@ def _authoritative_reviewer(
         reviewer = _canonical_assignee(candidate if isinstance(candidate, str) else None)
     except (TypeError, ValueError):
         return None
-    return reviewer or None
+    if not reviewer:
+        return None
+    return (int(row["id"]), reviewer)
 
+
+def _review_claim_history_is_clean(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    authority_id: int,
+    claim_id: int,
+    reviewer: str,
+) -> tuple[bool, bool, bool]:
+    """Return (clean, saw reviewer block, saw unblock) for this generation."""
+    saw_reviewer_block = False
+    saw_unblock = False
+    rows = conn.execute(
+        "SELECT id, kind, run_id FROM task_events WHERE task_id=? "
+        "AND id>? AND id<=? ORDER BY id",
+        (task_id, authority_id, claim_id),
+    ).fetchall()
+    for event in rows:
+        kind = event["kind"]
+        if kind in ("submitted_for_review", "review_failover"):
+            return False, saw_reviewer_block, saw_unblock
+        if kind == "claimed":
+            run = conn.execute(
+                "SELECT profile FROM task_runs WHERE id=?", (event["run_id"],)
+            ).fetchone()
+            if not run or _canonical_assignee(run["profile"]) != reviewer:
+                return False, saw_reviewer_block, saw_unblock
+        elif kind == "blocked":
+            run = conn.execute(
+                "SELECT profile FROM task_runs WHERE id=?", (event["run_id"],)
+            ).fetchone()
+            if run and _canonical_assignee(run["profile"]) == reviewer:
+                saw_reviewer_block = True
+        elif kind == "unblocked" and saw_reviewer_block:
+            saw_unblock = True
+    return True, saw_reviewer_block, saw_unblock
+
+
+def _recovered_reviewer_claim_is_valid(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    authority_id: int,
+    claim_id: int,
+    reviewer: str,
+) -> bool:
+    """Prove a generic claim is a reviewer recovery after block → unblock.
+
+    A claim from ``ready`` has no ``source_status=review`` marker. It is
+    recoverable only when the same latest review authority is still pending,
+    a reviewer run was actually blocked, then unblocked, and no implementation
+    claim/generation intervened.
+    """
+    clean, saw_reviewer_block, saw_unblock = _review_claim_history_is_clean(
+        conn,
+        task_id,
+        authority_id=authority_id,
+        claim_id=claim_id,
+        reviewer=reviewer,
+    )
+    return clean and saw_reviewer_block and saw_unblock
+
+
+def _review_authority_is_unconsumed(
+    conn: sqlite3.Connection, task_id: str, authority_id: int,
+) -> bool:
+    """Return whether no later decision or review generation consumed authority."""
+    row = conn.execute(
+        "SELECT 1 FROM task_events WHERE task_id=? AND id>? AND kind IN "
+        "('changes_requested', 'review_approved', 'submitted_for_review', "
+        "'review_failover', 'completed', 'archived') LIMIT 1",
+        (task_id, authority_id),
+    ).fetchone()
+    return row is None
 
 def _active_review_generation(
     conn: sqlite3.Connection,
@@ -4672,7 +4756,8 @@ def _active_review_generation(
         (run_id,),
     ).fetchone()
     now = int(time.time())
-    authoritative = _authoritative_reviewer(conn, task_id)
+    authority = _latest_reviewer_authority(conn, task_id)
+    authoritative = authority[1] if authority else None
     if (
         not run
         or run["task_id"] != task_id
@@ -4689,6 +4774,7 @@ def _active_review_generation(
             or int(task_row["claim_expires"]) <= now
         )
         or task_row["claim_lock"] != run["claim_lock"]
+        or authority is None
         or not authoritative
         or task_row["assignee"] != authoritative
         or _canonical_assignee(run["profile"]) != authoritative
@@ -4697,6 +4783,12 @@ def _active_review_generation(
         raise RuntimeError(
             f"cannot decide review for {task_id}: current reviewer generation "
             "is no longer active"
+        )
+
+    authority_id = authority[0]
+    if not _review_authority_is_unconsumed(conn, task_id, authority_id):
+        raise RuntimeError(
+            f"cannot decide review for {task_id}: reviewer authority is no longer active"
         )
 
     claim_event = conn.execute(
@@ -4713,12 +4805,37 @@ def _active_review_generation(
         claim_payload = json.loads(claim_event["payload"]) if claim_event else {}
     except (TypeError, ValueError):
         claim_payload = {}
+    direct_review_claim = (
+        isinstance(claim_payload, dict)
+        and claim_payload.get("source_status") == "review"
+    )
+    claim_history_clean = bool(
+        claim_event
+        and _review_claim_history_is_clean(
+            conn,
+            task_id,
+            authority_id=authority_id,
+            claim_id=int(claim_event["id"]),
+            reviewer=authoritative,
+        )[0]
+    )
+    recovered_review_claim = bool(
+        claim_history_clean
+        and _recovered_reviewer_claim_is_valid(
+            conn,
+            task_id,
+            authority_id=authority_id,
+            claim_id=int(claim_event["id"]),
+            reviewer=authoritative,
+        )
+    )
     if (
         not claim_event
         or not isinstance(claim_payload, dict)
-        or claim_payload.get("source_status") != "review"
         or not latest_claim
         or int(latest_claim["id"]) != int(claim_event["id"])
+        or not claim_history_clean
+        or (not direct_review_claim and not recovered_review_claim)
     ):
         raise RuntimeError(
             f"cannot decide review for {task_id}: current reviewer generation "
@@ -6827,7 +6944,24 @@ def block_task(
         same_cause = prev_kind == kind
         recurrences = prev_recurrences + 1 if same_cause else 1
 
+        reviewer_recovery = False
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
+            current = conn.execute(
+                "SELECT * FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()
+            if current is not None:
+                try:
+                    _active_review_generation(
+                        conn,
+                        task_id,
+                        current,
+                        reviewer=current["assignee"],
+                    )
+                    reviewer_recovery = True
+                except (RuntimeError, TypeError, ValueError):
+                    reviewer_recovery = False
+
+        if recurrences >= BLOCK_RECURRENCE_LIMIT and not reviewer_recovery:
             # Loop detected — stop letting the unblocker spin this task. Route
             # to triage for a human-in-the-loop decision instead of blocked.
             cur = conn.execute(

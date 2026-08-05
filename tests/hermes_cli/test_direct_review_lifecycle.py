@@ -163,6 +163,79 @@ def test_running_reviewer_can_request_changes_exactly_once(kanban_home):
         ).fetchone()["count"] == 1
 
 
+def test_reviewer_block_ready_reclaim_can_request_changes(kanban_home):
+    """A reviewer recovered through blocked -> ready keeps its authority."""
+    with kb.connect() as conn:
+        task_id, review, host = _review_card(conn)
+        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
+        conn.commit()
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="temporary reviewer capability failure",
+            kind="capability",
+            expected_run_id=review.current_run_id,
+        )
+        blocked = kb.get_task(conn, task_id)
+        assert blocked is not None and blocked.status == "blocked"
+        assert kb.unblock_task(conn, task_id)
+
+        recovered = kb.claim_task(
+            conn, task_id, claimer=f"{host}:review-retry",
+        )
+        assert recovered is not None
+        assert recovered.status == "running"
+        assert recovered.assignee == "code-reviewer"
+        assert recovered.current_run_id != review.current_run_id
+
+        corrected = kb.request_changes(
+            conn,
+            task_id,
+            "programmer",
+            reviewer="code-reviewer",
+            reason="retry decision",
+            expected_claim=recovered.claim_lock,
+            expected_run_id=recovered.current_run_id,
+        )
+        assert corrected is not None
+        assert corrected.status == "ready"
+        assert corrected.assignee == "programmer"
+        assert conn.execute(
+            "SELECT COUNT(*) AS count FROM task_events "
+            "WHERE task_id=? AND kind='changes_requested'",
+            (task_id,),
+        ).fetchone()["count"] == 1
+
+
+def test_reviewer_recovery_block_does_not_false_escalate_to_triage(kanban_home):
+    with kb.connect() as conn:
+        task_id, review, host = _review_card(conn)
+        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
+        conn.commit()
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="temporary reviewer capability failure",
+            kind="capability",
+            expected_run_id=review.current_run_id,
+        )
+        assert kb.unblock_task(conn, task_id)
+        recovered = kb.claim_task(conn, task_id, claimer=f"{host}:review-retry")
+        assert recovered is not None
+
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="temporary reviewer capability failure",
+            kind="capability",
+            expected_run_id=recovered.current_run_id,
+        )
+        blocked = kb.get_task(conn, task_id)
+        assert blocked is not None
+        assert blocked.status == "blocked"
+        assert blocked.status != "triage"
+
+
 def test_running_reviewer_can_approve_exact_head(kanban_home):
     """Approve uses the same active reviewer predicate as request-changes."""
     with kb.connect() as conn:
