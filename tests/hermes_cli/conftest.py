@@ -14,9 +14,15 @@ def all_assignees_spawnable(monkeypatch):
     patch, the dispatcher's profile-exists guard (PR #20105) routes
     those tasks into ``skipped_nonspawnable`` instead of spawning, which
     would break tests that assert spawn behavior.
+
+    Since the dispatcher's gate is now the strict configured-profile
+    resolver (``kanban_db._profile_is_configured``: real profile dir +
+    parsable ``config.yaml`` mapping), the fixture stubs that too — tests
+    that want to exercise the strict gate must NOT request this fixture.
     """
-    from hermes_cli import profiles
+    from hermes_cli import kanban_db, profiles
     monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    monkeypatch.setattr(kanban_db, "_profile_is_configured", lambda name: True)
 
 
 @pytest.fixture(autouse=True)

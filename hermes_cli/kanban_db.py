@@ -2875,8 +2875,17 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     """Lowercase-assignee normalization for Kanban rows (dashboard/CLI parity)."""
     if assignee is None:
         return None
-    from hermes_cli.profiles import normalize_profile_name
-
+    try:
+        from hermes_cli.profiles import normalize_profile_name
+    except Exception as exc:
+        # Degraded install / stubbed profiles module. Never fall back to the
+        # raw string (that would let an unnormalized name reach a spawn), and
+        # never let a raw ImportError escape into the tool handlers, which
+        # only translate RuntimeError/ValueError.
+        raise RuntimeError(
+            f"cannot canonicalize assignee {assignee!r}: profile helpers are "
+            f"unavailable"
+        ) from exc
     return normalize_profile_name(assignee)
 
 
@@ -5075,6 +5084,57 @@ _PROGRAMMER_ROLE = "programmer"
 _PROGRAMMER_ROLE_PREFIX = "programmer-"
 
 
+def _profile_is_configured(name: Optional[str]) -> bool:
+    """Return True iff *name* resolves to a fully **configured** profile.
+
+    This is the single strict admission contract shared by every lifecycle
+    decision that can hand a card to a worker (``request_changes`` transfer
+    admission, ``dispatch_once`` claim/spawn admission, and the read-only
+    ``has_spawnable_*`` telemetry probes).  Directory existence is NOT
+    enough: a half-created ``profiles/<name>/`` tree, or one holding a
+    ``config.yaml`` that is unreadable / not valid YAML / not a YAML
+    mapping, would make ``hermes -p <name>`` fail at startup, so it must
+    never be admitted.
+
+    The check is deliberately **fail-closed on every failure mode** —
+    import errors (partial install, test stubs), name errors, path errors,
+    I/O and permission errors, YAML parse errors and wrong document types
+    all return ``False``.  It never falls back to defaults, to another
+    profile, or to "assume spawnable".
+
+    ``default`` is the implicit root profile (the Hermes installation
+    itself, not a ``profiles/<name>/`` subdirectory); as in
+    :func:`list_profiles_on_disk` it is configured when the root exists.
+    """
+    if not isinstance(name, str) or not name.strip():
+        return False
+    try:
+        from hermes_cli.profiles import (  # local import: avoids import cycle
+            get_profile_dir,
+            normalize_profile_name,
+            validate_profile_name,
+        )
+    except Exception:
+        return False
+    try:
+        canon = normalize_profile_name(name)
+        validate_profile_name(canon)
+        # Path resolution goes through get_profile_dir so the profile name
+        # can never be joined into an arbitrary filesystem location.
+        profile_dir = Path(get_profile_dir(canon))
+        if canon == "default":
+            return profile_dir.is_dir()
+        config_path = profile_dir / "config.yaml"
+        if not config_path.is_file():
+            return False
+        import yaml
+        with open(config_path, "r", encoding="utf-8") as handle:
+            document = yaml.safe_load(handle)
+    except Exception:
+        return False
+    return isinstance(document, dict)
+
+
 def _is_programmer_role(name: Optional[str]) -> bool:
     """Return True when *name* satisfies the programmer-lane role contract.
 
@@ -5087,12 +5147,17 @@ def _is_programmer_role(name: Optional[str]) -> bool:
     """
     if not isinstance(name, str):
         return False
-    from hermes_cli.profiles import normalize_profile_name, validate_profile_name
-
     try:
+        # Imported inside the fail-closed boundary: a partial install must
+        # surface as "incompatible profile", never as a raw ImportError
+        # escaping into the tool handler.
+        from hermes_cli.profiles import (
+            normalize_profile_name,
+            validate_profile_name,
+        )
         canon = normalize_profile_name(name)
         validate_profile_name(canon)
-    except (TypeError, ValueError):
+    except Exception:
         return False
     if canon == _PROGRAMMER_ROLE:
         return True
@@ -5236,17 +5301,12 @@ def request_changes(
                     f"owner {original_owner!r} nor a compatible programmer "
                     f"profile ('programmer' or 'programmer-<name>')"
                 )
-            # Admission uses the module's canonical configured-profile
-            # contract (a profile directory holding a ``config.yaml``), not
-            # bare directory existence, so a half-created profile tree can
-            # never receive a card.  Any failure here fails closed.
-            try:
-                from hermes_cli.profiles import normalize_profile_name
-                canonical = normalize_profile_name(programmer)
-                available = canonical in list_profiles_on_disk()
-            except Exception:
-                available = False
-            if not available:
+            # Admission uses the strict configured-profile resolver: the
+            # profile must resolve, hold a regular ``config.yaml``, and that
+            # file must parse as a YAML mapping.  A half-created or malformed
+            # profile tree can never receive a card, and every failure mode
+            # (import, name, path, I/O, parse, type) fails closed.
+            if not _profile_is_configured(programmer):
                 raise RuntimeError(
                     f"cannot request changes for {task_id}: replacement "
                     f"programmer profile {programmer!r} is unavailable"
@@ -9749,24 +9809,18 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     lanes like ``orion-cc`` / ``orion-research`` waiting on terminals
     that pull tasks via ``claim_task`` directly).
 
-    Falls back to "any ready+assigned" if ``profile_exists`` is not
-    importable (e.g. partial install) — preserves the old behavior so
-    the warning still fires in degraded environments.
+    Read-only: it never mutates a task, run, or event.  It uses exactly the
+    same strict configured-profile resolver as the dispatcher's spawn
+    admission, so telemetry can never report a bare or malformed profile as
+    spawnable work the dispatcher "should" have picked up.
     """
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
-    if not rows:
-        return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        # Can't introspect — assume spawnable, preserve legacy behavior.
-        return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if _profile_is_configured(row["assignee"]):
             return True
     return False
 
@@ -9777,21 +9831,16 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
 
     Mirror of :func:`has_spawnable_ready` for the review column —
     used by the health telemetry to decide whether the dispatcher
-    should have spawned a review agent.
+    should have spawned a review agent.  Read-only, and gated by the same
+    strict configured-profile resolver.
     """
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
-    if not rows:
-        return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if _profile_is_configured(row["assignee"]):
             return True
     return False
 
@@ -10039,20 +10088,14 @@ def _dispatch_once_locked(
             _per_profile_running[prow["assignee"]] = int(prow["n"])
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
-    # We also resolve profile_exists once here for the same reason.
+    # We also resolve the configured-profile check once here for the same
+    # reason.  Fail-closed: an operator-configured fallback that is not a
+    # fully configured profile must not cause an assignee mutation that the
+    # spawn gate would only reject a few lines later.
     _default_assignee = (default_assignee or "").strip() or None
-    _default_assignee_resolved = False
-    if _default_assignee:
-        try:
-            from hermes_cli.profiles import profile_exists as _pe
-            _default_assignee_resolved = bool(_pe(_default_assignee))
-        except Exception:
-            # Profiles module not importable (test stubs, exotic envs).
-            # Trust the operator's config and try the assignment; the
-            # downstream profile_exists check on the assigned row will
-            # bucket it as nonspawnable if the profile genuinely isn't
-            # there, with the existing diagnostic.
-            _default_assignee_resolved = True
+    _default_assignee_resolved = (
+        _profile_is_configured(_default_assignee) if _default_assignee else False
+    )
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
@@ -10115,11 +10158,14 @@ def _dispatch_once_locked(
         # subprocess would crash on startup, get reaped as a zombie,
         # the task would loop back to ``ready`` on next tick, and we'd
         # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
-        try:
-            from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row_assignee):
+        #
+        # The gate is the strict configured-profile resolver (not bare
+        # directory existence) and it is fail-closed: if the profile tree
+        # is half-created, its ``config.yaml`` is missing/malformed, or the
+        # profile helpers cannot even be imported, we skip the task WITHOUT
+        # touching the task row, its runs, or its events.  We never spawn
+        # and never move a ready task to running on an unverified profile.
+        if not _profile_is_configured(row_assignee):
             # Bucket separately from skipped_unassigned: the operator
             # cannot fix this by assigning a profile (the assignee IS the
             # intended owner — a terminal lane). Health telemetry uses

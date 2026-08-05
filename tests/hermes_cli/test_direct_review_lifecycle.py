@@ -1352,25 +1352,21 @@ def test_transfer_retry_is_idempotent_and_binds_to_replacement(kanban_home):
     with kb.connect() as conn:
         task_id, review, _ = _review_card(conn)
         assert _request_changes(conn, task_id, review, "programmer-luna")
-        after = _events(conn, task_id)
-        runs = conn.execute(
-            "SELECT id, status, outcome, ended_at FROM task_runs "
-            "WHERE task_id=? ORDER BY id", (task_id,),
-        ).fetchall()
+        # Complete post-transfer state: the replay must not change a single
+        # column of tasks/task_runs/task_events.
+        after = _snapshot(conn, task_id)
 
         replay = _request_changes(conn, task_id, review, "programmer-luna")
 
         assert replay is not None
         assert replay.assignee == "programmer-luna"
-        assert _events(conn, task_id) == after
-        assert conn.execute(
-            "SELECT id, status, outcome, ended_at FROM task_runs "
-            "WHERE task_id=? ORDER BY id", (task_id,),
-        ).fetchall() == runs
+        assert _snapshot(conn, task_id) == after
 
-        # The retry binds to the replacement, not the original owner.
+        # The retry binds to the replacement, not the original owner, and
+        # the rejected owner-mismatch retry is fully zero-mutation too.
         with pytest.raises(RuntimeError):
             _request_changes(conn, task_id, review, "programmer")
+        assert _snapshot(conn, task_id) == after
 
 
 def test_same_owner_request_changes_still_works(kanban_home):
@@ -1521,3 +1517,217 @@ def test_transferred_programmer_becomes_finalizer_after_approval(kanban_home):
         )
         assert approved is not None
         assert approved.assignee == "programmer-luna"
+
+
+# ---------------------------------------------------------------------------
+# Strict configured-profile admission (request_changes + dispatcher)
+# ---------------------------------------------------------------------------
+
+def _write_profile_config(name: str, body: str) -> Path:
+    directory = Path.home() / ".hermes" / "profiles" / name
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "config.yaml"
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def _break_profiles_import(monkeypatch) -> None:
+    """Make ``from hermes_cli.profiles import ...`` fail deterministically.
+
+    Simulates a partial install / exotic environment: the module object is
+    present but exposes none of the profile helpers, so every helper import
+    raises ``ImportError``. The lifecycle must fail closed, and callers must
+    never see the raw ``ImportError`` (the tool handler only catches
+    ``RuntimeError``/``ValueError``).
+    """
+    import sys
+    import types
+
+    stub = types.ModuleType("hermes_cli.profiles")
+    monkeypatch.setitem(sys.modules, "hermes_cli.profiles", stub)
+
+
+def test_malformed_yaml_replacement_profile_is_rejected(kanban_home):
+    """``config.yaml`` that is not parsable YAML is not a configured profile."""
+    _write_profile_config("programmer-bad", "[invalid yaml\n")
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        before = _snapshot(conn, task_id)
+
+        with pytest.raises(RuntimeError, match="unavailable"):
+            _request_changes(conn, task_id, review, "programmer-bad")
+
+        _assert_no_mutation(conn, task_id, before, review)
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.status == "review"
+        assert current.assignee == "code-reviewer"
+
+
+@pytest.mark.parametrize(
+    "body", ["just a string\n", "- one\n- two\n", "", "null\n", "42\n"],
+)
+def test_non_mapping_yaml_replacement_profile_is_rejected(kanban_home, body):
+    """A ``config.yaml`` that does not parse to a mapping is rejected."""
+    _write_profile_config("programmer-scalar", body)
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        before = _snapshot(conn, task_id)
+
+        with pytest.raises(RuntimeError, match="unavailable"):
+            _request_changes(conn, task_id, review, "programmer-scalar")
+
+        _assert_no_mutation(conn, task_id, before, review)
+
+
+def test_request_changes_fails_closed_when_profile_helpers_unimportable(
+    kanban_home, monkeypatch,
+):
+    """A broken profiles module must not leak ``ImportError`` out of admission."""
+    _make_profile("programmer-luna")
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        before = _snapshot(conn, task_id)
+
+        _break_profiles_import(monkeypatch)
+        with pytest.raises((RuntimeError, ValueError)) as excinfo:
+            _request_changes(conn, task_id, review, "programmer-luna")
+        assert not isinstance(excinfo.value, ImportError)
+
+        _assert_no_mutation(conn, task_id, before, review)
+
+
+# --- dispatcher admission ---------------------------------------------------
+
+def _ready_transfer_card(conn):
+    """Return a task id parked in ``ready`` and owned by ``programmer-luna``."""
+    _make_profile("programmer-luna")
+    task_id, review, _host = _review_card(conn)
+    corrected = _request_changes(conn, task_id, review, "programmer-luna")
+    assert corrected is not None and corrected.status == "ready"
+    return task_id
+
+
+class _SpawnRecorder:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return 4242
+
+
+def test_dispatch_spawns_configured_transfer_target(kanban_home):
+    """Baseline: with a real configured profile the transferred card spawns."""
+    with kb.connect() as conn:
+        task_id = _ready_transfer_card(conn)
+        spawn = _SpawnRecorder()
+
+        result = kb.dispatch_once(conn, spawn_fn=spawn, dry_run=False)
+
+        assert len(spawn.calls) == 1
+        assert [s[0] for s in result.spawned] == [task_id]
+        current = kb.get_task(conn, task_id)
+        assert current is not None and current.status == "running"
+
+
+def test_dispatch_never_claims_a_task_whose_config_disappeared(kanban_home):
+    """Valid transfer, then the replacement's config.yaml is removed."""
+    with kb.connect() as conn:
+        task_id = _ready_transfer_card(conn)
+        config = Path.home() / ".hermes" / "profiles" / "programmer-luna" / "config.yaml"
+        config.unlink()
+        assert config.parent.is_dir()  # bare directory survives
+        before = _snapshot(conn, task_id)
+        spawn = _SpawnRecorder()
+
+        result = kb.dispatch_once(conn, spawn_fn=spawn, dry_run=False)
+
+        assert spawn.calls == []
+        assert result.spawned == []
+        assert result.skipped_nonspawnable == [task_id]
+        assert _snapshot(conn, task_id) == before
+        current = kb.get_task(conn, task_id)
+        assert current is not None and current.status == "ready"
+
+
+def test_dispatch_never_claims_a_task_whose_config_is_malformed(kanban_home):
+    """Same fence when the config is replaced with unparsable YAML."""
+    with kb.connect() as conn:
+        task_id = _ready_transfer_card(conn)
+        _write_profile_config("programmer-luna", "[invalid yaml\n")
+        before = _snapshot(conn, task_id)
+        spawn = _SpawnRecorder()
+
+        result = kb.dispatch_once(conn, spawn_fn=spawn, dry_run=False)
+
+        assert spawn.calls == []
+        assert result.skipped_nonspawnable == [task_id]
+        assert _snapshot(conn, task_id) == before
+
+
+def test_dispatch_fails_closed_when_profile_helpers_unimportable(
+    kanban_home, monkeypatch,
+):
+    """A broken profiles module must never spawn or move ready -> running."""
+    with kb.connect() as conn:
+        task_id = _ready_transfer_card(conn)
+        before = _snapshot(conn, task_id)
+        spawn = _SpawnRecorder()
+
+        _break_profiles_import(monkeypatch)
+        result = kb.dispatch_once(conn, spawn_fn=spawn, dry_run=False)
+
+        assert spawn.calls == []
+        assert result.spawned == []
+        assert result.skipped_nonspawnable == [task_id]
+        assert _snapshot(conn, task_id) == before
+        current = kb.get_task(conn, task_id)
+        assert current is not None and current.status == "ready"
+
+
+# --- read-only telemetry ----------------------------------------------------
+
+def test_has_spawnable_ready_requires_a_configured_profile(kanban_home):
+    with kb.connect() as conn:
+        task_id = _ready_transfer_card(conn)
+        assert kb.has_spawnable_ready(conn) is True
+
+        before = _snapshot(conn, task_id)
+        (Path.home() / ".hermes" / "profiles" / "programmer-luna"
+         / "config.yaml").unlink()
+        assert kb.has_spawnable_ready(conn) is False
+
+        _write_profile_config("programmer-luna", "[invalid yaml\n")
+        assert kb.has_spawnable_ready(conn) is False
+
+        # Telemetry is strictly read-only.
+        assert _snapshot(conn, task_id) == before
+
+
+def test_has_spawnable_review_requires_a_configured_profile(kanban_home):
+    _make_profile("code-reviewer")
+    with kb.connect() as conn:
+        task_id, _review, _host = _review_card(conn)
+        conn.execute(
+            "UPDATE tasks SET claim_lock = NULL WHERE id = ?", (task_id,)
+        )
+        conn.commit()
+        assert kb.has_spawnable_review(conn) is True
+
+        before = _snapshot(conn, task_id)
+        _write_profile_config("code-reviewer", "- not: a mapping\n")
+        assert kb.has_spawnable_review(conn) is False
+        assert _snapshot(conn, task_id) == before
+
+
+def test_telemetry_fails_closed_when_profile_helpers_unimportable(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        _ready_transfer_card(conn)
+        assert kb.has_spawnable_ready(conn) is True
+
+        _break_profiles_import(monkeypatch)
+        assert kb.has_spawnable_ready(conn) is False
+        assert kb.has_spawnable_review(conn) is False
