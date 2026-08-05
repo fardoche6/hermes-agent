@@ -1408,6 +1408,9 @@ CREATE TABLE IF NOT EXISTS task_links (
     dependency_kind   TEXT NOT NULL DEFAULT 'completion',
     provider_name     TEXT,
     metadata          TEXT,
+    metadata_digest   TEXT,
+    edge_identity     TEXT,
+    link_version      INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (parent_id, child_id)
 );
 
@@ -2767,6 +2770,40 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             )
         if "metadata" not in link_cols:
             _add_column_if_missing(conn, "task_links", "metadata", "metadata TEXT")
+        if "metadata_digest" not in link_cols:
+            _add_column_if_missing(
+                conn, "task_links", "metadata_digest", "metadata_digest TEXT"
+            )
+        if "edge_identity" not in link_cols:
+            _add_column_if_missing(
+                conn, "task_links", "edge_identity", "edge_identity TEXT"
+            )
+        if "link_version" not in link_cols:
+            _add_column_if_missing(
+                conn, "task_links", "link_version",
+                "link_version INTEGER NOT NULL DEFAULT 1",
+            )
+        for link in conn.execute(
+            "SELECT parent_id, child_id, dependency_kind, provider_name, metadata "
+            "FROM task_links WHERE metadata_digest IS NULL OR edge_identity IS NULL"
+        ).fetchall():
+            metadata = {}
+            try:
+                if link["metadata"]:
+                    parsed = json.loads(link["metadata"])
+                    metadata = parsed if isinstance(parsed, Mapping) else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                metadata = {}
+            edge_identity = _dependency_edge_identity(
+                link["parent_id"], link["child_id"],
+                link["dependency_kind"] or "completion", link["provider_name"], metadata,
+            )
+            metadata_digest = _dependency_metadata_digest(metadata)
+            conn.execute(
+                "UPDATE task_links SET metadata_digest = ?, edge_identity = ? "
+                "WHERE parent_id = ? AND child_id = ?",
+                (metadata_digest, edge_identity, link["parent_id"], link["child_id"]),
+            )
 
     # Provider admission is persisted on the historical run, never only in
     # process memory.  Existing runs naturally get NULL.
@@ -2796,6 +2833,11 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)"
     )
+    if "status" in cols:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_tasks_active_idempotency "
+            "ON tasks(idempotency_key) WHERE idempotency_key IS NOT NULL AND status != 'archived'"
+        )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
     )
@@ -3805,12 +3847,46 @@ def create_task(
     # insert, at which point both rows exist but the next lookup stabilises.
     if idempotency_key:
         row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
+            "SELECT * FROM tasks WHERE idempotency_key = ? "
             "AND status != 'archived' "
             "ORDER BY created_at DESC LIMIT 1",
             (idempotency_key,),
         ).fetchone()
         if row:
+            existing_links = conn.execute(
+                "SELECT parent_id, dependency_kind, provider_name, metadata "
+                "FROM task_links WHERE child_id = ? ORDER BY parent_id",
+                (row["id"],),
+            ).fetchall()
+            existing_specs = [
+                (
+                    link["parent_id"],
+                    *_normalize_dependency_spec(
+                        link["dependency_kind"] or "completion",
+                        link["provider_name"],
+                        _decode_dependency_metadata(link["metadata"]),
+                    ),
+                )
+                for link in existing_links
+            ]
+            requested_specs = [
+                (parent, dependency_kind, provider_name, dependency_metadata)
+                for parent in parents
+            ]
+            comparable = (
+                row["title"], row["body"], row["assignee"], row["tenant"],
+                int(row["priority"] or 0), row["workspace_kind"],
+                row["workspace_path"], row["branch_name"], row["project_id"],
+                existing_specs,
+            )
+            requested = (
+                title.strip(), body, assignee, tenant, int(priority), workspace_kind,
+                workspace_path, branch_name, project_id, requested_specs,
+            )
+            if comparable != requested:
+                raise ValueError(
+                    "idempotency key conflict: canonical task, parents, or dependency binding differs"
+                )
             return row["id"]
 
     now = int(time.time())
@@ -3922,8 +3998,9 @@ def create_task(
                 for pid in parents:
                     conn.execute(
                         "INSERT INTO task_links "
-                        "(parent_id, child_id, dependency_kind, provider_name, metadata) "
-                        "VALUES (?, ?, ?, ?, ?)",
+                        "(parent_id, child_id, dependency_kind, provider_name, metadata, "
+                        "metadata_digest, edge_identity, link_version) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, 1)",
                         (
                             pid,
                             task_id,
@@ -3931,20 +4008,13 @@ def create_task(
                             provider_name,
                             json.dumps(dependency_metadata, sort_keys=True)
                             if dependency_metadata else None,
+                            _dependency_metadata_digest(dependency_metadata),
+                            _dependency_edge_identity(
+                                pid, task_id, dependency_kind, provider_name,
+                                dependency_metadata,
+                            ),
                         ),
                     )
-                if not triage and initial_status != "blocked" and parents:
-                    dependency_resolution = resolve_task_dependencies(
-                        conn,
-                        task_id,
-                        board=board_slug,
-                    )
-                    if not dependency_resolution.satisfied:
-                        task_status = "todo"
-                        conn.execute(
-                            "UPDATE tasks SET status = 'todo' WHERE id = ?",
-                            (task_id,),
-                        )
                 _append_event(
                     conn,
                     task_id,
@@ -3968,6 +4038,16 @@ def create_task(
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+            if not triage and initial_status != "blocked" and parents:
+                dependency_resolution = resolve_task_dependencies(
+                    conn, task_id, board=board_slug,
+                )
+                if not dependency_resolution.satisfied:
+                    with write_txn(conn):
+                        conn.execute(
+                            "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+                            (task_id,),
+                        )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -4256,6 +4336,8 @@ class DependencyEvidence:
     workspace_base: Optional[dict[str, str]] = None
     metadata: Optional[dict[str, Any]] = None
     diagnostics: Optional[dict[str, Any]] = None
+    edge_identity: Optional[str] = None
+    link_version: Optional[int] = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -4268,6 +4350,8 @@ class DependencyEvidence:
             "workspace_base": self.workspace_base,
             "metadata": self.metadata or {},
             "diagnostics": self.diagnostics or {},
+            "edge_identity": self.edge_identity,
+            "link_version": self.link_version,
         }
 
 
@@ -4279,6 +4363,8 @@ class DependencyResolution:
     evidence: tuple[DependencyEvidence, ...] = ()
     binding: Optional[dict[str, Any]] = None
     diagnostics: tuple[dict[str, Any], ...] = ()
+    snapshot_digest: Optional[str] = None
+    link_version: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -4286,6 +4372,8 @@ class DependencyResolution:
             "evidence": [item.as_dict() for item in self.evidence],
             "binding": self.binding,
             "diagnostics": list(self.diagnostics),
+            "snapshot_digest": self.snapshot_digest,
+            "link_version": self.link_version,
         }
 
 
@@ -4335,6 +4423,33 @@ def _decode_dependency_metadata(raw: Any) -> dict[str, Any]:
     return validate_dependency_metadata(parsed)
 
 
+def _dependency_edge_identity(
+    parent_id: str,
+    child_id: str,
+    kind: str,
+    provider_name: Optional[str],
+    metadata: Mapping[str, Any],
+) -> str:
+    payload = json.dumps(
+        {
+            "parent_id": parent_id,
+            "child_id": child_id,
+            "dependency_kind": kind,
+            "provider_name": provider_name,
+            "metadata": metadata or None,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _dependency_metadata_digest(metadata: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(metadata or {}, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def resolve_task_dependencies(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4358,12 +4473,20 @@ def resolve_task_dependencies(
             ),
         )
     rows = conn.execute(
-        "SELECT parent_id, child_id, dependency_kind, provider_name, metadata "
-        "FROM task_links WHERE child_id = ? ORDER BY parent_id",
+        "SELECT parent_id, child_id, dependency_kind, provider_name, metadata, "
+        "edge_identity, link_version FROM task_links WHERE child_id = ? "
+        "ORDER BY parent_id",
         (task_id,),
     ).fetchall()
+    snapshot_payload = [dict(row) for row in rows]
+    snapshot_digest = hashlib.sha256(
+        json.dumps(snapshot_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    snapshot_version = max((int(row["link_version"] or 1) for row in rows), default=0)
     if not rows:
-        return DependencyResolution(satisfied=True)
+        return DependencyResolution(
+            satisfied=True, snapshot_digest=snapshot_digest, link_version=snapshot_version
+        )
 
     evidence: list[DependencyEvidence] = []
     provider_bindings: list[dict[str, Any]] = []
@@ -4516,6 +4639,8 @@ def resolve_task_dependencies(
                 workspace_base=workspace_base,
                 metadata=link_metadata,
                 diagnostics=edge_diagnostics,
+                edge_identity=row["edge_identity"],
+                link_version=row["link_version"],
             )
         )
         if edge_status != "satisfied":
@@ -4555,6 +4680,8 @@ def resolve_task_dependencies(
         evidence=tuple(evidence),
         binding=binding,
         diagnostics=tuple(aggregate_diagnostics),
+        snapshot_digest=snapshot_digest,
+        link_version=snapshot_version,
     )
 
 
@@ -4577,7 +4704,8 @@ def list_dependency_links(
     """Return typed link storage without exposing the SQLite connection."""
     _dependency_board(conn, board)
     rows = conn.execute(
-        "SELECT parent_id, child_id, dependency_kind, provider_name, metadata "
+        "SELECT parent_id, child_id, dependency_kind, provider_name, metadata, "
+        "metadata_digest, edge_identity, link_version "
         "FROM task_links WHERE child_id = ? ORDER BY parent_id",
         (task_id,),
     ).fetchall()
@@ -4594,6 +4722,9 @@ def list_dependency_links(
                 "dependency_kind": row["dependency_kind"] or "completion",
                 "provider_name": row["provider_name"],
                 "metadata": metadata,
+                "metadata_digest": row["metadata_digest"],
+                "edge_identity": row["edge_identity"],
+                "link_version": row["link_version"],
             }
         )
     return output
@@ -4647,21 +4778,11 @@ def link_tasks(
                     "dependency link binding is immutable; unlink it before "
                     "creating a different binding"
                 )
-            dependency_resolution = resolve_task_dependencies(
-                conn,
-                child_id,
-                board=board_slug,
-            )
-            if not dependency_resolution.satisfied:
-                conn.execute(
-                    "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
-                    (child_id,),
-                )
             return
         conn.execute(
             "INSERT INTO task_links "
-            "(parent_id, child_id, dependency_kind, provider_name, metadata) "
-            "VALUES (?, ?, ?, ?, ?) "
+            "(parent_id, child_id, dependency_kind, provider_name, metadata, "
+            "metadata_digest, edge_identity, link_version) VALUES (?, ?, ?, ?, ?, ?, ?, 1) "
             "ON CONFLICT(parent_id, child_id) DO NOTHING",
             (
                 parent_id,
@@ -4669,21 +4790,12 @@ def link_tasks(
                 dependency_kind,
                 provider_name,
                 json.dumps(safe_metadata, sort_keys=True) if safe_metadata else None,
+                _dependency_metadata_digest(safe_metadata),
+                _dependency_edge_identity(
+                    parent_id, child_id, dependency_kind, provider_name, safe_metadata,
+                ),
             ),
         )
-        # Reuse the canonical resolver rather than special-casing completion
-        # links here.  This keeps typed-link updates and claim/readiness
-        # decisions in lockstep.
-        dependency_resolution = resolve_task_dependencies(
-            conn,
-            child_id,
-            board=board_slug,
-        )
-        if not dependency_resolution.satisfied:
-            conn.execute(
-                "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
-                (child_id,),
-            )
         _append_event(
             conn, child_id, "linked",
             {
@@ -4695,6 +4807,13 @@ def link_tasks(
             },
         )
         _inherit_notify_subs(conn, child_id, (parent_id,))
+    dependency_resolution = resolve_task_dependencies(conn, child_id, board=board_slug)
+    if not dependency_resolution.satisfied:
+        with write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+                (child_id,),
+            )
 
 
 def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
@@ -5332,65 +5451,53 @@ def recompute_ready(
         failure_limit = DEFAULT_FAILURE_LIMIT
     board_slug = _dependency_board(conn, board)
     promoted = 0
-    with write_txn(conn):
-        todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries, "
-            "       recovery_required "
-            "FROM tasks WHERE status IN ('todo', 'blocked', 'ready')"
-        ).fetchall()
-        for row in todo_rows:
-            task_id = row["id"]
-            cur_status = row["status"]
-            if bool(row["recovery_required"]):
+    rows = conn.execute(
+        "SELECT id, status, consecutive_failures, max_retries, recovery_required "
+        "FROM tasks WHERE status IN ('todo', 'blocked', 'ready')"
+    ).fetchall()
+    for row in rows:
+        task_id = row["id"]
+        cur_status = row["status"]
+        if bool(row["recovery_required"]):
+            continue
+        if cur_status == "blocked" and _has_sticky_block(conn, task_id):
+            # Worker / operator asked for human review — do not silently
+            # auto-recover. ``unblock_task`` is the only legitimate exit.
+            continue
+        # Provider execution must remain outside the board write transaction.
+        resolution = resolve_task_dependencies(conn, task_id, board=board_slug)
+        with write_txn(conn):
+            current = conn.execute(
+                "SELECT status, consecutive_failures, max_retries, recovery_required "
+                "FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if not current or bool(current["recovery_required"]):
                 continue
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Worker / operator asked for human review — do not
-                # silently auto-recover.  ``unblock_task`` is the only
-                # legitimate exit (it emits ``"unblocked"`` which flips
-                # this predicate back).
-                continue
-            dependency_resolution = resolve_task_dependencies(
-                conn,
-                task_id,
-                board=board_slug,
-            )
-            if not dependency_resolution.satisfied:
-                # A provider may change after a previous sweep.  Ready is
-                # therefore not a durable authorization; demote it just as
-                # claim_task does, keeping readback and admission honest.
-                if cur_status == "ready":
-                    conn.execute(
-                        "UPDATE tasks SET status = 'todo' "
-                        "WHERE id = ? AND status = 'ready'",
-                        (task_id,),
-                    )
-                continue
-            if cur_status == "ready":
-                continue
-            if cur_status == "blocked":
-                # Don't auto-recover tasks that have hit the circuit-breaker
-                # failure limit.  The counter must accumulate across recovery
-                # cycles rather than resetting on every promotion.
-                failures = int(row["consecutive_failures"] or 0)
-                task_limit = row["max_retries"]
-                effective_limit = (
-                    int(task_limit) if task_limit is not None
-                    else int(failure_limit)
+            if not resolution.satisfied:
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+                    (task_id,),
                 )
-                if failures >= effective_limit:
+                continue
+            status = current["status"]
+            if status == "ready":
+                continue
+            if status == "blocked":
+                limit = int(
+                    current["max_retries"]
+                    if current["max_retries"] is not None
+                    else failure_limit
+                )
+                if int(current["consecutive_failures"] or 0) >= limit:
                     continue
-                conn.execute(
-                    "UPDATE tasks SET status = 'ready' "
-                    "WHERE id = ? AND status = 'blocked'",
-                    (task_id,),
-                )
-            else:
-                conn.execute(
-                    "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
-                    (task_id,),
-                )
-            _append_event(conn, task_id, "promoted", None)
-            promoted += 1
+            cur = conn.execute(
+                "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = ?",
+                (task_id, status),
+            )
+            if cur.rowcount:
+                _append_event(conn, task_id, "promoted", None)
+                promoted += 1
     return promoted
 
 
@@ -5425,6 +5532,9 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     board_slug = _dependency_board(conn, board)
+    dependency_resolution = resolve_task_dependencies(
+        conn, task_id, board=board_slug,
+    )
     with write_txn(conn):
         task_guard = conn.execute(
             "SELECT recovery_required FROM tasks WHERE id=?", (task_id,)
@@ -5439,11 +5549,22 @@ def claim_task(
         # 'todo' here — recompute_ready will re-promote when the parents
         # actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        dependency_resolution = resolve_task_dependencies(
-            conn,
-            task_id,
-            board=board_slug,
-        )
+        snapshot_rows = conn.execute(
+            "SELECT parent_id, child_id, dependency_kind, provider_name, metadata, "
+            "edge_identity, link_version FROM task_links WHERE child_id = ? "
+            "ORDER BY parent_id",
+            (task_id,),
+        ).fetchall()
+        current_digest = hashlib.sha256(
+            json.dumps([dict(row) for row in snapshot_rows], sort_keys=True,
+                       separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if current_digest != dependency_resolution.snapshot_digest:
+            dependency_resolution = DependencyResolution(
+                satisfied=False,
+                diagnostics=({"reason": "dependency_snapshot_drift"},),
+                snapshot_digest=current_digest,
+            )
         if not dependency_resolution.satisfied:
             conn.execute(
                 "UPDATE tasks SET status = 'todo' "

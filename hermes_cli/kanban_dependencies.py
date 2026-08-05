@@ -14,10 +14,17 @@ from __future__ import annotations
 import json
 import logging
 import math
-import multiprocessing
+import os
+import pathlib
 import re
+import selectors
+import signal
+import subprocess
+import sys
 import threading
 import time
+import dataclasses
+import itertools
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional
@@ -34,6 +41,7 @@ MAX_METADATA_STRING = 1024
 MAX_NAME_LENGTH = 96
 MAX_GENERATION_LENGTH = 256
 MAX_PROVIDER_TIMEOUT_SECONDS = 30.0
+MAX_BYTES = 64 * 1024
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}$")
 _OBJECT_ID_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 _BOARD_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -280,14 +288,21 @@ class _RegisteredProvider:
     callback: Callable[[KanbanDependencyContext], Any]
     timeout_seconds: float
     owner: str
+    module: str
+    qualname: str
+    pythonpath: tuple[str, ...]
+    module_file: str
 
 
 _PROVIDER_LOCK = threading.RLock()
 _PROVIDERS: dict[tuple[str, str], _RegisteredProvider] = {}
 _ACTIVE_INVOCATIONS: dict[
     tuple[str, str],
-    dict[int, tuple[Any, threading.Event]],
+    dict[int, tuple[subprocess.Popen[bytes], threading.Event]],
 ] = {}
+_GLOBAL_ADMISSION = threading.BoundedSemaphore(8)
+_PROVIDER_ADMISSION: dict[tuple[str, str], threading.BoundedSemaphore] = {}
+_INVOCATION_IDS = itertools.count(1)
 
 
 def register_kanban_dependency_provider(
@@ -308,6 +323,22 @@ def register_kanban_dependency_provider(
     name = _validate_name(provider_name, "provider_name")
     if not callable(callback):
         raise ValueError("dependency provider callback must be callable")
+    module_name = getattr(callback, "__module__", None)
+    qualname = getattr(callback, "__qualname__", None)
+    if (
+        not isinstance(module_name, str)
+        or not isinstance(qualname, str)
+        or "<locals>" in qualname
+        or getattr(callback, "__self__", None) is not None
+        or getattr(callback, "__name__", "").startswith("<")
+    ):
+        raise ValueError(
+            "dependency provider callback must be an importable module-level callable"
+        )
+    module = sys.modules.get(module_name)
+    module_file = getattr(module, "__file__", None)
+    if not module_file:
+        raise ValueError("dependency provider module must have an importable file")
     try:
         timeout = float(timeout_seconds)
     except (TypeError, ValueError) as exc:
@@ -321,6 +352,14 @@ def register_kanban_dependency_provider(
     with _PROVIDER_LOCK:
         if key in _PROVIDERS:
             existing = _PROVIDERS[key]
+            if (
+                existing.owner == provider_owner
+                and existing.module == module_name
+                and existing.qualname == qualname
+                and existing.module_file == str(pathlib.Path(module_file).resolve())
+                and existing.timeout_seconds == timeout
+            ):
+                return
             raise ValueError(
                 f"dependency provider {kind}/{name} is already registered by {existing.owner!r}"
             )
@@ -330,22 +369,44 @@ def register_kanban_dependency_provider(
             callback=callback,
             timeout_seconds=timeout,
             owner=provider_owner,
+            module=module_name,
+            qualname=qualname,
+            pythonpath=tuple(dict.fromkeys((
+                str(pathlib.Path(module_file).resolve().parent),
+                str(pathlib.Path(module_file).resolve().parents[1]),
+            ))),
+            module_file=str(pathlib.Path(module_file).resolve()),
         )
+        _PROVIDER_ADMISSION.setdefault(key, threading.BoundedSemaphore(2))
 
 
 def _stop_process(process: Any) -> None:
     """Terminate and reap one provider helper without leaving a child behind."""
+    if process is None:
+        return
     try:
-        if process.is_alive():
-            process.terminate()
-            process.join(timeout=0.5)
-        if process.is_alive():
-            killer = getattr(process, "kill", process.terminate)
-            killer()
-            process.join(timeout=0.5)
+        if process.poll() is None:
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            else:
+                process.terminate()
+            try:
+                process.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                if os.name == "posix":
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    process.kill()
+                process.wait(timeout=1.0)
         else:
-            process.join(timeout=0)
-    except (AssertionError, OSError):
+            process.wait(timeout=0)
+    except (OSError, subprocess.TimeoutExpired):
         # A process that failed during start or was already reaped is not a
         # lifecycle leak.  There is no useful recovery at this layer.
         return
@@ -421,6 +482,11 @@ def _unknown(reason: str) -> KanbanDependencyResult:
 
 
 def _thaw(value: Any) -> Any:
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {
+            field.name: _thaw(getattr(value, field.name))
+            for field in dataclasses.fields(value)
+        }
     if isinstance(value, Mapping):
         return {str(key): _thaw(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
@@ -437,98 +503,91 @@ def _provider_context_payload(context: KanbanDependencyContext) -> dict[str, Any
     }
 
 
-def _provider_process_entry(
-    callback: Callable[[KanbanDependencyContext], Any],
-    context_payload: Mapping[str, Any],
-    sender: Any,
-) -> None:
-    """Run one callback in a killable helper and send only validated JSON."""
-    try:
-        context = KanbanDependencyContext(
-            board=context_payload["board"],
-            task=context_payload["task"],
-            link=context_payload["link"],
-            parent=context_payload["parent"],
-        )
-        try:
-            raw_result = callback(context)
-        except BaseException:
-            envelope = {"outcome": "exception"}
-        else:
-            try:
-                result = normalize_dependency_result(raw_result)
-            except BaseException:
-                envelope = {"outcome": "malformed"}
-            else:
-                envelope = {
-                    "outcome": "ok",
-                    "result": _thaw(result.as_dict()),
-                }
-    except BaseException as exc:  # plugin code must never break Kanban
-        envelope = {"outcome": "exception"}
-    try:
-        sender.send_bytes(
-            json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        )
-    except (BrokenPipeError, EOFError, OSError):
-        pass
-    finally:
-        sender.close()
-
-
-def _provider_process_context() -> Any:
-    try:
-        return multiprocessing.get_context("fork")
-    except (AttributeError, ValueError):
-        return multiprocessing.get_context("spawn")
-
-
 def _run_provider_process(
     key: tuple[str, str],
     provider: _RegisteredProvider,
     context: KanbanDependencyContext,
 ) -> KanbanDependencyResult:
-    process_context = _provider_process_context()
-    receiver, sender = process_context.Pipe(duplex=False)
-    process = process_context.Process(
-        target=_provider_process_entry,
-        args=(provider.callback, _provider_context_payload(context), sender),
-        name=f"kanban-provider-{key[0]}-{key[1]}",
-        daemon=True,
+    request_deadline = time.monotonic() + provider.timeout_seconds
+    request = json.dumps(
+        {"module": provider.module, "module_file": provider.module_file,
+         "qualname": provider.qualname,
+         "context": _provider_context_payload(context)},
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    if len(request) > MAX_BYTES:
+        return _unknown("provider_request_too_large")
+    env = {
+        name: value for name, value in os.environ.items()
+        if name in {
+            "HERMES_HOME", "HERMES_PROFILE", "HERMES_KANBAN_HOME",
+            "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD",
+            "HERMES_KANBAN_WORKSPACES_ROOT", "TZ", "LANG", "LC_ALL",
+        }
+    }
+    repo_root = str(pathlib.Path(__file__).resolve().parents[1])
+    env["PYTHONPATH"] = os.pathsep.join(
+        dict.fromkeys((repo_root, *provider.pythonpath))
     )
+    env["PYTHONUNBUFFERED"] = "1"
+    process: Optional[subprocess.Popen[bytes]] = None
     cancelled = threading.Event()
-    invocation_id = id(process)
+    invocation_id = next(_INVOCATION_IDS)
+    admission = _PROVIDER_ADMISSION[key]
+    if not _GLOBAL_ADMISSION.acquire(
+        timeout=max(0.0, request_deadline - time.monotonic())
+    ):
+        return _unknown("provider_busy")
+    if not admission.acquire(
+        timeout=max(0.0, request_deadline - time.monotonic())
+    ):
+        _GLOBAL_ADMISSION.release()
+        return _unknown("provider_busy")
     try:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "hermes_cli.kanban_provider_worker"],
+            cwd=repo_root,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            start_new_session=(os.name == "posix"),
+        )
         with _PROVIDER_LOCK:
             if _PROVIDERS.get(key) is not provider:
                 return _unknown("provider_unavailable")
-            try:
-                process.start()
-            except BaseException:
-                return _unknown("provider_unavailable")
             _ACTIVE_INVOCATIONS.setdefault(key, {})[invocation_id] = (process, cancelled)
-        sender.close()
-        deadline = time.monotonic() + provider.timeout_seconds
-        raw_message: Optional[bytes] = None
-        while True:
+        assert process.stdin is not None
+        process.stdin.write(request)
+        process.stdin.close()
+        deadline = request_deadline
+        output = bytearray()
+        selector: Optional[selectors.BaseSelector] = selectors.DefaultSelector()
+        assert process.stdout is not None
+        os.set_blocking(process.stdout.fileno(), False)
+        selector.register(process.stdout, selectors.EVENT_READ)
+        while time.monotonic() < deadline:
             if cancelled.is_set():
                 return _unknown("provider_unavailable")
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return _unknown("provider_timeout")
-            try:
-                if receiver.poll(min(remaining, 0.05)):
-                    raw_message = receiver.recv_bytes()
-                    break
-            except (EOFError, OSError):
-                if not process.is_alive():
-                    return _unknown("provider_unavailable")
-            if not process.is_alive() and not receiver.poll():
-                return _unknown("provider_unavailable")
-        if raw_message is None:
-            return _unknown("provider_malformed_result")
+            events = selector.select(min(remaining, 0.05))
+            for stream, _ in events:
+                chunk = stream.fileobj.read(8192)
+                if chunk:
+                    output.extend(chunk)
+                    if len(output) > MAX_BYTES:
+                        return _unknown("provider_output_too_large")
+                else:
+                    selector.unregister(stream.fileobj)
+            if process.poll() is not None and not selector.get_map():
+                break
+        else:
+            return _unknown("provider_timeout")
+        if not output:
+            return _unknown("provider_unavailable")
         try:
-            envelope = json.loads(raw_message.decode("utf-8"))
+            envelope = json.loads(bytes(output).decode("utf-8"))
         except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
             return _unknown("provider_malformed_result")
         if not isinstance(envelope, Mapping):
@@ -550,8 +609,11 @@ def _run_provider_process(
         except Exception:
             return _unknown("provider_malformed_result")
     finally:
-        receiver.close()
-        sender.close()
+        try:
+            if selector is not None:
+                selector.close()
+        except UnboundLocalError:
+            pass
         _stop_process(process)
         with _PROVIDER_LOCK:
             active = _ACTIVE_INVOCATIONS.get(key)
@@ -559,6 +621,8 @@ def _run_provider_process(
                 active.pop(invocation_id, None)
                 if not active:
                     _ACTIVE_INVOCATIONS.pop(key, None)
+        admission.release()
+        _GLOBAL_ADMISSION.release()
 
 
 def evaluate_kanban_dependency_provider(
@@ -567,6 +631,14 @@ def evaluate_kanban_dependency_provider(
     context: KanbanDependencyContext,
 ) -> KanbanDependencyResult:
     """Invoke a provider with a hard timeout and fail closed on every fault."""
+    # All official CLI and dispatcher paths converge here. Discovery is
+    # idempotent and failure-isolated by PluginManager; a broken optional
+    # plugin must not remove ordinary completion edges.
+    try:
+        from hermes_cli.plugins import _ensure_plugins_discovered
+        _ensure_plugins_discovered()
+    except Exception:
+        pass
     if not isinstance(context, KanbanDependencyContext):
         return _unknown("provider_context_invalid")
     try:
@@ -579,7 +651,11 @@ def evaluate_kanban_dependency_provider(
     if provider is None:
         return _unknown("provider_unavailable")
 
-    return _run_provider_process((kind, name), provider, context)
+    try:
+        return _run_provider_process((kind, name), provider, context)
+    except Exception:
+        _log.debug("Kanban dependency provider process failed", exc_info=True)
+        return _unknown("provider_unavailable")
 
 
 __all__ = [

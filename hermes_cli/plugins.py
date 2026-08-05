@@ -1949,8 +1949,46 @@ class PluginManager:
         unregister_kanban_dependency_providers(
             owner=loaded.manifest.key or loaded.manifest.name,
         )
-        self._plugins.pop(found_key, None)
+        plugin_name = loaded.manifest.name
         module = loaded.module
+        module_name = getattr(module, "__name__", "") if loaded.module else ""
+
+        def owned(callback: Any) -> bool:
+            callback_module = getattr(callback, "__module__", "")
+            return bool(module_name and (
+                callback_module == module_name
+                or callback_module.startswith(module_name + ".")
+            ))
+
+        # Remove every surface attributed to this module, not only the typed
+        # provider. This is deliberately ledger-based and leaves registrations
+        # belonging to other plugins untouched.
+        for hook_name in list(self._hooks):
+            self._hooks[hook_name] = [cb for cb in self._hooks[hook_name] if not owned(cb)]
+            if not self._hooks[hook_name]:
+                self._hooks.pop(hook_name, None)
+        for kind in list(self._middleware):
+            self._middleware[kind] = [cb for cb in self._middleware[kind] if not owned(cb)]
+            if not self._middleware[kind]:
+                self._middleware.pop(kind, None)
+        for name, entry in list(self._plugin_commands.items()):
+            if entry.get("plugin") == plugin_name or owned(entry.get("handler")):
+                self._plugin_commands.pop(name, None)
+        for name, entry in list(self._cli_commands.items()):
+            if entry.get("plugin") == plugin_name or owned(entry.get("handler_fn")):
+                self._cli_commands.pop(name, None)
+        self._slack_action_handlers[:] = [
+            item for item in self._slack_action_handlers
+            if not (len(item) >= 3 and item[2] == plugin_name)
+            and not (len(item) >= 2 and owned(item[1]))
+        ]
+        for tool_name in loaded.tools_registered:
+            try:
+                from tools.registry import registry
+                registry.deregister(tool_name)
+            except Exception:
+                logger.debug("failed to deregister plugin tool %s", tool_name, exc_info=True)
+        self._plugins.pop(found_key, None)
         if module is not None:
             sys.modules.pop(module.__name__, None)
         return True
