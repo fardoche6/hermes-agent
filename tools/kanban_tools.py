@@ -877,6 +877,8 @@ def _handle_block(args: dict, **kw) -> str:
                 reason=reason,
                 kind=kind,
                 expected_run_id=_worker_run_id(tid),
+                expected_assignee=os.environ.get("HERMES_PROFILE"),
+                expected_claim=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"),
             )
             if not ok:
                 return tool_error(

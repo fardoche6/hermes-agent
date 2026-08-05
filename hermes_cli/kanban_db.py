@@ -6802,6 +6802,8 @@ def _try_direct_review_required_handoff(
     *,
     reason: str,
     expected_run_id: Optional[int],
+    expected_assignee: Optional[str],
+    expected_claim: Optional[str],
 ) -> tuple[bool, bool, Optional[int]]:
     """Route a live programmer handoff before dependency auto-promotion.
 
@@ -6828,11 +6830,17 @@ def _try_direct_review_required_handoff(
     # Only a dispatcher-scoped worker can perform the immediate handoff.  The
     # uncredentialed/operator API keeps the legacy parked dependency shape so
     # existing reconciliation and dry-run behavior remain intact.
-    if expected_run_id is None:
+    if expected_run_id is None or not expected_assignee or not expected_claim:
         return False, False, None
     if row["status"] != "running" or not current or not current.startswith("programmer"):
         return False, False, None
-    if expected_run_id is not None and row["current_run_id"] != int(expected_run_id):
+    # The row is only a comparison target.  Credentials passed into the CAS
+    # transition must come from the caller, never be recovered from SQLite.
+    if _canonical_assignee(expected_assignee) != current:
+        return False, False, None
+    if row["claim_lock"] != expected_claim:
+        return False, False, None
+    if row["current_run_id"] != int(expected_run_id):
         return False, False, None
     if not row["claim_lock"] or not row["current_run_id"]:
         return False, False, None
@@ -6844,10 +6852,10 @@ def _try_direct_review_required_handoff(
         conn,
         task_id,
         reviewer,
-        expected_assignee=current,
+        expected_assignee=expected_assignee,
         expected_status="running",
-        expected_claim=row["claim_lock"],
-        expected_run_id=row["current_run_id"],
+        expected_claim=expected_claim,
+        expected_run_id=expected_run_id,
         handoff_reason=reason,
     )
     if submitted is None:
@@ -6934,6 +6942,8 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    expected_assignee: Optional[str] = None,
+    expected_claim: Optional[str] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -6972,6 +6982,8 @@ def block_task(
             task_id,
             reason=str(reason or ""),
             expected_run_id=expected_run_id,
+            expected_assignee=expected_assignee,
+            expected_claim=expected_claim,
         )
         if handled:
             if transitioned:

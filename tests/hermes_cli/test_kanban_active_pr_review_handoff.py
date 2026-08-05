@@ -168,6 +168,8 @@ def test_review_required_block_routes_directly_and_is_idempotent(
             kind="dependency",
             reason="review-required: implementation is ready",
             expected_run_id=implementation_run_id,
+            expected_assignee=implementation.assignee,
+            expected_claim=implementation.claim_lock,
         ) is True
 
         review = kb.get_task(conn, task_id)
@@ -361,6 +363,8 @@ def test_review_handoff_does_not_bypass_unfinished_parents(
             conn, child_id, kind="dependency",
             reason="review-required: needs sign-off",
             expected_run_id=implementation.current_run_id,
+            expected_assignee=implementation.assignee,
+            expected_claim=implementation.claim_lock,
         ) is True
         # A parent edge can be added while the implementation worker is
         # already running; the direct handoff must re-check it before review.

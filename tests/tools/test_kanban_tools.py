@@ -234,14 +234,10 @@ def test_block_happy_path(worker_env):
         conn.close()
 
 
-def test_review_required_block_handler_routes_same_card_to_reviewer(
-    monkeypatch, tmp_path,
-):
-    """The worker-facing block tool performs the authenticated review handoff."""
+def _make_review_required_worker(monkeypatch, tmp_path):
     from pathlib import Path as _Path
     from hermes_cli import kanban_db as kb
     from hermes_cli import profiles
-    from tools import kanban_tools as kt
 
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -269,6 +265,16 @@ def test_review_required_block_handler_routes_same_card_to_reviewer(
     monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
     monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claimed.claim_lock)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
+    return kb, task_id, run
+
+
+def test_review_required_block_handler_routes_same_card_to_reviewer(
+    monkeypatch, tmp_path,
+):
+    """The worker-facing block tool performs the authenticated review handoff."""
+    from tools import kanban_tools as kt
+
+    kb, task_id, run = _make_review_required_worker(monkeypatch, tmp_path)
 
     first = json.loads(kt._handle_block({
         "kind": "dependency",
@@ -312,6 +318,54 @@ def test_review_required_block_handler_routes_same_card_to_reviewer(
         assert conn.execute(
             "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (task_id,),
         ).fetchone()[0] == before_runs
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "credential_state",
+    ("missing_profile", "stale_profile", "missing_claim", "stale_claim"),
+)
+def test_review_required_block_handler_bad_credentials_stays_parked(
+    monkeypatch, tmp_path, credential_state,
+):
+    """Review routing must require the caller's live profile and claim."""
+    from tools import kanban_tools as kt
+
+    kb, task_id, run = _make_review_required_worker(monkeypatch, tmp_path)
+    if credential_state == "missing_profile":
+        monkeypatch.delenv("HERMES_PROFILE")
+    elif credential_state == "stale_profile":
+        monkeypatch.setenv("HERMES_PROFILE", "programmer-stale")
+    elif credential_state == "missing_claim":
+        monkeypatch.delenv("HERMES_KANBAN_CLAIM_LOCK")
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "stale-claim")
+
+    out = json.loads(kt._handle_block({
+        "kind": "dependency",
+        "reason": "review-required: implementation is ready",
+    }))
+    assert out["ok"] is True
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "todo"
+        assert task.assignee == "programmer"
+        events = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id=? ORDER BY id",
+            (task_id,),
+        ).fetchall()
+        assert [row["kind"] for row in events][-1:] == ["dependency_wait"]
+        assert "submitted_for_review" not in [row["kind"] for row in events]
+        implementation_run = conn.execute(
+            "SELECT outcome, ended_at FROM task_runs WHERE id=?",
+            (run.id,),
+        ).fetchone()
+        assert implementation_run["outcome"] == "blocked"
+        assert implementation_run["ended_at"] is not None
     finally:
         conn.close()
 
