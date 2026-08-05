@@ -4624,30 +4624,30 @@ def _authoritative_reviewer(
     conn: sqlite3.Connection, task_id: str,
 ) -> Optional[str]:
     """Resolve reviewer ownership from the latest review-lane generation."""
-    for row in conn.execute(
+    row = conn.execute(
         "SELECT kind, payload FROM task_events WHERE task_id=? "
         "AND kind IN ('submitted_for_review', 'review_failover') "
-        "ORDER BY id DESC",
+        "ORDER BY id DESC LIMIT 1",
         (task_id,),
-    ):
-        try:
-            payload = json.loads(row["payload"]) if row["payload"] else {}
-        except (TypeError, ValueError):
-            payload = {}
-        if not isinstance(payload, dict):
-            continue
-        candidate = (
-            payload.get("next_reviewer")
-            if row["kind"] == "review_failover"
-            else payload.get("reviewer")
-        )
-        try:
-            reviewer = _canonical_assignee(candidate if isinstance(candidate, str) else None)
-        except (TypeError, ValueError):
-            return None
-        if reviewer:
-            return reviewer
-    return None
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    candidate = (
+        payload.get("next_reviewer")
+        if row["kind"] == "review_failover"
+        else payload.get("reviewer")
+    )
+    try:
+        reviewer = _canonical_assignee(candidate if isinstance(candidate, str) else None)
+    except (TypeError, ValueError):
+        return None
+    return reviewer or None
 
 
 def _active_review_generation(

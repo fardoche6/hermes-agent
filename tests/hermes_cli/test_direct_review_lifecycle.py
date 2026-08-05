@@ -328,6 +328,78 @@ def test_malformed_latest_review_authority_fails_closed(kanban_home, kind, paylo
 
 
 @pytest.mark.parametrize("kind", ["request_changes", "approve"])
+@pytest.mark.parametrize("trusted", [False, True])
+@pytest.mark.parametrize(
+    "payload",
+    ["not-json", "[]", "{}", '{"other": "missing"}',
+     '{"reviewer": ""}', '{"reviewer": 42}', '{"reviewer": "   "}'],
+)
+def test_newer_malformed_review_authority_overrides_valid_history(
+    kanban_home, kind, trusted, payload,
+):
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        kb._append_event(
+            conn, task_id, "submitted_for_review", {"reviewer": "code-reviewer"},
+            run_id=review.current_run_id,
+        )
+        newer = conn.execute(
+            "SELECT id FROM task_events WHERE task_id=? "
+            "AND kind='submitted_for_review' ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        assert newer is not None
+        conn.execute("UPDATE task_events SET payload=? WHERE id=?", (payload, newer["id"]))
+        conn.commit()
+        before_events = _events(conn, task_id)
+        before_runs = conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id=? ORDER BY id", (task_id,),
+        ).fetchall()
+
+        with pytest.raises(RuntimeError, match="reviewer generation|reviewer lane"):
+            _terminal_decision(conn, task_id, review, kind=kind, trusted=trusted)
+
+        _assert_no_mutation(conn, task_id, before_events, before_runs, review)
+
+
+@pytest.mark.parametrize("kind", ["request_changes", "approve"])
+def test_valid_newer_failover_recovers_from_malformed_history(kanban_home, kind):
+    with kb.connect() as conn:
+        task_id, review, host = _review_card(conn, reviewer="reviewer-a")
+        kb._append_event(
+            conn, task_id, "submitted_for_review", {"reviewer": "reviewer-a"},
+            run_id=review.current_run_id,
+        )
+        newer = conn.execute(
+            "SELECT id FROM task_events WHERE task_id=? "
+            "AND kind='submitted_for_review' ORDER BY id DESC LIMIT 1", (task_id,),
+        ).fetchone()
+        assert newer is not None
+        conn.execute(
+            "UPDATE task_events SET payload=? WHERE id=?", ("{malformed", newer["id"]),
+        )
+        conn.commit()
+        assert kb.failover_review_task(conn, task_id, "reviewer-b", error="handoff")
+        replacement = kb.claim_review_task(conn, task_id, claimer=f"{host}:replacement")
+        assert replacement is not None
+
+        if kind == "request_changes":
+            result = kb.request_changes(
+                conn, task_id, "programmer", reviewer="reviewer-b",
+                reason="valid failover decision",
+                expected_claim=replacement.claim_lock,
+                expected_run_id=replacement.current_run_id,
+            )
+        else:
+            result = kb.approve_review(
+                conn, task_id, reviewer="reviewer-b", summary="valid failover decision",
+                head_sha=HEAD_SHA, expected_claim=replacement.claim_lock,
+                expected_run_id=replacement.current_run_id,
+            )
+        assert result is not None
+
+
+@pytest.mark.parametrize("kind", ["request_changes", "approve"])
 def test_missing_latest_failover_authority_fails_closed(kanban_home, kind):
     with kb.connect() as conn:
         task_id, review, host = _review_card(conn, reviewer="reviewer-a")
