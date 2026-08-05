@@ -470,6 +470,11 @@ def _cwd_marker(session_id: str) -> str:
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
     "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_|HERMES_CRON_SESSION)"
 )
+# These markers must cross the Popen boundary for delegated-child isolation,
+# but must not cross the persistent shell-snapshot boundary.
+_SNAPSHOT_RUNTIME_EXCLUDED_ENV_NAMES: tuple[str, ...] = (
+    "HERMES_DELEGATED_CHILD_CONTEXT",
+)
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -502,10 +507,11 @@ def _export_dump_excluding_session_vars(
     # because ``unset`` with only missing names is ignored under 2>/dev/null.
     # Quote caller-provided names so malformed configuration can never become
     # shell syntax. Valid environment names remain unquoted by shlex.quote().
-    safe_names = {
+    safe_names = set(_SNAPSHOT_RUNTIME_EXCLUDED_ENV_NAMES)
+    safe_names.update(
         name for name in excluded_names
         if isinstance(name, str) and name
-    }
+    )
     extra_unset = " ".join(shlex.quote(name) for name in sorted(safe_names))
     if extra_unset:
         extra_unset = f" {extra_unset}"
@@ -806,7 +812,10 @@ class BaseEnvironment(ABC):
         # Values stay in environment memory and never enter the shell command
         # string, so secrets are not exposed through process arguments/logs.
         saved_names: list[tuple[str, str, str]] = []
-        for name in passthrough_names:
+        snapshot_preserved_names = tuple(dict.fromkeys(
+            (*passthrough_names, *_SNAPSHOT_RUNTIME_EXCLUDED_ENV_NAMES)
+        ))
+        for name in snapshot_preserved_names:
             marker = f"_HERMES_RUNTIME_PASSTHROUGH_{name}"
             present = f"{marker}_PRESENT"
             value = f"{marker}_VALUE"
