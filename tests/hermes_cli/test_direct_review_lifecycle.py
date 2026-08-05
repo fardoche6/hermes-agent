@@ -1345,3 +1345,193 @@ def test_review_heartbeat_stale_fails_over_to_alternate_reviewer(
             item["profile"] == "code-reviewer" and item["error"] == closed[0].error
             for item in attempted
         )
+
+
+# ---------------------------------------------------------------------------
+# Compatible-programmer transfer on the same card
+# ---------------------------------------------------------------------------
+
+def _make_profile(name: str) -> None:
+    """Materialize a profile directory under the temp home."""
+    (Path.home() / ".hermes" / "profiles" / name).mkdir(parents=True, exist_ok=True)
+
+
+def _request_changes(conn, task_id, review, programmer, *, reason="transfer"):
+    return kb.request_changes(
+        conn, task_id, programmer, reviewer="code-reviewer", reason=reason,
+        expected_claim=review.claim_lock, expected_run_id=review.current_run_id,
+    )
+
+
+def test_request_changes_transfers_to_compatible_programmer(kanban_home):
+    _make_profile("programmer-luna")
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+
+        corrected = _request_changes(conn, task_id, review, "programmer-luna")
+
+        assert corrected is not None
+        assert corrected.status == "ready"
+        assert corrected.assignee == "programmer-luna"
+        assert _payload(conn, task_id, "changes_requested")["programmer"] == (
+            "programmer-luna"
+        )
+
+
+def test_transfer_retry_is_idempotent_and_binds_to_replacement(kanban_home):
+    _make_profile("programmer-luna")
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        assert _request_changes(conn, task_id, review, "programmer-luna")
+        after = _events(conn, task_id)
+        runs = conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id=? ORDER BY id", (task_id,),
+        ).fetchall()
+
+        replay = _request_changes(conn, task_id, review, "programmer-luna")
+
+        assert replay is not None
+        assert replay.assignee == "programmer-luna"
+        assert _events(conn, task_id) == after
+        assert conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id=? ORDER BY id", (task_id,),
+        ).fetchall() == runs
+
+        # The retry binds to the replacement, not the original owner.
+        with pytest.raises(RuntimeError):
+            _request_changes(conn, task_id, review, "programmer")
+
+
+def test_same_owner_request_changes_still_works(kanban_home):
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+
+        corrected = _request_changes(conn, task_id, review, "programmer")
+
+        assert corrected is not None
+        assert corrected.status == "ready"
+        assert corrected.assignee == "programmer"
+        assert _payload(conn, task_id, "changes_requested")["programmer"] == (
+            "programmer"
+        )
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    ["orchestrator", "code-reviewer", "code-reviewer-b", "programmer-",
+     "programmer luna", "../programmer", "programmer/luna", "Programmer Luna"],
+)
+def test_incompatible_programmer_is_rejected_without_mutation(
+    kanban_home, candidate,
+):
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        before_events = _events(conn, task_id)
+        before_runs = conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id=? ORDER BY id", (task_id,),
+        ).fetchall()
+
+        with pytest.raises((RuntimeError, ValueError)):
+            _request_changes(conn, task_id, review, candidate)
+
+        _assert_no_mutation(conn, task_id, before_events, before_runs, review)
+        current = kb.get_task(conn, task_id)
+        assert current is not None and current.assignee == "code-reviewer"
+
+
+@pytest.mark.parametrize("candidate", ["", "   ", None])
+def test_blank_programmer_is_rejected_without_mutation(kanban_home, candidate):
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        before_events = _events(conn, task_id)
+        before_runs = conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id=? ORDER BY id", (task_id,),
+        ).fetchall()
+
+        with pytest.raises((RuntimeError, ValueError)):
+            _request_changes(conn, task_id, review, candidate)
+
+        _assert_no_mutation(conn, task_id, before_events, before_runs, review)
+
+
+def test_unknown_compatible_programmer_profile_is_rejected(kanban_home):
+    """Role-shaped but nonexistent profiles fail closed before mutation."""
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        before_events = _events(conn, task_id)
+        before_runs = conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id=? ORDER BY id", (task_id,),
+        ).fetchall()
+
+        with pytest.raises(RuntimeError):
+            _request_changes(conn, task_id, review, "programmer-ghost")
+
+        _assert_no_mutation(conn, task_id, before_events, before_runs, review)
+
+
+def test_transfer_still_requires_run_claim_and_reviewer_lane(kanban_home):
+    _make_profile("programmer-luna")
+    with kb.connect() as conn:
+        task_id, review, _ = _review_card(conn)
+        before_events = _events(conn, task_id)
+        before_runs = conn.execute(
+            "SELECT id, status, outcome, ended_at FROM task_runs "
+            "WHERE task_id=? ORDER BY id", (task_id,),
+        ).fetchall()
+
+        # Stale run id.
+        with pytest.raises(RuntimeError):
+            kb.request_changes(
+                conn, task_id, "programmer-luna", reviewer="code-reviewer",
+                reason="transfer", expected_claim=review.claim_lock,
+                expected_run_id=review.current_run_id + 991,
+            )
+        # Wrong claim.
+        with pytest.raises(RuntimeError):
+            kb.request_changes(
+                conn, task_id, "programmer-luna", reviewer="code-reviewer",
+                reason="transfer", expected_claim="someone-else:review",
+                expected_run_id=review.current_run_id,
+            )
+        # Non-reviewer caller.
+        with pytest.raises(RuntimeError):
+            kb.request_changes(
+                conn, task_id, "programmer-luna", reviewer="programmer",
+                reason="transfer", expected_claim=review.claim_lock,
+                expected_run_id=review.current_run_id,
+            )
+
+        _assert_no_mutation(conn, task_id, before_events, before_runs, review)
+
+
+def test_transferred_programmer_becomes_finalizer_after_approval(kanban_home):
+    _make_profile("programmer-luna")
+    with kb.connect() as conn:
+        task_id, review, host = _review_card(conn)
+        assert _request_changes(conn, task_id, review, "programmer-luna")
+
+        follow_up = kb.claim_task(conn, task_id, claimer=f"{host}:impl-2")
+        assert follow_up is not None
+        assert follow_up.assignee == "programmer-luna"
+        assert kb.submit_task_for_review(
+            conn, task_id, "code-reviewer", trusted_operator=True,
+        ) is not None
+        second = kb.claim_review_task(conn, task_id, claimer=f"{host}:review-2")
+        assert second is not None
+
+        assert kb._resolve_finalizer(
+            conn, task_id, reviewer="code-reviewer",
+        ) == "programmer-luna"
+
+        approved = kb.approve_review(
+            conn, task_id, reviewer="code-reviewer", summary="looks good",
+            head_sha=HEAD_SHA, expected_claim=second.claim_lock,
+            expected_run_id=second.current_run_id,
+        )
+        assert approved is not None
+        assert approved.assignee == "programmer-luna"

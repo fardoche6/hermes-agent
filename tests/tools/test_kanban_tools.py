@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -1325,6 +1326,76 @@ def test_kanban_request_changes_handler_returns_to_programmer(monkeypatch, tmp_p
             "SELECT outcome, ended_at FROM task_runs WHERE id=?",
             (review.current_run_id,),
         ).fetchone()["outcome"] == "changes_requested"
+
+
+def test_kanban_request_changes_handler_transfers_to_compatible_programmer(
+    monkeypatch, tmp_path,
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    (home / "profiles" / "programmer-luna").mkdir(parents=True)
+    from hermes_cli import kanban_db as kb
+    import tools.kanban_tools as kt
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="transfer handler", assignee="programmer")
+        assert kb.claim_task(conn, task_id) is not None
+        assert kb.submit_task_for_review(
+            conn, task_id, "code-reviewer", trusted_operator=True,
+        ) is not None
+        review = kb.claim_review_task(conn, task_id, claimer="test-host:review")
+        assert review is not None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_PROFILE", "code-reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", review.claim_lock)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+
+    result = json.loads(kt._handle_request_changes({
+        "programmer": "programmer-luna", "reason": "hand to a healthy worker",
+    }))
+
+    assert result == {
+        "ok": True, "task_id": task_id, "status": "ready",
+        "assignee": "programmer-luna",
+    }
+
+
+def test_kanban_request_changes_handler_rejects_non_programmer_role(
+    monkeypatch, tmp_path,
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    from hermes_cli import kanban_db as kb
+    import tools.kanban_tools as kt
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="reject handler", assignee="programmer")
+        assert kb.claim_task(conn, task_id) is not None
+        assert kb.submit_task_for_review(
+            conn, task_id, "code-reviewer", trusted_operator=True,
+        ) is not None
+        review = kb.claim_review_task(conn, task_id, claimer="test-host:review")
+        assert review is not None
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_PROFILE", "code-reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", review.claim_lock)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+
+    result = json.loads(kt._handle_request_changes({
+        "programmer": "orchestrator", "reason": "not allowed",
+    }))
+
+    assert result.get("ok") is not True
+    with kb.connect() as conn:
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.status == "review"
+        assert current.assignee == "code-reviewer"
+        assert current.current_run_id == review.current_run_id
 
 
 def test_kanban_approve_handler_closes_review_run_and_hands_off(

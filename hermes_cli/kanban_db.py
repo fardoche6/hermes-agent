@@ -5071,6 +5071,36 @@ def submit_task_for_review(
         return get_task(conn, task_id)
 
 
+_PROGRAMMER_ROLE = "programmer"
+_PROGRAMMER_ROLE_PREFIX = "programmer-"
+
+
+def _is_programmer_role(name: Optional[str]) -> bool:
+    """Return True when *name* satisfies the programmer-lane role contract.
+
+    The contract is deliberately narrow: the canonical profile id must be
+    exactly ``programmer`` or ``programmer-<suffix>`` with a non-empty suffix
+    that is itself a valid profile identifier.  Parsing is delegated to
+    :mod:`hermes_cli.profiles` so the DB never hand-rolls name rules; anything
+    that fails to normalize or validate (blank, whitespace, path separators,
+    reserved ids) fails closed.
+    """
+    if not isinstance(name, str):
+        return False
+    from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+    try:
+        canon = normalize_profile_name(name)
+        validate_profile_name(canon)
+    except (TypeError, ValueError):
+        return False
+    if canon == _PROGRAMMER_ROLE:
+        return True
+    if not canon.startswith(_PROGRAMMER_ROLE_PREFIX):
+        return False
+    return bool(canon[len(_PROGRAMMER_ROLE_PREFIX):])
+
+
 def request_changes(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5195,10 +5225,27 @@ def request_changes(
                 "implementation owner could be resolved"
             )
         if programmer != original_owner:
-            raise RuntimeError(
-                f"cannot request changes for {task_id}: programmer must be "
-                f"the original implementation owner {original_owner!r}"
-            )
+            # Routing a correction to a *different* worker is allowed only for
+            # a compatible programmer-lane profile that actually exists.  The
+            # same-owner path below is untouched so temp/test homes without a
+            # profile tree keep working exactly as before.
+            if not _is_programmer_role(programmer):
+                raise RuntimeError(
+                    f"cannot request changes for {task_id}: programmer "
+                    f"{programmer!r} is neither the original implementation "
+                    f"owner {original_owner!r} nor a compatible programmer "
+                    f"profile ('programmer' or 'programmer-<name>')"
+                )
+            from hermes_cli.profiles import profile_exists
+            try:
+                available = profile_exists(programmer)
+            except Exception:
+                available = False
+            if not available:
+                raise RuntimeError(
+                    f"cannot request changes for {task_id}: replacement "
+                    f"programmer profile {programmer!r} is unavailable"
+                )
 
         predicates = ["id = ?", "status IN ('review', 'running')"]
         params: list[object] = [task_id]
@@ -5223,7 +5270,7 @@ def request_changes(
             conn, task_id, outcome="changes_requested", summary=reason,
             expected_run_id=expected_run_id,
         )
-        payload: dict[str, object] = {"programmer": original_owner, "reason": reason}
+        payload: dict[str, object] = {"programmer": programmer, "reason": reason}
         if reviewer_name:
             payload["reviewer"] = reviewer_name
         _append_event(
