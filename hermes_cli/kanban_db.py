@@ -10555,6 +10555,8 @@ def _authorize_review_spawn(
             ).fetchone()
             if gate is None or gate["state"] != "attached":
                 return False
+            if expected_run_id is None or expected_authority is None:
+                return False
             if not _review_spawn_cas_matches(
                 conn,
                 task_id,
@@ -10619,6 +10621,9 @@ def _spawn_review_gate_and_attach(
     post-Popen/pre-attach window.  If attach fails, this function closes and
     reaps the child before releasing the SQLite writer lock.
     """
+    run_id = task.current_run_id
+    if run_id is None:
+        return None
     token = secrets.token_urlsafe(32)
     pid: Optional[int] = None
     handle: Optional[_ReviewLaunchGateHandle] = None
@@ -10627,7 +10632,7 @@ def _spawn_review_gate_and_attach(
             if not _review_spawn_cas_matches(
                 conn,
                 task.id,
-                expected_run_id=task.current_run_id,
+                expected_run_id=run_id,
                 expected_claim=task.claim_lock,
                 expected_assignee=task.assignee,
                 expected_authority=authority,
@@ -10651,7 +10656,7 @@ def _spawn_review_gate_and_attach(
                 "AND current_run_id=? AND claim_lock=? AND assignee=? "
                 "AND worker_pid IS NULL AND recovery_required=0",
                 (
-                    int(pid), task.id, int(task.current_run_id), task.claim_lock,
+                    int(pid), task.id, int(run_id), task.claim_lock,
                     task.assignee,
                 ),
             )
@@ -10661,7 +10666,7 @@ def _spawn_review_gate_and_attach(
                 "UPDATE task_runs SET worker_pid=? WHERE id=? AND task_id=? "
                 "AND status='running' AND ended_at IS NULL AND claim_lock=? "
                 "AND worker_pid IS NULL",
-                (int(pid), int(task.current_run_id), task.id, task.claim_lock),
+                (int(pid), int(run_id), task.id, task.claim_lock),
             )
             if run_cur.rowcount != 1:
                 raise _ReviewSpawnCASRejected
@@ -10671,7 +10676,7 @@ def _spawn_review_gate_and_attach(
                 "(task_id, run_id, claim_lock, assignee, authority_id, gate_token, "
                 "gate_pid, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'attached', ?)",
                 (
-                    task.id, int(task.current_run_id), task.claim_lock,
+                    task.id, int(run_id), task.claim_lock,
                     task.assignee, int(authority[0]), token, int(pid), now,
                 ),
             )
@@ -10682,12 +10687,12 @@ def _spawn_review_gate_and_attach(
                 {
                     "pid": int(pid),
                     "gate_token": token,
-                    "run_id": int(task.current_run_id),
+                    "run_id": int(run_id),
                     "claim_lock": task.claim_lock,
                     "assignee": task.assignee,
                     "review_authority_id": int(authority[0]),
                 },
-                run_id=int(task.current_run_id),
+                run_id=int(run_id),
             )
         return int(pid), token
     except BaseException as exc:
@@ -10717,6 +10722,9 @@ def _materialize_review_launch_workspace(
     authority: tuple[int, str],
 ) -> bool:
     """Materialize only an authorized generation, under the DB writer lock."""
+    run_id = task.current_run_id
+    if run_id is None:
+        return False
     with write_txn(conn):
         gate = conn.execute(
             "SELECT * FROM task_launch_gates WHERE task_id=? AND gate_pid=? "
@@ -10728,7 +10736,7 @@ def _materialize_review_launch_workspace(
         if not _review_spawn_cas_matches(
             conn,
             task.id,
-            expected_run_id=task.current_run_id,
+            expected_run_id=run_id,
             expected_claim=task.claim_lock,
             expected_assignee=task.assignee,
             expected_authority=authority,
@@ -10756,7 +10764,7 @@ def _materialize_review_launch_workspace(
             "AND worker_pid=? AND current_run_id=? AND claim_lock=?",
             (
                 str(actual), branch_name, task.id, int(pid),
-                int(task.current_run_id), task.claim_lock,
+                int(run_id), task.claim_lock,
             ),
         )
         conn.execute(
@@ -10774,7 +10782,7 @@ def _materialize_review_launch_workspace(
                 "path": str(actual),
                 "created": created,
             },
-            run_id=int(task.current_run_id),
+            run_id=int(run_id),
         )
         return True
 
@@ -10788,6 +10796,9 @@ def _release_review_launch(
     authority: tuple[int, str],
 ) -> bool:
     """Commit release state, then send the one-time token to the child."""
+    run_id = task.current_run_id
+    if run_id is None:
+        return False
     handle = _review_launch_handle(pid)
     if handle is None:
         return False
@@ -10802,7 +10813,7 @@ def _release_review_launch(
         if not _review_spawn_cas_matches(
             conn,
             task.id,
-            expected_run_id=task.current_run_id,
+            expected_run_id=run_id,
             expected_claim=task.claim_lock,
             expected_assignee=task.assignee,
             expected_authority=authority,
@@ -10816,7 +10827,7 @@ def _release_review_launch(
         conn.execute(
             "UPDATE tasks SET recovery_required=0, recovery_reason=NULL WHERE id=? "
             "AND worker_pid=? AND current_run_id=? AND claim_lock=?",
-            (task.id, int(pid), int(task.current_run_id), task.claim_lock),
+            (task.id, int(pid), int(run_id), task.claim_lock),
         )
         _append_event(
             conn,
@@ -10825,12 +10836,12 @@ def _release_review_launch(
             {
                 "pid": int(pid),
                 "gate_token": gate_token,
-                "run_id": int(task.current_run_id),
+                "run_id": int(run_id),
                 "claim_lock": task.claim_lock,
                 "assignee": task.assignee,
                 "review_authority_id": int(authority[0]),
             },
-            run_id=int(task.current_run_id),
+            run_id=int(run_id),
         )
         _append_event(
             conn,
@@ -10838,13 +10849,13 @@ def _release_review_launch(
             "spawned",
             {
                 "pid": int(pid),
-                "run_id": int(task.current_run_id),
+                "run_id": int(run_id),
                 "claim_lock": task.claim_lock,
                 "assignee": task.assignee,
                 "review_authority_id": int(authority[0]),
                 "launch_gate": True,
             },
-            run_id=int(task.current_run_id),
+            run_id=int(run_id),
         )
     if not handle.release():
         return False
@@ -12601,6 +12612,8 @@ def _default_spawn(
     log_path = log_dir / f"{task.id}.log"
 
     if launch_gate:
+        if launch_authority_id is None:
+            raise ValueError("launch_gate requires reviewer authority")
         gate_env = {
             "HERMES_LAUNCH_GATE_PARENT_PID": str(os.getpid()),
             "HERMES_LAUNCH_GATE_TOKEN": str(launch_token),
