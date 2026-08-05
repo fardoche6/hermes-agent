@@ -20,6 +20,7 @@ Production sequence reproduced here (SubsidySmart coding card):
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -131,6 +132,102 @@ def test_correction_recovery_after_crash_is_not_pr_guarded(
 # ---------------------------------------------------------------------------
 # Invariant 3 — documented review-required dependency handoff
 # ---------------------------------------------------------------------------
+
+def test_review_required_block_routes_directly_and_is_idempotent(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """A worker handoff must enter review before generic dependency promotion.
+
+    The reviewer list is supplied by the real profile-discovery path rather
+    than a frozen assignee list. Re-delivering the same block after the
+    reviewer claim exists must not close or demote that live review run.
+    """
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(
+        profiles,
+        "list_profiles",
+        lambda: [
+            SimpleNamespace(name="code-reviewer-a"),
+            SimpleNamespace(name="code-reviewer-b"),
+        ],
+    )
+    host = kb._claimer_id().split(":", 1)[0]
+    spawned = []
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="coding card", assignee="programmer")
+        assert kb.claim_task(conn, task_id, claimer=f"{host}:impl") is not None
+        implementation = kb.get_task(conn, task_id)
+        assert implementation is not None
+        implementation_run_id = implementation.current_run_id
+
+        assert kb.block_task(
+            conn,
+            task_id,
+            kind="dependency",
+            reason="review-required: implementation is ready",
+            expected_run_id=implementation_run_id,
+        ) is True
+
+        review = kb.get_task(conn, task_id)
+        assert review is not None
+        assert review.status == "review"
+        assert review.assignee == "code-reviewer-a"
+        assert review.claim_lock is None
+        assert review.current_run_id is None
+        events = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id=? ORDER BY id",
+            (task_id,),
+        ).fetchall()
+        assert [row["kind"] for row in events][-2:] == [
+            "dependency_wait",
+            "submitted_for_review",
+        ]
+        implementation_run = conn.execute(
+            "SELECT outcome, ended_at FROM task_runs WHERE id=?",
+            (implementation_run_id,),
+        ).fetchone()
+        assert implementation_run["outcome"] == "review_submitted"
+        assert implementation_run["ended_at"] is not None
+
+        kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: (
+                spawned.append((task.id, task.assignee)) or 4242
+            ),
+        )
+        claimed_review = kb.get_task(conn, task_id)
+        assert claimed_review is not None
+        assert spawned == [(task_id, "code-reviewer-a")]
+        live_review_run_id = claimed_review.current_run_id
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=?", (task_id,)
+        ).fetchone()[0]
+        run_count = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (task_id,)
+        ).fetchone()[0]
+
+        # A duplicate delivery cannot block the active reviewer or create a
+        # second run.
+        assert kb.block_task(
+            conn,
+            task_id,
+            kind="dependency",
+            reason="review-required: implementation is ready",
+        ) is True
+        unchanged = kb.get_task(conn, task_id)
+        assert unchanged is not None
+        assert unchanged.status == "review"
+        assert unchanged.assignee == "code-reviewer-a"
+        assert unchanged.claim_lock is not None
+        assert unchanged.current_run_id == live_review_run_id
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=?", (task_id,)
+        ).fetchone()[0] == event_count
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (task_id,)
+        ).fetchone()[0] == run_count
 
 def test_review_required_handoff_reconciles_into_review_lane(
     kanban_home, monkeypatch, all_assignees_spawnable,
@@ -257,13 +354,18 @@ def test_review_handoff_does_not_bypass_unfinished_parents(
         parent_id = kb.create_task(conn, title="parent work", assignee="programmer")
         child_id = kb.create_task(conn, title="child work", assignee="programmer")
         assert kb.claim_task(conn, child_id, claimer=f"{host}:impl") is not None
+        implementation = kb.get_task(conn, child_id)
+        assert implementation is not None
+        kb.link_tasks(conn, parent_id, child_id)
         assert kb.block_task(
             conn, child_id, kind="dependency",
             reason="review-required: needs sign-off",
+            expected_run_id=implementation.current_run_id,
         ) is True
-        kb.link_tasks(conn, parent_id, child_id)
-        # Racy writer / recompute promoted the child to generic ready while
-        # the parent is still open (the production shape).
+        # A parent edge can be added while the implementation worker is
+        # already running; the direct handoff must re-check it before review.
+        # Simulate a racy writer / recompute promoting the child to generic
+        # ready while the parent is still open (the production shape).
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (child_id,))
         conn.commit()
         assert kb.get_task(conn, parent_id).status not in ("done", "archived")

@@ -4932,6 +4932,7 @@ def submit_task_for_review(
     expected_status: Optional[str] = None,
     expected_claim: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    handoff_reason: Optional[str] = None,
     trusted_operator: bool = False,
 ) -> Optional[Task]:
     """Atomically hand an implementation run to a reviewer.
@@ -5056,6 +5057,12 @@ def submit_task_for_review(
             )
             if cur.rowcount != 1:
                 return None
+        if handoff_reason is not None:
+            _append_event(
+                conn, task_id, "dependency_wait",
+                {"reason": handoff_reason, "kind": "dependency"},
+                run_id=old_run_id,
+            )
         _append_event(
             conn, task_id, "submitted_for_review",
             {"reviewer": reviewer, "previous_assignee": row["assignee"]},
@@ -5467,6 +5474,27 @@ def _reviewer_candidates(
             continue
         compatible.append(name)
     return compatible, failures
+
+
+def _select_review_handoff_reviewer(current: Optional[str]) -> Optional[str]:
+    """Select one configured reviewer for a programmer handoff.
+
+    ``_reviewer_candidates`` is the single profile/configuration preflight for
+    the review lane.  It may include the current profile for reviewer
+    failover, so a review-required implementation handoff must explicitly
+    exclude the programmer and choose a ``code-reviewer*`` candidate.
+    """
+    current_name = _canonical_assignee(current)
+    candidates, _ = _reviewer_candidates(current)
+    for candidate in candidates:
+        reviewer = _canonical_assignee(candidate)
+        if (
+            reviewer
+            and reviewer != current_name
+            and reviewer.startswith("code-reviewer")
+        ):
+            return reviewer
+    return None
 
 
 def failover_review_task(
@@ -6768,6 +6796,70 @@ def _maybe_emit_scratch_tip(
         _mark_scratch_tip_shown()
 
 
+def _try_direct_review_required_handoff(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    expected_run_id: Optional[int],
+) -> tuple[bool, bool, Optional[int]]:
+    """Route a live programmer handoff before dependency auto-promotion.
+
+    Returns ``(handled, transitioned, run_id)``.  ``handled`` is true for an
+    already-active reviewer lane, making duplicate worker delivery a no-op;
+    ``transitioned`` is true only when this call submitted the implementation
+    run.  A missing reviewer or a parent race returns ``(False, False, None)``
+    so the existing dependency path remains the fallback and its parent gating
+    semantics stay unchanged.
+    """
+    row = conn.execute(
+        "SELECT status, assignee, claim_lock, current_run_id "
+        "FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return False, False, None
+
+    current = _canonical_assignee(row["assignee"])
+    if row["status"] == "review":
+        return True, False, None
+    if row["status"] == "running" and current and not current.startswith("programmer"):
+        return True, False, None
+    # Only a dispatcher-scoped worker can perform the immediate handoff.  The
+    # uncredentialed/operator API keeps the legacy parked dependency shape so
+    # existing reconciliation and dry-run behavior remain intact.
+    if expected_run_id is None:
+        return False, False, None
+    if row["status"] != "running" or not current or not current.startswith("programmer"):
+        return False, False, None
+    if expected_run_id is not None and row["current_run_id"] != int(expected_run_id):
+        return False, False, None
+    if not row["claim_lock"] or not row["current_run_id"]:
+        return False, False, None
+
+    reviewer = _select_review_handoff_reviewer(current)
+    if not reviewer:
+        return False, False, None
+    submitted = submit_task_for_review(
+        conn,
+        task_id,
+        reviewer,
+        expected_assignee=current,
+        expected_status="running",
+        expected_claim=row["claim_lock"],
+        expected_run_id=row["current_run_id"],
+        handoff_reason=reason,
+    )
+    if submitted is None:
+        return False, False, None
+    event = conn.execute(
+        "SELECT run_id FROM task_events WHERE task_id=? "
+        "AND kind='submitted_for_review' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return True, True, int(event["run_id"]) if event and event["run_id"] else None
+
+
 def edit_completed_task_result(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6874,6 +6966,29 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    if kind == "dependency" and str(reason or "").startswith(REVIEW_HANDOFF_PREFIX):
+        handled, transitioned, run_id = _try_direct_review_required_handoff(
+            conn,
+            task_id,
+            reason=str(reason or ""),
+            expected_run_id=expected_run_id,
+        )
+        if handled:
+            if transitioned:
+                _blocked_task = get_task(conn, task_id)
+                _fire_kanban_lifecycle_hook(
+                    "kanban_task_blocked",
+                    task_id,
+                    board=get_current_board(),
+                    assignee=_blocked_task.assignee if _blocked_task else None,
+                    run_id=run_id,
+                    reason=reason,
+                )
+                return True
+            # A repeated delivery for an already-routed review handoff must
+            # not block the active reviewer or create another run. Treat the
+            # idempotent no-op as success so the worker does not retry it.
+            return True
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(

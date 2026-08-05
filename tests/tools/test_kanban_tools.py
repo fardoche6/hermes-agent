@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 
@@ -229,6 +230,88 @@ def test_block_happy_path(worker_env):
     conn = kb.connect()
     try:
         assert kb.get_task(conn, worker_env).status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_review_required_block_handler_routes_same_card_to_reviewer(
+    monkeypatch, tmp_path,
+):
+    """The worker-facing block tool performs the authenticated review handoff."""
+    from pathlib import Path as _Path
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import profiles
+    from tools import kanban_tools as kt
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_PROFILE", "programmer")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.setattr(
+        profiles,
+        "list_profiles",
+        lambda: [SimpleNamespace(name="code-reviewer-a"), SimpleNamespace(name="code-reviewer-b")],
+    )
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="coding card", assignee="programmer")
+        claimed = kb.claim_task(conn, task_id, claimer="programmer:impl")
+        assert claimed is not None and claimed.claim_lock
+        run = kb.latest_run(conn, task_id)
+        assert run is not None
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", claimed.claim_lock)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run.id))
+
+    first = json.loads(kt._handle_block({
+        "kind": "dependency",
+        "reason": "review-required: implementation is ready",
+    }))
+    assert first["ok"] is True
+    conn = kb.connect()
+    try:
+        routed = kb.get_task(conn, task_id)
+        assert routed is not None
+        assert routed.assignee == "code-reviewer-a"
+    finally:
+        conn.close()
+
+    conn = kb.connect()
+    try:
+        before_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=?", (task_id,),
+        ).fetchone()[0]
+        before_runs = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (task_id,),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    duplicate = json.loads(kt._handle_block({
+        "kind": "dependency",
+        "reason": "review-required: implementation is ready",
+    }))
+    assert duplicate["ok"] is True
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "review"
+        assert task.assignee == "code-reviewer-a"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=?", (task_id,),
+        ).fetchone()[0] == before_events
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?", (task_id,),
+        ).fetchone()[0] == before_runs
     finally:
         conn.close()
 
