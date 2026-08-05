@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from agent.kanban_stop import (
@@ -16,6 +18,29 @@ def clear_kanban_env(monkeypatch):
     for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_STOP_NUDGE"):
         monkeypatch.delenv(var, raising=False)
     return monkeypatch
+
+
+def _tool_messages(name: str, result: object, *, call_id: str = "call-1") -> list[dict]:
+    return [
+        {"role": "user", "content": "work the kanban task"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "name": name,
+            "tool_call_id": call_id,
+            "content": json.dumps(result),
+        },
+    ]
 
 
 
@@ -50,6 +75,8 @@ def test_nudge_when_no_terminal_tool(clear_kanban_env):
     assert nudge is not None
     assert "kanban_complete" in nudge
     assert "kanban_block" in nudge
+    assert "kanban_approve" in nudge
+    assert "kanban_request_changes" in nudge
     assert "t_46be8aa5" in nudge
     assert "protocol violation" in nudge.lower() or "protocol" in nudge.lower()
 
@@ -72,6 +99,58 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
     ]
     assert session_called_kanban_terminal(messages) is True
     assert build_kanban_stop_nudge(messages=messages) is None
+
+
+@pytest.mark.parametrize("tool_name", ["kanban_approve", "kanban_request_changes"])
+def test_successful_reviewer_decision_is_terminal(clear_kanban_env, tool_name):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_review")
+    messages = _tool_messages(
+        tool_name,
+        {"ok": True, "task_id": "t_review", "status": "ready"},
+    )
+
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
+@pytest.mark.parametrize("tool_name", ["kanban_approve", "kanban_request_changes"])
+def test_rejected_reviewer_decision_is_not_terminal(clear_kanban_env, tool_name):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_review")
+    messages = _tool_messages(tool_name, {"error": "review decision rejected"})
+
+    assert session_called_kanban_terminal(messages) is False
+    assert build_kanban_stop_nudge(messages=messages) is not None
+
+
+def test_comment_only_verdict_is_not_terminal(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_review")
+    messages = _tool_messages(
+        "kanban_comment",
+        {"ok": True, "comment_id": 42, "body": "APPROVE"},
+    )
+
+    assert session_called_kanban_terminal(messages) is False
+    assert build_kanban_stop_nudge(messages=messages) is not None
+
+
+@pytest.mark.parametrize("tool_name", ["kanban_complete", "kanban_block"])
+def test_generic_complete_and_block_remain_terminal(clear_kanban_env, tool_name):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_implementation")
+    messages = _tool_messages(
+        tool_name,
+        {"ok": True, "task_id": "t_implementation", "status": "done"},
+    )
+
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
+def test_ordinary_nonterminal_call_still_nudges(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_work")
+    messages = _tool_messages("kanban_heartbeat", {"ok": True})
+
+    assert session_called_kanban_terminal(messages) is False
+    assert build_kanban_stop_nudge(messages=messages) is not None
 
 
 
