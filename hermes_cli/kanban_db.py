@@ -3641,12 +3641,12 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
 _DEPENDENCY_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,95}$")
 
 
-def _normalize_dependency_spec(
+def _materialize_dependency_spec(
     dependency_kind: Optional[str],
     provider_name: Optional[str],
     metadata: Optional[Mapping[str, Any]],
 ) -> tuple[str, Optional[str], dict[str, Any]]:
-    """Validate the generic typed-link fields shared by create/link APIs."""
+    """Canonicalize dependency fields without cross-field admission checks."""
     if dependency_kind is None:
         kind = "completion"
     elif not isinstance(dependency_kind, str):
@@ -3666,16 +3666,36 @@ def _normalize_dependency_spec(
             "provider_name must match [A-Za-z0-9][A-Za-z0-9_.:-]{0,95}"
         )
     safe_metadata = validate_dependency_metadata(metadata)
+    return kind, provider, safe_metadata
+
+
+def _validate_dependency_spec(
+    kind: str,
+    provider: Optional[str],
+    safe_metadata: Mapping[str, Any],
+) -> None:
+    """Validate dependency relationships after board admission is resolved."""
     if kind == "completion":
         if provider is not None or safe_metadata:
             raise ValueError(
                 "completion dependencies cannot carry provider_name or metadata"
             )
-        return kind, None, {}
-    if provider is None:
+    elif provider is None:
         raise ValueError(
             "non-completion dependencies require provider_name"
         )
+
+
+def _normalize_dependency_spec(
+    dependency_kind: Optional[str],
+    provider_name: Optional[str],
+    metadata: Optional[Mapping[str, Any]],
+) -> tuple[str, Optional[str], dict[str, Any]]:
+    """Canonicalize and validate generic typed-link fields."""
+    kind, provider, safe_metadata = _materialize_dependency_spec(
+        dependency_kind, provider_name, metadata,
+    )
+    _validate_dependency_spec(kind, provider, safe_metadata)
     return kind, provider, safe_metadata
 
 
@@ -4092,6 +4112,16 @@ def create_task(
     board can supply the repo and branch convention. Its literal worktree is
     never reused; the new task still gets its own task-id-keyed path.
     """
+    # Materialize every parent/dependency value before any board, project, or
+    # provider admission check.  Callers may pass a falsey custom iterable or
+    # a one-shot generator; the canonical values below are the only values
+    # used for admission, replay, validation, and link persistence.
+    parents = tuple(sorted({str(p) for p in parents if p}))
+    dependency_kind, provider_name, dependency_metadata = _materialize_dependency_spec(
+        dependency_kind,
+        provider_name,
+        dependency_metadata,
+    )
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
@@ -4104,7 +4134,7 @@ def create_task(
         not parents
         and not project_id
         and not project_source_task_id
-        and (dependency_kind is None or dependency_kind == "completion")
+        and dependency_kind == "completion"
         and provider_name is None
         and not dependency_metadata
     )
@@ -4235,11 +4265,8 @@ def create_task(
                 # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
                 project_repo = str(project_obj.primary_path)
 
-    parents = tuple(sorted({str(p) for p in parents if p}))
-    dependency_kind, provider_name, dependency_metadata = _normalize_dependency_spec(
-        dependency_kind,
-        provider_name,
-        dependency_metadata,
+    _validate_dependency_spec(
+        dependency_kind, provider_name, dependency_metadata,
     )
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
@@ -8478,6 +8505,23 @@ class _ReviewerPolicySyncResult:
     error_code: Optional[str] = None
 
 
+_REVIEWER_POLICY_VERSION_MIN = 1
+_REVIEWER_POLICY_VERSION_MAX = 2**31 - 1
+
+
+def _parse_reviewer_policy_version(raw: object) -> Optional[int]:
+    """Parse one durable policy version without coercing malformed values."""
+    if type(raw) is not int:
+        return None
+    if not (
+        _REVIEWER_POLICY_VERSION_MIN
+        <= raw
+        <= _REVIEWER_POLICY_VERSION_MAX
+    ):
+        return None
+    return raw
+
+
 def _invalid_reviewer_policy(
     error: str, *, profile: object = "", error_code: str = "invalid_value",
 ) -> _ReviewerPolicyResult:
@@ -8727,6 +8771,11 @@ def _synchronize_reviewer_policy(
             "(snapshot_read_failed)"
         )
         return _ReviewerPolicySyncResult(False, "snapshot_read_failed")
+    current_version = (
+        _parse_reviewer_policy_version(current["policy_version"])
+        if current is not None
+        else None
+    )
 
     comparable = (
         parsed.state.value,
@@ -8737,10 +8786,26 @@ def _synchronize_reviewer_policy(
         source_path_value,
         parsed.source_digest,
     )
-    if current is not None and comparable == tuple(current[key] for key in (
-        "state", "profile", "error_code", "error_detail",
-        "authority_db_path", "source_path", "source_digest",
-    )):
+    source_failure_code = (
+        parsed.error_code
+        if parsed.state is _ReviewerPolicyState.INVALID
+        else None
+    )
+    if (
+        current is not None
+        and current_version is not None
+        and comparable == tuple(current[key] for key in (
+            "state", "profile", "error_code", "error_detail",
+            "authority_db_path", "source_path", "source_digest",
+        ))
+    ):
+        if source_failure_code is not None:
+            _log.warning(
+                "kanban dispatcher: reviewer policy source is invalid "
+                "(%s)",
+                source_failure_code,
+            )
+            return _ReviewerPolicySyncResult(False, source_failure_code)
         return _ReviewerPolicySyncResult(True)
 
     if dry_run:
@@ -8763,7 +8828,17 @@ def _synchronize_reviewer_policy(
             latest = conn.execute(
                 "SELECT policy_version FROM kanban_reviewer_policy WHERE id=1"
             ).fetchone()
-            version = int(latest["policy_version"]) + 1 if latest else 1
+            latest_version = (
+                _parse_reviewer_policy_version(latest["policy_version"])
+                if latest is not None
+                else None
+            )
+            version = (
+                latest_version + 1
+                if latest_version is not None
+                and latest_version < _REVIEWER_POLICY_VERSION_MAX
+                else 1
+            )
             conn.execute(
                 """
                 INSERT INTO kanban_reviewer_policy (
@@ -8804,6 +8879,13 @@ def _synchronize_reviewer_policy(
             "(snapshot_write_failed)"
         )
         return _ReviewerPolicySyncResult(False, "snapshot_write_failed")
+    if source_failure_code is not None:
+        _log.warning(
+            "kanban dispatcher: reviewer policy source is invalid "
+            "(%s)",
+            source_failure_code,
+        )
+        return _ReviewerPolicySyncResult(False, source_failure_code)
     return _ReviewerPolicySyncResult(True)
 
 
@@ -8846,11 +8928,8 @@ def _load_reviewer_policy(conn: sqlite3.Connection) -> _ReviewerPolicyResult:
             "reviewer policy state is invalid",
             error_code="invalid_state",
         )
-    try:
-        version = int(row["policy_version"])
-    except (TypeError, ValueError):
-        version = 0
-    if version <= 0:
+    version = _parse_reviewer_policy_version(row["policy_version"])
+    if version is None:
         return _invalid_reviewer_policy(
             "reviewer policy version is invalid",
             error_code="invalid_version",
@@ -9322,6 +9401,29 @@ def release_stale_claims(
         (now, now - DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS),
     ).fetchall()
     for row in stale:
+        # A durable reviewer verdict owns this generation until its identity
+        # bound retirement path completes.  Reconciliation runs before this
+        # generic stale-claim pass, and any still-pending/retirement-fenced
+        # row is fail-closed here rather than parsed or released as ordinary
+        # stale work.
+        if (
+            _pending_review_decision(conn, row["id"]) is not None
+            or _review_decision_needs_retirement(conn, row["id"])
+        ):
+            _log.debug(
+                "kanban stale-claim release skipped pending review decision "
+                "(decision_retirement_owned)"
+            )
+            continue
+        # A heartbeat can make a row appear stale even when legacy/manual
+        # repair left its claim expiry NULL.  Do not guess that it is stale:
+        # skip with bounded evidence and let the owning lifecycle recover it.
+        if row["claim_expires"] is None:
+            _log.warning(
+                "kanban stale-claim release skipped missing claim expiry "
+                "(null_claim_expiry)"
+            )
+            continue
         lock = row["claim_lock"] or ""
         host_local = lock.startswith(host_prefix)
         hb = row["last_heartbeat_at"]
@@ -9424,26 +9526,22 @@ def release_stale_claims(
                     termination=termination,
                 )
                 continue
-        pending = _pending_review_decision(conn, row["id"])
-        if pending is not None:
-            _record_pending_decision_exit_proof(conn, pending)
-            if _finalize_pending_review_decision(conn, row["id"]) is not None:
-                continue
-            _mark_recovery_required(
-                conn,
-                row["id"],
-                row["claim_lock"],
-                reason="review decision finalization identity changed after retirement",
-                termination=termination,
+        # A decision may be recorded by a concurrent lifecycle writer
+        # after the initial read above.  The generic reclaimer still
+        # refuses ownership; the next reconciliation pass owns it.
+        if (
+            _pending_review_decision(conn, row["id"]) is not None
+            or _review_decision_needs_retirement(conn, row["id"])
+        ):
+            _log.debug(
+                "kanban stale-claim release deferred new review decision "
+                "(decision_retirement_owned)"
             )
             continue
-        if _review_decision_needs_retirement(conn, row["id"]):
-            _mark_recovery_required(
-                conn,
-                row["id"],
-                row["claim_lock"],
-                reason="review decision identity changed before stale reclaim",
-                termination=termination,
+        if row["claim_expires"] is None:
+            _log.warning(
+                "kanban stale-claim release skipped missing claim expiry "
+                "(null_claim_expiry)"
             )
             continue
         gate_to_retire = conn.execute(
@@ -9459,6 +9557,7 @@ def release_stale_claims(
                 "claim_expires = NULL, worker_pid = NULL, recovery_required=0, "
                 "recovery_reason=NULL "
                 "WHERE id = ? AND status = ? AND claim_lock IS ? "
+                "AND claim_expires IS NOT NULL "
                 "AND ("
                 "  (claim_expires IS NOT NULL AND claim_expires < ?) OR "
                 "  (last_heartbeat_at IS NOT NULL AND last_heartbeat_at <= ?)"
@@ -9494,7 +9593,10 @@ def release_stale_claims(
                     int(row["worker_pid"])
                     if row["worker_pid"] is not None else None
                 ),
-                "claim_expires": int(row["claim_expires"]),
+                "claim_expires": (
+                    int(row["claim_expires"])
+                    if row["claim_expires"] is not None else None
+                ),
                 "last_heartbeat_at": (
                     int(row["last_heartbeat_at"])
                     if row["last_heartbeat_at"] is not None else None
@@ -15276,12 +15378,24 @@ def dispatch_once(
         # cannot report a stale reviewer as admissible.
         policy_sync = _synchronize_reviewer_policy(conn, dry_run=dry_run)
         if not policy_sync.synchronized:
-            return DispatchResult(
+            result = DispatchResult(
                 policy_sync_failed=True,
                 policy_sync_error_code=(
                     policy_sync.error_code or "snapshot_sync_failed"
                 ),
             )
+            # Keep the read-only queue telemetry useful while the tick is
+            # fail-closed: these rows were not admitted, claimed, or mutated.
+            for row in conn.execute(
+                "SELECT id, assignee FROM tasks "
+                "WHERE status IN ('ready', 'review') "
+                "AND claim_lock IS NULL AND recovery_required=0"
+            ):
+                if row["assignee"] is None:
+                    result.skipped_unassigned.append(row["id"])
+                else:
+                    result.skipped_nonspawnable.append(row["id"])
+            return result
         result = _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
@@ -15351,6 +15465,10 @@ def _dispatch_once_locked(
 
     result = DispatchResult()
     if not dry_run:
+        # Pending reviewer decisions own physical retirement.  Reconcile them
+        # before generic stale-claim release can inspect TTL/heartbeat fields;
+        # this preserves the exact decision generation and successor CAS.
+        _reap_pending_review_decisions(conn)
         result.reclaimed = release_stale_claims(conn, board=board)
         result.stale = detect_stale_running(
             conn, stale_timeout_seconds=stale_timeout_seconds,

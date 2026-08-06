@@ -779,3 +779,299 @@ def test_direct_cli_block_then_dispatch_reconciles_from_bound_snapshot(
         assert task is not None
         assert task.status == "review"
         assert task.assignee == "code-reviewer-authorized"
+
+
+def test_create_task_materializes_parent_inputs_once_before_unbound_admission(
+    reviewer_home, tmp_path,
+):
+    """Falsey and one-shot parent iterables cannot bypass board admission."""
+
+    class FalseyParents:
+        def __init__(self, values):
+            self.values = tuple(values)
+            self.iterations = 0
+
+        def __bool__(self):
+            return False
+
+        def __iter__(self):
+            self.iterations += 1
+            return iter(self.values)
+
+    class OneShotParents:
+        def __init__(self, values):
+            self.values = tuple(values)
+            self.used = False
+
+        def __iter__(self):
+            if self.used:
+                raise AssertionError("parent iterable was consumed twice")
+            self.used = True
+            return iter(self.values)
+
+    explicit_db = tmp_path / "owners.db"
+    kb.init_db(explicit_db)
+    with kb.connect(db_path=explicit_db) as conn:
+        parent_id = kb.create_task(conn, title="parent")
+        falsey = FalseyParents([parent_id])
+        with pytest.raises(ValueError, match="no bound board"):
+            kb.create_task(conn, title="falsey parent", parents=falsey)
+        assert falsey.iterations == 1
+
+        empty = kb.create_task(conn, title="empty parent iterable", parents=iter(()))
+        assert kb.get_task(conn, empty) is not None
+
+    bound_db = reviewer_home / "kanban" / "boards" / "project" / "kanban.db"
+    kb.init_db(bound_db)
+    with kb.connect(db_path=bound_db) as conn:
+        parent_id = kb.create_task(conn, title="bound parent")
+        child_id = kb.create_task(
+            conn,
+            title="one-shot parent",
+            parents=OneShotParents([parent_id, parent_id]),
+        )
+        links = conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id=?", (child_id,)
+        ).fetchall()
+        assert [row["parent_id"] for row in links] == [parent_id]
+
+
+def test_create_task_normalizes_dependency_mapping_before_board_admission(
+    reviewer_home, tmp_path,
+):
+    """Dependency metadata is materialized before an explicit DB is admitted."""
+
+    class CountingMetadata(dict[str, str]):
+        def __init__(self):
+            super().__init__({"source": "one-shot"})
+            self.items_calls = 0
+
+        def items(self):
+            self.items_calls += 1
+            return super().items()
+
+    explicit_db = tmp_path / "dependency-owners.db"
+    kb.init_db(explicit_db)
+    metadata = CountingMetadata()
+    with kb.connect(db_path=explicit_db) as conn:
+        with pytest.raises(ValueError, match="no bound board"):
+            kb.create_task(
+                conn,
+                title="typed dependency",
+                dependency_kind="sample.gate",
+                provider_name="sample-provider",
+                dependency_metadata=metadata,
+            )
+    assert metadata.items_calls == 1
+
+
+@pytest.mark.parametrize(
+    "raw_version",
+    [None, True, False, "1", "bogus", 0, -1, 2**31],
+)
+def test_reviewer_policy_version_parser_rejects_unsupported_values(raw_version):
+    parser = getattr(kb, "_parse_reviewer_policy_version")
+    assert parser(raw_version) is None
+
+
+@pytest.mark.parametrize("raw_version", [1, 2, 2**31 - 1])
+def test_reviewer_policy_version_parser_accepts_bounded_integers(raw_version):
+    parser = getattr(kb, "_parse_reviewer_policy_version")
+    assert parser(raw_version) == raw_version
+
+
+def test_malformed_reviewer_policy_version_is_repaired_and_recovers_after_write_failure(
+    reviewer_home, monkeypatch,
+):
+    _write_profile(reviewer_home, "code-reviewer")
+    _write_reviewer_config(reviewer_home, "code-reviewer")
+    kb.init_db()
+
+    with kb.connect_closing() as conn:
+        synchronize = getattr(kb, "_synchronize_reviewer_policy")
+        initial = synchronize(conn)
+        assert initial.synchronized is True
+        conn.execute(
+            "UPDATE kanban_reviewer_policy SET policy_version=? WHERE id=1",
+            ("bogus",),
+        )
+        conn.commit()
+
+        repaired = synchronize(conn)
+        assert repaired.synchronized is True
+        row = conn.execute(
+            "SELECT policy_version FROM kanban_reviewer_policy WHERE id=1"
+        ).fetchone()
+        assert row["policy_version"] == 1
+        assert _load_policy(conn).state is getattr(kb, "_ReviewerPolicyState").PINNED
+
+        conn.execute(
+            "UPDATE kanban_reviewer_policy SET policy_version=? WHERE id=1",
+            ("bogus",),
+        )
+        conn.commit()
+        (reviewer_home / "config.yaml").write_text(
+            "kanban:\n  reviewer_profile: code-reviewer\n# source changed\n",
+            encoding="utf-8",
+        )
+        conn.execute(
+            "CREATE TRIGGER deny_policy_refresh "
+            "BEFORE UPDATE ON kanban_reviewer_policy "
+            "BEGIN SELECT RAISE(ABORT, 'policy refresh denied'); END"
+        )
+        spawned: list[str] = []
+        failed = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawned.append(task.id),
+        )
+        assert getattr(failed, "policy_sync_failed") is True
+        assert getattr(failed, "policy_sync_error_code") == "snapshot_write_failed"
+        assert spawned == []
+        assert conn.execute(
+            "SELECT policy_version FROM kanban_reviewer_policy WHERE id=1"
+        ).fetchone()["policy_version"] == "bogus"
+
+        conn.execute("DROP TRIGGER deny_policy_refresh")
+        recovered = kb.dispatch_once(conn, max_spawn=0)
+        assert getattr(recovered, "policy_sync_failed") is False
+        recovered_version = conn.execute(
+            "SELECT policy_version FROM kanban_reviewer_policy WHERE id=1"
+        ).fetchone()["policy_version"]
+        assert isinstance(recovered_version, int)
+        assert recovered_version > 0
+        assert _load_policy(conn).state is getattr(kb, "_ReviewerPolicyState").PINNED
+
+        source_path = reviewer_home / "config.yaml"
+        original_read_bytes = Path.read_bytes
+
+        def unreadable(path):
+            if path == source_path:
+                raise OSError("simulated source read failure")
+            return original_read_bytes(path)
+
+        monkeypatch.setattr(Path, "read_bytes", unreadable)
+        blocked = kb.dispatch_once(conn, max_spawn=0)
+        assert getattr(blocked, "policy_sync_failed") is True
+        assert getattr(blocked, "policy_sync_error_code") == "source_unreadable"
+
+
+def test_dispatch_reconciles_pending_review_before_null_expiry_reclaim(
+    reviewer_home,
+):
+    """A retired REQUEST_CHANGES run finalizes before stale-claim release."""
+    import time
+
+    _write_profile(reviewer_home, "code-reviewer")
+    _write_reviewer_config(reviewer_home, "code-reviewer")
+    kb.init_db()
+    process = subprocess.Popen(["sleep", "30"])
+    try:
+        with kb.connect_closing() as conn:
+            kb.dispatch_once(conn, max_spawn=0)
+            first = kb.create_task(
+                conn, title="pending review", assignee="programmer"
+            )
+            queued = kb.create_task(
+                conn, title="queued review", assignee="programmer"
+            )
+            ordinary = kb.create_task(
+                conn, title="ordinary null expiry", assignee="programmer"
+            )
+            host = kb._claimer_id().split(":", 1)[0]
+            assert kb.claim_task(conn, first, claimer=f"{host}:implementation-1")
+            assert kb.claim_task(conn, queued, claimer=f"{host}:implementation-2")
+            assert kb.claim_task(conn, ordinary, claimer=f"{host}:ordinary")
+            assert kb.submit_task_for_review(
+                conn, first, "code-reviewer", trusted_operator=True
+            )
+            assert kb.submit_task_for_review(
+                conn, queued, "code-reviewer", trusted_operator=True
+            )
+            assert kb.claim_review_task(
+                conn, first, claimer=f"{host}:reviewer"
+            )
+            review = kb.get_task(conn, first)
+            assert review is not None
+            authority = kb._latest_unconsumed_reviewer_authority(conn, first)
+            assert authority is not None
+            assert kb._set_worker_pid(
+                conn,
+                first,
+                process.pid,
+                expected_run_id=review.current_run_id,
+                expected_claim=review.claim_lock,
+                expected_assignee=review.assignee,
+                expected_authority=authority,
+            )
+            assert kb.request_changes(
+                conn,
+                first,
+                "programmer",
+                reviewer="code-reviewer",
+                reason="fix the failing assertion",
+                trusted_operator=True,
+            ) is not None
+            process.terminate()
+            returncode = process.wait(timeout=5)
+            raw_status = -returncode if returncode < 0 else returncode << 8
+            kb._record_worker_exit(process.pid, raw_status)
+            old = int(time.time()) - 3600
+            conn.execute(
+                "UPDATE tasks SET claim_expires=NULL, last_heartbeat_at=? "
+                "WHERE id IN (?, ?)",
+                (old, first, ordinary),
+            )
+            conn.execute(
+                "UPDATE task_runs SET claim_expires=NULL, last_heartbeat_at=? "
+                "WHERE task_id IN (?, ?) AND ended_at IS NULL",
+                (old, first, ordinary),
+            )
+            conn.commit()
+
+            spawned: list[tuple[str, str | None]] = []
+            result = kb.dispatch_once(
+                conn,
+                max_spawn=3,
+                spawn_fn=lambda task, workspace: spawned.append(
+                    (task.id, task.assignee)
+                ),
+            )
+            finalized = conn.execute(
+                "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+                "AND kind='review_decision_finalized'",
+                (first,),
+            ).fetchone()[0]
+            first_task = kb.get_task(conn, first)
+            queued_task = kb.get_task(conn, queued)
+            ordinary_task = kb.get_task(conn, ordinary)
+            assert result.reclaimed == 0
+            assert finalized == 1
+            assert first_task is not None
+            assert first_task.assignee == "programmer"
+            assert queued_task is not None
+            assert queued_task.assignee == "code-reviewer"
+            assert ordinary_task is not None
+            assert ordinary_task.status == "running"
+            assert ordinary_task.claim_expires is None
+            assert {task_id for task_id, _ in spawned} == {queued}
+
+            before_repeat = len(
+                conn.execute(
+                    "SELECT id FROM task_events WHERE task_id=? "
+                    "AND kind='review_decision_finalized'",
+                    (first,),
+                ).fetchall()
+            )
+            kb.dispatch_once(conn, max_spawn=3, spawn_fn=lambda *_args: None)
+            after_repeat = len(
+                conn.execute(
+                    "SELECT id FROM task_events WHERE task_id=? "
+                    "AND kind='review_decision_finalized'",
+                    (first,),
+                ).fetchall()
+            )
+            assert after_repeat == before_repeat
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        process.wait(timeout=5)
