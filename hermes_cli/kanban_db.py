@@ -87,7 +87,7 @@ import threading
 import logging
 import time
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
@@ -444,6 +444,19 @@ _CURRENT_BOARD_OVERRIDE: ContextVar[str | None] = ContextVar(
 )
 
 
+@dataclass(frozen=True)
+class _KanbanAuthorityContext:
+    """Immutable filesystem authority captured by one SQLite connection."""
+
+    db_path: Path
+    board_slug: Optional[str]
+    kanban_home: Optional[Path]
+    board_metadata_root: Optional[Path]
+    project_db_path: Optional[Path] = None
+    project_db_fallback: Optional[Path] = None
+    operational_board_slug: Optional[str] = None
+
+
 @contextlib.contextmanager
 def scoped_current_board(slug: str):
     """Temporarily pin the active board for the current context only."""
@@ -648,39 +661,149 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     return board_dir(slug) / "kanban.db"
 
 
-def _canonical_board_from_db_path(path: Path) -> Optional[str]:
-    """Derive a board slug only from one of the canonical board DB layouts.
+def _authority_context_from_db_path(
+    path: Path,
+) -> Optional[_KanbanAuthorityContext]:
+    """Derive filesystem authority only from a canonical DB layout.
 
     An arbitrary ``db_path`` is deliberately not treated as the active board:
     doing that would let a lower-level API silently route a temporary/custom
     database through whatever board happens to be selected in the ambient
-    process.  The legacy default path and ``boards/<slug>/kanban.db`` are the
-    only layouts whose slug is unambiguous from the path itself.
+    process. A structurally recognizable but case-noncanonical board keeps its
+    DB root for authority-bound reviewer policy reads, but has no board identity
+    and therefore cannot inherit board metadata.
     """
     try:
         resolved = path.expanduser().resolve(strict=False)
-        # A canonical custom-board layout identifies its slug without
-        # consulting the ambient board root.  This matters when the DB path is
-        # pinned by HERMES_KANBAN_DB but a worker changes HERMES_KANBAN_HOME.
+        if resolved.name != "kanban.db":
+            return None
+
+        # A canonical custom-board layout identifies both its slug and root
+        # without consulting the ambient board root.  The case-sensitive
+        # comparison is intentional: ``boards/PROD`` is not authority for
+        # normalized slug ``prod``.
         if (
-            resolved.name == "kanban.db"
-            and resolved.parent.parent.name == "boards"
+            resolved.parent.parent.name == "boards"
             and resolved.parent.parent.parent.name == "kanban"
         ):
-            return _normalize_board_slug(resolved.parent.name)
-        default_db = (kanban_home() / "kanban.db").resolve(strict=False)
-        if resolved == default_db:
-            return DEFAULT_BOARD
-        boards = boards_root().resolve(strict=False)
-        if resolved.name != "kanban.db" or resolved.parent.parent != boards:
-            return None
-        return _normalize_board_slug(resolved.parent.name)
+            root = resolved.parent.parent.parent.parent
+            raw_slug = resolved.parent.name
+            try:
+                normalized = _normalize_board_slug(raw_slug)
+            except ValueError:
+                normalized = None
+            if normalized is None or raw_slug != normalized:
+                return _KanbanAuthorityContext(
+                    db_path=resolved,
+                    board_slug=None,
+                    kanban_home=root,
+                    board_metadata_root=None,
+                )
+            return _KanbanAuthorityContext(
+                db_path=resolved,
+                board_slug=normalized,
+                kanban_home=root,
+                board_metadata_root=root / "kanban" / "boards" / normalized,
+            )
+
+        # A DB directly beneath a ``boards`` directory is attempting the
+        # custom-board layout, even if an ancestor is mis-cased or otherwise
+        # malformed. It must not fall through to the legacy default layout.
+        if resolved.parent.parent.name == "boards":
+            root = resolved.parent.parent.parent.parent
+            return _KanbanAuthorityContext(
+                db_path=resolved,
+                board_slug=None,
+                kanban_home=root,
+                board_metadata_root=None,
+            )
+
+        # The legacy/default layout is identified by its filename and keeps
+        # the DB's parent as its immutable Kanban root. This also makes a
+        # fixed legacy DB independent of a later HERMES_KANBAN_HOME change.
+        root = resolved.parent
+        return _KanbanAuthorityContext(
+            db_path=resolved,
+            board_slug=DEFAULT_BOARD,
+            kanban_home=root,
+            board_metadata_root=root / "kanban" / "boards" / DEFAULT_BOARD,
+        )
     except (OSError, RuntimeError, ValueError):
         return None
 
 
+def _canonical_board_from_db_path(path: Path) -> Optional[str]:
+    """Return a canonical board slug derived from *path*, if provable."""
+    context = _authority_context_from_db_path(path)
+    return context.board_slug if context is not None else None
+
+
+def _authority_context_for_connection(
+    path: Path,
+    board: Optional[str],
+) -> _KanbanAuthorityContext:
+    """Resolve one immutable authority context at connection-open time."""
+    resolved = path.expanduser().resolve(strict=False)
+    explicit = _normalize_board_slug(board)
+    derived = _authority_context_from_db_path(resolved)
+    if derived is not None:
+        # ``connect(db_path=..., board="default")`` is the legacy API for a
+        # caller-owned default DB. Preserve its explicit board-root contract;
+        # an omitted board remains path-bound so a fixed legacy DB cannot
+        # inherit a later ambient root.
+        if derived.board_slug == DEFAULT_BOARD and explicit == DEFAULT_BOARD:
+            from hermes_constants import get_hermes_home
+
+            return _KanbanAuthorityContext(
+                db_path=resolved,
+                board_slug=DEFAULT_BOARD,
+                kanban_home=derived.kanban_home,
+                board_metadata_root=derived.board_metadata_root,
+                project_db_path=(derived.kanban_home / "projects.db")
+                if derived.kanban_home is not None
+                else None,
+                project_db_fallback=(get_hermes_home() / "projects.db").resolve(
+                    strict=False
+                ),
+            )
+        if derived.board_slug is not None:
+            if explicit is not None and explicit != derived.board_slug:
+                raise ValueError(
+                    f"connection board {explicit!r} does not match DB board "
+                    f"{derived.board_slug!r}"
+                )
+            return derived
+        # A case-variant or otherwise malformed board directory is explicitly
+        # unbound. Never let ``board=`` turn it into ambient authority.
+        return derived
+    if explicit is None:
+        return _KanbanAuthorityContext(
+            db_path=resolved,
+            board_slug=None,
+            kanban_home=None,
+            board_metadata_root=None,
+        )
+
+    # An explicit board is a valid authority declaration for an otherwise
+    # arbitrary DB. Capture the DB-parent root now; later env changes cannot
+    # redirect this connection's metadata or project lookup.
+    root = resolved.parent
+    metadata_root = root / "kanban" / "boards" / explicit
+
+    return _KanbanAuthorityContext(
+        db_path=resolved,
+        board_slug=explicit,
+        kanban_home=root,
+        board_metadata_root=metadata_root,
+        project_db_path=root / "projects.db",
+    )
+
+
 def _connection_board_path(conn: sqlite3.Connection) -> Optional[Path]:
     """Return the path captured when ``conn`` was opened, if available."""
+    authority = getattr(conn, "_hermes_kanban_authority", None)
+    if isinstance(authority, _KanbanAuthorityContext):
+        return authority.db_path
     raw = getattr(conn, "_hermes_kanban_db_path", None)
     if not raw:
         return None
@@ -688,6 +811,73 @@ def _connection_board_path(conn: sqlite3.Connection) -> Optional[Path]:
         return Path(str(raw))
     except (TypeError, ValueError):
         return None
+
+
+def _connection_authority(
+    conn: sqlite3.Connection,
+) -> Optional[_KanbanAuthorityContext]:
+    """Return the immutable authority captured on *conn*, if any."""
+    authority = getattr(conn, "_hermes_kanban_authority", None)
+    if isinstance(authority, _KanbanAuthorityContext):
+        return authority
+    return None
+
+
+def _connection_board_metadata(
+    conn: sqlite3.Connection,
+    board: str,
+) -> Optional[dict]:
+    """Read board metadata only from the connection's bound board root."""
+    authority = _connection_authority(conn)
+    if (
+        authority is None
+        or authority.board_slug != board
+        or authority.board_metadata_root is None
+    ):
+        return None
+    return _read_board_metadata_at(
+        authority.board_metadata_root,
+        board,
+        authority.db_path,
+    )
+
+
+def _connection_projects_db_path(
+    conn: sqlite3.Connection,
+) -> Optional[Path]:
+    """Return the primary project store anchored to the connection."""
+    authority = _connection_authority(conn)
+    if authority is None:
+        return None
+    if authority.project_db_path is not None:
+        return authority.project_db_path
+    if authority.kanban_home is None:
+        return None
+    return authority.kanban_home / "projects.db"
+
+
+def _connection_project_db_fallback(
+    conn: sqlite3.Connection,
+) -> Optional[Path]:
+    """Return a captured legacy project-store fallback, if one is allowed."""
+    authority = _connection_authority(conn)
+    if authority is None:
+        return None
+    fallback = authority.project_db_fallback
+    primary = _connection_projects_db_path(conn)
+    if fallback is None or fallback == primary:
+        return None
+    # Only an explicit legacy default DB without board metadata may use this
+    # compatibility fallback; a fixed canonical board never falls through to
+    # ambient project state.
+    if (
+        primary is None
+        or primary.exists()
+        or authority.board_metadata_root is None
+        or (authority.board_metadata_root / "board.json").exists()
+    ):
+        return None
+    return fallback
 
 
 def workspaces_root(board: Optional[str] = None) -> Path:
@@ -784,6 +974,38 @@ def _default_board_display_name(slug: str) -> str:
     return " ".join(part.capitalize() for part in slug.replace("_", "-").split("-") if part) or slug
 
 
+def _read_board_metadata_at(
+    metadata_root: Path,
+    slug: str,
+    db_path: Path,
+) -> dict:
+    """Read one board metadata file from an already-authoritative root."""
+    meta: dict[str, Any] = {
+        "slug": slug,
+        "name": _default_board_display_name(slug),
+        "description": "",
+        "icon": "",
+        "color": "",
+        "default_workdir": None,
+        "project_id": None,
+        "created_at": None,
+        "archived": False,
+    }
+    try:
+        path = metadata_root / "board.json"
+        if path.exists():
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                # Never let the metadata file claim a different slug than
+                # its directory — trust the filesystem.
+                raw["slug"] = slug
+                meta.update(raw)
+    except (OSError, json.JSONDecodeError):
+        pass
+    meta["db_path"] = str(db_path)
+    return meta
+
+
 def read_board_metadata(board: Optional[str] = None) -> dict:
     """Return ``board.json`` contents (or synthesized defaults).
 
@@ -793,34 +1015,9 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
     doesn't need to reconstruct them.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
-    meta: dict[str, Any] = {
-        "slug": slug,
-        "name": _default_board_display_name(slug),
-        "description": "",
-        "icon": "",
-        "color": "",
-        "default_workdir": None,
-        # Optional first-class Project this board is scoped to. When set, new
-        # tasks inherit it (deterministic worktree + branch under the project's
-        # primary repo) and ``default_workdir`` mirrors the project's primary
-        # path so the persistent-workspace inheritance path keeps working.
-        "project_id": None,
-        "created_at": None,
-        "archived": False,
-    }
-    try:
-        p = board_metadata_path(slug)
-        if p.exists():
-            raw = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(raw, dict):
-                # Never let the metadata file claim a different slug than
-                # its directory — trust the filesystem.
-                raw["slug"] = slug
-                meta.update(raw)
-    except (OSError, json.JSONDecodeError):
-        pass
-    meta["db_path"] = str(kanban_db_path(slug))
-    return meta
+    return _read_board_metadata_at(
+        board_dir(slug), slug, kanban_db_path(slug)
+    )
 
 
 def write_board_metadata(
@@ -1691,16 +1888,26 @@ def _bind_kanban_connection_board(
     conn: sqlite3.Connection,
     board: Optional[str],
     db_path: Optional[str] = None,
+    authority: Optional[_KanbanAuthorityContext] = None,
 ) -> sqlite3.Connection:
-    """Bind the resolved board and DB path for legacy APIs.
+    """Bind the resolved authority and legacy board/path attributes.
 
     The path is captured as well as the slug because a dispatcher connection
     may have been opened from an explicit test/custom path while an ambient
     ``HERMES_KANBAN_DB`` points somewhere else.
     """
+    if authority is None:
+        authority = _KanbanAuthorityContext(
+            db_path=Path(db_path).expanduser().resolve(strict=False)
+            if db_path else Path("").resolve(),
+            board_slug=_normalize_board_slug(board),
+            kanban_home=None,
+            board_metadata_root=None,
+        )
     try:
-        setattr(conn, "_hermes_kanban_board", board)
-        setattr(conn, "_hermes_kanban_db_path", db_path)
+        setattr(conn, "_hermes_kanban_authority", authority)
+        setattr(conn, "_hermes_kanban_board", authority.board_slug)
+        setattr(conn, "_hermes_kanban_db_path", str(authority.db_path))
     except Exception:
         # sqlite3.Connection normally permits attributes; callers still pass
         # explicit board values when a custom connection implementation does
@@ -2432,18 +2639,22 @@ def connect(
       ``HERMES_KANBAN_DB`` env → ``HERMES_KANBAN_BOARD`` env →
       ``<root>/kanban/current`` → ``default``.
     """
-    resolved_board = _normalize_board_slug(board)
+    path_was_implicit = db_path is None
     if db_path is not None:
-        path = db_path
-        if resolved_board is None:
-            resolved_board = _canonical_board_from_db_path(path)
+        path = Path(db_path)
     else:
         path = kanban_db_path(board=board)
-        resolved_board = (
-            resolved_board
-            or _canonical_board_from_db_path(path)
-            or get_current_board()
+    authority = _authority_context_for_connection(path, board)
+    if path_was_implicit and board is None and authority.board_slug is None:
+        # Gateway/CLI callers historically use an arbitrary HERMES_KANBAN_DB
+        # filename without passing board=. Keep the neutral operational label
+        # for lifecycle calls, while board-sensitive admission still checks
+        # the absence of canonical metadata authority.
+        authority = replace(
+            authority,
+            operational_board_slug=DEFAULT_BOARD,
         )
+    resolved_board = authority.board_slug
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive
@@ -2459,7 +2670,7 @@ def connect(
     resolved = str(path.resolve())
     if resolved in _INITIALIZED_PATHS:
         conn = _bind_kanban_connection_board(
-            _sqlite_connect(path), resolved_board, resolved
+            _sqlite_connect(path), resolved_board, resolved, authority
         )
         try:
             conn.row_factory = sqlite3.Row
@@ -2492,7 +2703,7 @@ def connect(
         _guard_existing_db_is_healthy(path)
         resolved = str(path.resolve())
         conn = _bind_kanban_connection_board(
-            _sqlite_connect(path), resolved_board, resolved
+            _sqlite_connect(path), resolved_board, resolved, authority
         )
         try:
             conn.row_factory = sqlite3.Row
@@ -4142,6 +4353,7 @@ def create_task(
         conn,
         board,
         allow_unbound=allow_unbound_simple_task,
+        require_bound=not allow_unbound_simple_task,
     )
     board_is_bound = _connection_has_board_binding(conn, board)
     idempotency_key = str(idempotency_key).strip() if idempotency_key else None
@@ -4169,7 +4381,9 @@ def create_task(
     # (deterministic worktree + branch) without each surface repeating it.
     if project_id is None and board_is_bound:
         try:
-            _bmeta = read_board_metadata(board_slug)
+            _bmeta = _connection_board_metadata(conn, board_slug)
+            if _bmeta is None:
+                raise ValueError("connection board metadata is unavailable")
             _board_project = (_bmeta.get("project_id") or "").strip()
             if _board_project:
                 project_id = _board_project
@@ -4192,11 +4406,21 @@ def create_task(
     if project_id is not None:
         project_id = str(project_id).strip() or None
     if project_id:
-        try:
-            with _pdb.connect_closing() as _pconn:
-                project_obj = _pdb.get_project(_pconn, project_id)
-        except Exception:
-            project_obj = None
+        project_db_path = _connection_projects_db_path(conn)
+        project_db_paths = (
+            [project_db_path] if project_db_path is not None else []
+        )
+        fallback_project_db = _connection_project_db_fallback(conn)
+        if fallback_project_db is not None:
+            project_db_paths.append(fallback_project_db)
+        for candidate_project_db in project_db_paths:
+            try:
+                with _pdb.connect_closing(db_path=candidate_project_db) as _pconn:
+                    project_obj = _pdb.get_project(_pconn, project_id)
+            except Exception:
+                project_obj = None
+            if project_obj is not None:
+                break
         if project_obj is None and project_source_task_id:
             # Worker profiles have their own projects.db, while the Kanban DB is
             # intentionally shared. Recover routing only from a canonical
@@ -4331,8 +4555,8 @@ def create_task(
         and workspace_kind in {"dir", "worktree"}
         and board_is_bound
     ):
-        board_meta = read_board_metadata(board_slug)
-        board_default = board_meta.get("default_workdir")
+        board_meta = _connection_board_metadata(conn, board_slug)
+        board_default = board_meta.get("default_workdir") if board_meta else None
         if board_default:
             workspace_path = str(board_default)
 
@@ -4885,6 +5109,7 @@ def _dependency_board(
     board: Optional[str] = None,
     *,
     allow_unbound: bool = False,
+    require_bound: bool = False,
 ) -> str:
     """Resolve a board without consulting ambient state for unbound DBs.
 
@@ -4893,6 +5118,34 @@ def _dependency_board(
     and project paths keep the strict fail-closed behavior.
     """
     explicit = _normalize_board_slug(board)
+    authority = _connection_authority(conn)
+    if authority is not None:
+        bound = authority.board_slug
+        operational = authority.operational_board_slug
+        if explicit:
+            if bound is None:
+                if require_bound or operational is None or explicit != operational:
+                    raise ValueError(
+                        "kanban connection has no bound board; pass board= explicitly "
+                        "only when opening a connection with a canonical board identity"
+                    )
+                return explicit
+            if explicit != bound:
+                raise ValueError(
+                    f"dependency board {explicit!r} does not match connection "
+                    f"board {bound!r}"
+                )
+        if bound:
+            return bound
+        if operational and not require_bound:
+            return operational
+        if allow_unbound:
+            return DEFAULT_BOARD
+        raise ValueError(
+            "kanban connection has no bound board; pass board= explicitly for "
+            "custom or ambiguous db_path connections"
+        )
+
     bound = getattr(conn, "_hermes_kanban_board", None)
     if bound:
         bound = _normalize_board_slug(str(bound))
@@ -4926,6 +5179,14 @@ def _connection_has_board_binding(
     neutral compatibility label. That label is not an authority and must not
     drive project or default-workdir inheritance for arbitrary explicit DBs.
     """
+    authority = _connection_authority(conn)
+    if authority is not None:
+        explicit = _normalize_board_slug(board)
+        return bool(
+            authority.board_slug
+            and authority.board_metadata_root is not None
+            and (explicit is None or explicit == authority.board_slug)
+        )
     if _normalize_board_slug(board):
         return True
     bound = getattr(conn, "_hermes_kanban_board", None)
@@ -4937,6 +5198,9 @@ def _connection_has_board_binding(
 
 def _connection_db_path(conn: sqlite3.Connection) -> Optional[Path]:
     """Return the immutable database path captured when ``conn`` opened."""
+    authority = _connection_authority(conn)
+    if authority is not None:
+        return authority.db_path
     raw = getattr(conn, "_hermes_kanban_db_path", None)
     if not raw:
         return None
@@ -8538,30 +8802,17 @@ def _invalid_reviewer_policy(
 def _reviewer_policy_source_path(
     conn: sqlite3.Connection,
 ) -> Optional[Path]:
-    """Return the policy source derived only from the bound DB path.
+    """Return the policy source from the connection's immutable root.
 
     This is intentionally not ``kanban_home() / config.yaml``.  A worker is
     allowed to inherit or override ambient path variables, but the database
-    connection already identifies the board authority.  Default boards use
-    the DB's parent root; canonical custom boards walk back from
-    ``kanban/boards/<slug>/kanban.db`` to that same root.
+    connection already identifies the board authority. Unbound arbitrary DBs
+    have no reviewer-policy source rather than guessing from ambient state.
     """
-    db_path = _connection_db_path(conn)
-    if db_path is None:
+    authority = _connection_authority(conn)
+    if authority is None or authority.kanban_home is None:
         return None
-    try:
-        resolved = db_path.expanduser().resolve(strict=False)
-    except (OSError, RuntimeError):
-        return None
-    if (
-        resolved.name == "kanban.db"
-        and resolved.parent.parent.name == "boards"
-        and resolved.parent.parent.parent.name == "kanban"
-    ):
-        root = resolved.parent.parent.parent.parent
-    else:
-        root = resolved.parent
-    return root / "config.yaml"
+    return authority.kanban_home / "config.yaml"
 
 
 def _with_policy_source(
@@ -12035,7 +12286,16 @@ def _resolve_worktree_workspace(
         # The dispatcher's CWD is incidental (gateway launch dir) and using it
         # scatters worktrees under whatever repo the gateway started in.
         board_slug = _dependency_board_for_workspace(board, conn=conn)
-        board_default = (read_board_metadata(board_slug).get("default_workdir") or "").strip()
+        board_metadata = (
+            _connection_board_metadata(conn, board_slug)
+            if conn is not None
+            else read_board_metadata(board_slug)
+        )
+        board_default = (
+            (board_metadata.get("default_workdir") or "").strip()
+            if board_metadata is not None
+            else ""
+        )
         if not board_default:
             raise ValueError(
                 f"task {task.id} has workspace_kind=worktree but no workspace_path, "

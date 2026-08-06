@@ -235,6 +235,144 @@ def test_unbound_explicit_db_does_not_inherit_ambient_default_project(
             )
 
 
+def _seed_project(root: Path, slug: str) -> tuple[str, Path]:
+    from hermes_cli import projects_db as pdb
+
+    repo = root / f"{slug}-repo"
+    repo.mkdir(parents=True)
+    with pdb.connect_closing(db_path=root / "projects.db") as conn:
+        project_id = pdb.create_project(
+            conn,
+            name=slug.title(),
+            slug=slug,
+            primary_path=str(repo),
+        )
+    return project_id, repo
+
+
+def _seed_custom_board(
+    root: Path,
+    project_id: str,
+    repo: Path,
+    *,
+    directory: str = "prod",
+) -> Path:
+    board_dir = root / "kanban" / "boards" / directory
+    board_dir.mkdir(parents=True)
+    (board_dir / "board.json").write_text(
+        json.dumps(
+            {
+                "project_id": project_id,
+                "default_workdir": str(repo),
+            }
+        ),
+        encoding="utf-8",
+    )
+    db_path = board_dir / "kanban.db"
+    kb.init_db(db_path=db_path)
+    return db_path
+
+
+def test_fixed_custom_board_connections_keep_distinct_authority_contexts(
+    reviewer_home, tmp_path, monkeypatch,
+):
+    root_a = tmp_path / "root-a"
+    root_b = tmp_path / "root-b"
+    root_a.mkdir()
+    root_b.mkdir()
+    project_a, repo_a = _seed_project(root_a, "project-a")
+    project_b, repo_b = _seed_project(root_b, "project-b")
+    db_a = _seed_custom_board(root_a, project_a, repo_a)
+    db_b = _seed_custom_board(root_b, project_b, repo_b)
+
+    monkeypatch.setenv("HERMES_HOME", str(root_b))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(root_b))
+    conn_a = kb.connect(db_path=db_a)
+    conn_b = kb.connect(db_path=db_b)
+    try:
+        for conn, project_id, repo, label in (
+            (conn_a, project_a, repo_a, "a-1"),
+            (conn_b, project_b, repo_b, "b-1"),
+            (conn_a, project_a, repo_a, "a-2"),
+            (conn_b, project_b, repo_b, "b-2"),
+        ):
+            task_id = kb.create_task(
+                conn,
+                title=f"authority {label}",
+                workspace_kind="worktree",
+            )
+            task = kb.get_task(conn, task_id)
+            assert task is not None
+            assert task.project_id == project_id
+            assert task.workspace_path == str(repo / ".worktrees" / task_id)
+    finally:
+        conn_a.close()
+        conn_b.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(root_a))
+    with kb.connect(db_path=db_b) as reopened:
+        task_id = kb.create_task(
+            reopened,
+            title="authority b after reopen",
+            workspace_kind="worktree",
+        )
+        task = kb.get_task(reopened, task_id)
+        assert task is not None
+        assert task.project_id == project_b
+        assert task.workspace_path == str(repo_b / ".worktrees" / task_id)
+
+
+def test_noncanonical_custom_board_path_cannot_bind_ambient_metadata(
+    reviewer_home, tmp_path, monkeypatch,
+):
+    root_a = tmp_path / "root-a"
+    root_b = tmp_path / "root-b"
+    root_a.mkdir()
+    root_b.mkdir()
+    project_a, repo_a = _seed_project(root_a, "project-a")
+    project_b, repo_b = _seed_project(root_b, "project-b")
+    noncanonical_db = _seed_custom_board(
+        root_a,
+        project_a,
+        repo_a,
+        directory="PROD",
+    )
+    _seed_custom_board(root_b, project_b, repo_b)
+
+    monkeypatch.setenv("HERMES_HOME", str(root_b))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(root_b))
+    with kb.connect(db_path=noncanonical_db, board="prod") as conn:
+        task_id = kb.create_task(
+            conn,
+            title="noncanonical remains projectless",
+            workspace_kind="worktree",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.project_id is None
+        assert task.workspace_path is None
+
+        with pytest.raises(ValueError, match="no bound board"):
+            kb.create_task(
+                conn,
+                title="noncanonical explicit project",
+                project_id=project_b,
+            )
+        with pytest.raises(ValueError, match="no bound board"):
+            kb.create_task(
+                conn,
+                title="noncanonical dependency",
+                dependency_kind="sample.gate",
+            )
+        with pytest.raises(ValueError, match="no bound board"):
+            kb.create_task(
+                conn,
+                title="noncanonical provider",
+                provider_name="sample",
+            )
+        assert getattr(kb, "_reviewer_policy_source_path")(conn) == root_a / "config.yaml"
+
+
 def test_dispatch_stops_on_reviewer_policy_sync_failure_and_recovers(
     reviewer_home, tmp_path,
 ):
