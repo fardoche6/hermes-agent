@@ -2280,6 +2280,10 @@ DEFAULT_CONFIG = {
         # decomposer prompt, model, or skills; configure that LLM path under
         # auxiliary.kanban_decomposer.
         "orchestrator_profile": "",
+        # Pin review handoffs/failover to one exact reviewer profile. When
+        # unset, the dispatcher keeps discovering compatible code-reviewer*
+        # profiles dynamically.
+        "reviewer_profile": None,
         # Where a child task lands if the orchestrator can't match an
         # assignee to any installed profile. When unset, falls back to the
         # default profile. A task never ends up with assignee=None.

@@ -8366,39 +8366,101 @@ def _bounded_review_error(error: object) -> str:
     return text[:500]
 
 
+def _configured_reviewer_profile() -> tuple[Optional[str], Optional[dict[str, str]]]:
+    """Return the canonical pinned reviewer, or one bounded config failure.
+
+    ``None`` is the compatibility value: it leaves reviewer discovery
+    unchanged. Any explicit non-null value is a closed-world policy, so an
+    invalid setting must not fall through to discovered reviewer profiles.
+    """
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+        config = load_config()
+        kanban_config = config.get("kanban") if isinstance(config, dict) else None
+        if kanban_config is None:
+            return None, None
+        if not isinstance(kanban_config, dict):
+            return None, {
+                "profile": "",
+                "error": "kanban.reviewer_profile is unavailable: kanban must be a mapping",
+            }
+        configured = kanban_config.get("reviewer_profile")
+        if configured is None:
+            return None, None
+        if not isinstance(configured, str) or not configured.strip():
+            return None, {
+                "profile": _bounded_review_error(configured),
+                "error": (
+                    "kanban.reviewer_profile must be a nonempty string or null"
+                ),
+            }
+        canonical = normalize_profile_name(configured)
+        validate_profile_name(canonical)
+    except Exception as exc:
+        configured_text = locals().get("configured", "")
+        return None, {
+            "profile": _bounded_review_error(configured_text),
+            "error": _bounded_review_error(exc),
+        }
+
+    if not canonical.startswith("code-reviewer"):
+        return None, {
+            "profile": _bounded_review_error(canonical),
+            "error": "configured reviewer profile must start with code-reviewer",
+        }
+    return canonical, None
+
+
 def _reviewer_candidates(
     current: Optional[str], *, required_skill: str = "sdlc-review",
 ) -> tuple[list[str], list[dict[str, str]]]:
-    """Return compatible ``code-reviewer*`` profiles and preflight failures.
+    """Return compatible reviewer profiles and preflight failures.
 
     Reviewer failover is deliberately limited to the reviewer lane.  A missing
     forced skill is a capability failure, not a review decision, so it is
     reported before a worker is spawned and does not consume a task retry.
     """
     failures: list[dict[str, str]] = []
+    configured, config_failure = _configured_reviewer_profile()
+    if config_failure is not None:
+        return [], [config_failure]
     try:
         from hermes_cli.profiles import get_profile_dir, list_profiles, profile_exists
-        profiles = list_profiles()
     except Exception as exc:
-        return [], [{"profile": str(current or ""), "error": _bounded_review_error(exc)}]
-    names = [
-        str(p.name) for p in profiles
-        if str(p.name).startswith("code-reviewer")
-    ]
-    # The caller supplies the reviewer authorized by the latest
-    # ``submitted_for_review``/``review_failover`` event. Keep that reviewer
-    # first even when profile discovery returns the candidates in a different
-    # order; assigning an older candidate before a new authority event would
-    # create a generation that cannot legally decide the review.
-    current_name = _canonical_assignee(current)
-    if current_name:
-        names.insert(0, current_name)
+        return [], [{
+            "profile": _bounded_review_error(current or ""),
+            "error": _bounded_review_error(exc),
+        }]
+    if configured is not None:
+        # A configured reviewer is an exact allowlist, not a preferred first
+        # choice. In particular, do not reinsert a disallowed current authority
+        # or discover an alternate reviewer behind the operator's back.
+        names = [configured]
+    else:
+        profiles = list_profiles()
+        names = [
+            str(p.name) for p in profiles
+            if str(p.name).startswith("code-reviewer")
+        ]
+        # The caller supplies the reviewer authorized by the latest
+        # ``submitted_for_review``/``review_failover`` event. Keep that reviewer
+        # first even when profile discovery returns the candidates in a
+        # different order; assigning an older candidate before a new authority
+        # event would create a generation that cannot legally decide the review.
+        current_name = _canonical_assignee(current)
+        if current_name:
+            names.insert(0, current_name)
     names = list(dict.fromkeys(names))
     compatible: list[str] = []
     for name in names:
         try:
             if not profile_exists(name):
-                failures.append({"profile": name, "error": "profile unavailable"})
+                failures.append({
+                    "profile": _bounded_review_error(name),
+                    "error": "profile unavailable",
+                })
                 continue
             profile_dir = get_profile_dir(name)
             # Test fixtures and control-plane callers may provide a synthetic
@@ -8406,17 +8468,28 @@ def _reviewer_candidates(
             # profile_exists gate rather than misclassifying them as a skill
             # failure. Real profile directories are preflighted strictly.
             if not profile_dir.is_dir():
+                if configured is not None:
+                    failures.append({
+                        "profile": _bounded_review_error(name),
+                        "error": "profile unavailable",
+                    })
+                    continue
                 compatible.append(name)
                 continue
             skill_dir = profile_dir / "skills" / required_skill
             if not skill_dir.is_dir():
                 failures.append({
-                    "profile": name,
-                    "error": f"missing skill: {required_skill}",
+                    "profile": _bounded_review_error(name),
+                    "error": _bounded_review_error(
+                        f"missing skill: {required_skill}"
+                    ),
                 })
                 continue
         except Exception as exc:
-            failures.append({"profile": name, "error": _bounded_review_error(exc)})
+            failures.append({
+                "profile": _bounded_review_error(name),
+                "error": _bounded_review_error(exc),
+            })
             continue
         compatible.append(name)
     return compatible, failures
