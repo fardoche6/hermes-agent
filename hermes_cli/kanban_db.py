@@ -1132,6 +1132,8 @@ class Run:
     summary: Optional[str]
     metadata: Optional[dict]
     error: Optional[str]
+    recovery_required: bool = False
+    recovery_reason: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
@@ -1156,6 +1158,15 @@ class Run:
             summary=row["summary"],
             metadata=meta,
             error=row["error"],
+            recovery_required=(
+                bool(row["recovery_required"])
+                if "recovery_required" in row.keys()
+                and row["recovery_required"] is not None
+                else False
+            ),
+            recovery_reason=(
+                row["recovery_reason"] if "recovery_reason" in row.keys() else None
+            ),
         )
 
 
@@ -1337,6 +1348,11 @@ CREATE TABLE IF NOT EXISTS task_runs (
     claim_lock          TEXT,
     claim_expires       INTEGER,
     worker_pid          INTEGER,
+    -- Physical retirement uncertainty is scoped to the exact run as well as
+    -- the task.  A flagged run remains the owner of its claim/PID until a
+    -- later wait/reap proves that owner is gone.
+    recovery_required   INTEGER NOT NULL DEFAULT 0,
+    recovery_reason     TEXT,
     max_runtime_seconds INTEGER,
     last_heartbeat_at   INTEGER,
     started_at          INTEGER NOT NULL,
@@ -1363,6 +1379,10 @@ CREATE TABLE IF NOT EXISTS task_launch_gates (
     gate_token     TEXT NOT NULL UNIQUE,
     gate_pid       INTEGER NOT NULL,
     state          TEXT NOT NULL,
+    -- The gate carries the same fail-closed recovery marker as its task/run.
+    -- A released/retired decision must not silently erase gate uncertainty.
+    recovery_required INTEGER NOT NULL DEFAULT 0,
+    recovery_reason TEXT,
     workspace_path TEXT,
     workspace_kind TEXT,
     workspace_created INTEGER NOT NULL DEFAULT 0,
@@ -2533,6 +2553,45 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "recovery_reason TEXT",
         )
 
+    # Physical-retirement uncertainty is intentionally copied onto the active
+    # run and launch gate.  Task-only recovery flags were not enough: a
+    # reviewer decision could otherwise pass a run/gate mutation that left the
+    # task flag clear.  These additive migrations keep old boards readable and
+    # are idempotent under concurrent initialization.
+    run_cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+    }
+    if run_cols:
+        if "recovery_required" not in run_cols:
+            _add_column_if_missing(
+                conn,
+                "task_runs",
+                "recovery_required",
+                "recovery_required INTEGER NOT NULL DEFAULT 0",
+            )
+        if "recovery_reason" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "recovery_reason", "recovery_reason TEXT",
+            )
+    gate_cols = {
+        row["name"] for row in conn.execute("PRAGMA table_info(task_launch_gates)")
+    }
+    if gate_cols:
+        if "recovery_required" not in gate_cols:
+            _add_column_if_missing(
+                conn,
+                "task_launch_gates",
+                "recovery_required",
+                "recovery_required INTEGER NOT NULL DEFAULT 0",
+            )
+        if "recovery_reason" not in gate_cols:
+            _add_column_if_missing(
+                conn,
+                "task_launch_gates",
+                "recovery_reason",
+                "recovery_reason TEXT",
+            )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2691,7 +2750,8 @@ _REBUILD_SPECS = {
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, profile TEXT, step_key TEXT,"
         " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
-        " worker_pid INTEGER, max_runtime_seconds INTEGER,"
+        " worker_pid INTEGER, recovery_required INTEGER NOT NULL DEFAULT 0,"
+        " recovery_reason TEXT, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
         " error TEXT)",
@@ -3483,10 +3543,17 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, claim_lock, assignee, recovery_required "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         if not row:
             return False
+        if _task_retirement_fenced(conn, task_id):
+            raise RuntimeError(
+                f"cannot reassign {task_id}: recovery-required physical retirement "
+                "must be resolved first"
+            )
         if row["claim_lock"] is not None and row["status"] == "review":
             raise RuntimeError(
                 f"cannot reassign {task_id}: currently claimed reviewer "
@@ -4256,12 +4323,15 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, "
+            "       recovery_required "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            if bool(row["recovery_required"]):
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -4342,6 +4412,11 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        task_guard = conn.execute(
+            "SELECT recovery_required FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        if task_guard is None or _task_retirement_fenced(conn, task_id):
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4388,8 +4463,6 @@ def claim_task(
                SET status        = 'running',
                    claim_lock    = ?,
                    claim_expires = ?,
-                   recovery_required = 0,
-                   recovery_reason = NULL,
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
                AND status = 'ready'
@@ -4498,7 +4571,7 @@ def claim_review_task(
             task_row is None
             or task_row["status"] != "review"
             or task_row["claim_lock"] is not None
-            or bool(task_row["recovery_required"])
+            or _task_retirement_fenced(conn, task_id)
         ):
             return None
 
@@ -4565,8 +4638,6 @@ def claim_review_task(
                SET status        = 'review',
                    claim_lock    = ?,
                    claim_expires = ?,
-                   recovery_required = 0,
-                   recovery_reason = NULL,
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
                AND status = 'review'
@@ -4610,6 +4681,8 @@ def claim_review_task(
             "expires": expires,
             "run_id": run_id,
             "source_status": "review",
+            "assignee": trow["assignee"] if trow else reviewer,
+            "profile": trow["assignee"] if trow else reviewer,
         }
         if authority is not None and reviewer == authority[1]:
             claim_payload["review_authority_id"] = authority[0]
@@ -4939,7 +5012,8 @@ def _active_review_generation(
     """
     run_id = task_row["current_run_id"]
     run = conn.execute(
-        "SELECT task_id, profile, status, claim_lock, claim_expires, ended_at "
+        "SELECT task_id, profile, status, claim_lock, claim_expires, worker_pid, "
+        "       recovery_required, recovery_reason, ended_at "
         "FROM task_runs WHERE id=?",
         (run_id,),
     ).fetchone()
@@ -4949,6 +5023,8 @@ def _active_review_generation(
     if (
         not run
         or run["task_id"] != task_id
+        or bool(task_row["recovery_required"])
+        or bool(run["recovery_required"])
         or run["status"] != "running"
         or run["ended_at"] is not None
         or not run["profile"]
@@ -4962,18 +5038,46 @@ def _active_review_generation(
             or int(task_row["claim_expires"]) <= now
         )
         or task_row["claim_lock"] != run["claim_lock"]
+        or task_row["worker_pid"] != run["worker_pid"]
         or authority is None
         or not authoritative
         or task_row["assignee"] != authoritative
         or _canonical_assignee(run["profile"]) != authoritative
         or (reviewer is not None and reviewer != _canonical_assignee(run["profile"]))
     ):
+        if bool(task_row["recovery_required"]) or bool(run and run["recovery_required"]):
+            raise RuntimeError(
+                f"cannot decide review for {task_id}: recovery-required physical "
+                "retirement is unresolved"
+            )
         raise RuntimeError(
             f"cannot decide review for {task_id}: current reviewer generation "
             "is no longer active"
         )
 
     authority_id = authority[0]
+    gate = conn.execute(
+        "SELECT authority_id, assignee, claim_lock, gate_pid, state, "
+        "       recovery_required FROM task_launch_gates "
+        "WHERE task_id=? AND run_id=? AND claim_lock=? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, int(run_id), task_row["claim_lock"]),
+    ).fetchone()
+    if gate is not None and (
+        bool(gate["recovery_required"])
+        or gate["state"] not in (
+            "attached", "authorized", "prepared", "released", "revalidation_failed",
+        )
+        or int(gate["authority_id"]) != int(authority_id)
+        or gate["assignee"] != authoritative
+        or gate["claim_lock"] != task_row["claim_lock"]
+        or task_row["worker_pid"] is None
+        or int(gate["gate_pid"]) != int(task_row["worker_pid"])
+    ):
+        raise RuntimeError(
+            f"cannot decide review for {task_id}: recovery-required or mutated "
+            "launch gate"
+        )
     if not _review_authority_is_unconsumed(conn, task_id, authority_id):
         raise RuntimeError(
             f"cannot decide review for {task_id}: reviewer authority is no longer active"
@@ -5040,6 +5144,415 @@ def _active_review_generation(
             "already has a decision"
         )
     return _canonical_assignee(run["profile"]) or ""
+
+
+def _event_payload(row: Optional[sqlite3.Row]) -> dict[str, Any]:
+    """Decode one event payload without allowing malformed history to pass."""
+    if row is None or not row["payload"]:
+        return {}
+    try:
+        payload = json.loads(row["payload"])
+    except (TypeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _pending_review_decision(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[dict[str, Any]]:
+    """Return the still-fenced decision for the current reviewer run.
+
+    A decision event is only pending when its exact run, claim, authority,
+    worker PID, and claim event are still the live task/run identity.  This
+    makes old events harmless after a later review generation and gives every
+    caller one replay-safe definition of "decision recorded, retirement not
+    finalized".
+    """
+    task = conn.execute(
+        "SELECT status, assignee, claim_lock, claim_expires, worker_pid, "
+        "       current_run_id, recovery_required FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    if task is None:
+        return None
+    if task["current_run_id"] is None or task["claim_lock"] is None:
+        return None
+    decision_row = conn.execute(
+        "SELECT id, task_id, run_id, kind, payload FROM task_events WHERE task_id=? "
+        "AND kind IN ('review_approved', 'changes_requested') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if decision_row is None:
+        return None
+    payload = _event_payload(decision_row)
+    generation = str(payload.get("decision_generation") or "")
+    try:
+        run_id = int(payload.get("run_id"))
+        authority_id = int(payload.get("authority_id"))
+        worker_pid = int(payload.get("worker_pid"))
+        claim_event_id = int(payload.get("claim_event_id"))
+    except (TypeError, ValueError):
+        return None
+    if (
+        not generation
+        or run_id != int(task["current_run_id"])
+        or decision_row["run_id"] is None
+        or int(decision_row["run_id"]) != run_id
+        or payload.get("claim_lock") != task["claim_lock"]
+        or task["worker_pid"] is None
+        or int(task["worker_pid"]) != worker_pid
+        or payload.get("reviewer") != _canonical_assignee(task["assignee"])
+    ):
+        return None
+    run = conn.execute(
+        "SELECT task_id, profile, status, claim_lock, claim_expires, worker_pid, "
+        "       ended_at, recovery_required FROM task_runs WHERE id=?",
+        (run_id,),
+    ).fetchone()
+    if run is None or (
+        run["task_id"] != task_id
+        or run["status"] != "running"
+        or run["ended_at"] is not None
+        or run["claim_lock"] != task["claim_lock"]
+        or run["worker_pid"] is None
+        or int(run["worker_pid"]) != worker_pid
+        or _canonical_assignee(run["profile"]) != _canonical_assignee(task["assignee"])
+    ):
+        return None
+    authority = _latest_reviewer_authority(conn, task_id)
+    if authority != (authority_id, _canonical_assignee(task["assignee"])):
+        return None
+    claim = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id=? "
+        "AND kind='claimed' AND id=? LIMIT 1",
+        (task_id, claim_event_id),
+    ).fetchone()
+    claim_payload = _event_payload(claim)
+    if (
+        claim is None
+        or claim["run_id"] is None
+        or int(claim["run_id"]) != run_id
+        or claim_payload.get("source_status") != "review"
+        or claim_payload.get("run_id") != run_id
+        or claim_payload.get("lock") != task["claim_lock"]
+        or claim_payload.get("review_authority_id") != authority_id
+        or claim_payload.get("assignee") != _canonical_assignee(task["assignee"])
+    ):
+        return None
+    latest_claim = conn.execute(
+        "SELECT id FROM task_events WHERE task_id=? AND kind='claimed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if latest_claim is None or int(latest_claim["id"]) != claim_event_id:
+        return None
+    gate = None
+    gate_id = payload.get("gate_id")
+    if gate_id is not None:
+        try:
+            gate = conn.execute(
+                "SELECT * FROM task_launch_gates WHERE id=?", (int(gate_id),)
+            ).fetchone()
+        except (TypeError, ValueError):
+            return None
+        if gate is None or (
+            gate["task_id"] != task_id
+            or int(gate["run_id"]) != run_id
+            or gate["claim_lock"] != task["claim_lock"]
+            or int(gate["gate_pid"]) != worker_pid
+            or int(gate["authority_id"]) != authority_id
+            or gate["assignee"] != _canonical_assignee(task["assignee"])
+            or payload.get("gate_token") != gate["gate_token"]
+        ):
+            return None
+    return {
+        "event": decision_row,
+        "event_id": int(decision_row["id"]),
+        "kind": str(decision_row["kind"]),
+        "payload": payload,
+        "generation": generation,
+        "run_id": run_id,
+        "claim_lock": str(task["claim_lock"]),
+        "worker_pid": worker_pid,
+        "authority_id": authority_id,
+        "claim_event_id": claim_event_id,
+        "gate": gate,
+    }
+
+
+def _review_decision_needs_retirement(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when the current run owns a durable, still-fenced verdict.
+
+    ``_pending_review_decision`` deliberately returns ``None`` for mutated
+    identities so an old event cannot finalize a different generation.  A
+    current run that owns such a malformed or mutated event must nevertheless
+    remain fail-closed: otherwise timeout/stale/crash handling could clear its
+    claim and admit a successor.  This predicate is therefore intentionally
+    narrower than a history lookup (the decision event's run must still be
+    the task's current run) but less permissive than the full finalization
+    identity check.
+    """
+    task = conn.execute(
+        "SELECT current_run_id, claim_lock FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    if task is None or task["current_run_id"] is None or task["claim_lock"] is None:
+        return False
+    decision = conn.execute(
+        "SELECT run_id, payload FROM task_events WHERE task_id=? "
+        "AND kind IN ('review_approved', 'changes_requested') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if decision is None or not _event_payload(decision).get("pending_retirement"):
+        return False
+    try:
+        return int(decision["run_id"]) == int(task["current_run_id"])
+    except (TypeError, ValueError):
+        # A pending decision with an unparseable run binding is corruption in
+        # the current generation.  Refuse every successor transition rather
+        # than treating it as an old, harmless event.
+        return True
+
+
+def _task_retirement_fenced(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when any live task/run/gate owner is still unresolved."""
+    row = conn.execute(
+        "SELECT t.current_run_id, t.claim_lock, t.recovery_required, "
+        "       r.recovery_required AS run_recovery "
+        "FROM tasks t LEFT JOIN task_runs r ON r.id=t.current_run_id "
+        "WHERE t.id=?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    if bool(row["recovery_required"]) or bool(row["run_recovery"]):
+        return True
+    if _pending_review_decision(conn, task_id) is not None:
+        return True
+    if _review_decision_needs_retirement(conn, task_id):
+        return True
+    if row["current_run_id"] is None or row["claim_lock"] is None:
+        return False
+    gate = conn.execute(
+        "SELECT recovery_required FROM task_launch_gates "
+        "WHERE task_id=? AND run_id=? AND claim_lock=? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, int(row["current_run_id"]), row["claim_lock"]),
+    ).fetchone()
+    return gate is not None and bool(gate["recovery_required"])
+
+
+def _pending_decision_matches_call(
+    pending: dict[str, Any],
+    *,
+    kind: str,
+    reviewer: str,
+    summary: Optional[str] = None,
+    head_sha: Optional[str] = None,
+    programmer: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> bool:
+    payload = pending["payload"]
+    if pending["kind"] != kind or payload.get("reviewer") != reviewer:
+        return False
+    if kind == "review_approved":
+        return (
+            payload.get("summary") == summary
+            and payload.get("head_sha") == head_sha
+        )
+    return payload.get("programmer") == programmer and payload.get("reason") == reason
+
+
+def _pending_decision_exit_proven(
+    conn: sqlite3.Connection, pending: dict[str, Any],
+) -> bool:
+    """Check the durable proof written by the authoritative reaper."""
+    for row in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? "
+        "AND kind='review_decision_exit_proven' ORDER BY id DESC",
+        (pending["event"]["task_id"],),
+    ):
+        payload = _event_payload(row)
+        if (
+            payload.get("decision_generation") == pending["generation"]
+            and payload.get("decision_event_id") == pending["event_id"]
+            and payload.get("run_id") == pending["run_id"]
+            and payload.get("claim_lock") == pending["claim_lock"]
+            and payload.get("worker_pid") == pending["worker_pid"]
+            and payload.get("authority_id") == pending["authority_id"]
+        ):
+            return True
+    return False
+
+
+def _authoritative_worker_exit(pid: int) -> bool:
+    """Reap ``pid`` when this process owns it; liveness alone is not proof."""
+    pid = int(pid)
+    if pid in _recent_worker_exits:
+        return True
+    if os.name == "nt":
+        return False
+    try:
+        waited_pid, raw_status = os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, OSError):
+        return False
+    if waited_pid != pid:
+        return False
+    _record_worker_exit(pid, int(raw_status))
+    return True
+
+
+def _record_pending_decision_exit_proof(
+    conn: sqlite3.Connection, pending: dict[str, Any],
+) -> None:
+    """Commit exit proof separately so a reaper crash can replay finalization."""
+    # Liveness/termination reporting is not authoritative.  This helper is
+    # called by several reclaim paths, so enforce the wait/reap boundary here
+    # instead of trusting each caller to do it first.
+    if not _authoritative_worker_exit(pending["worker_pid"]):
+        return
+    with write_txn(conn):
+        current = _pending_review_decision(conn, pending["event"]["task_id"])
+        if current is None or current["generation"] != pending["generation"]:
+            return
+        if _pending_decision_exit_proven(conn, current):
+            return
+        _append_event(
+            conn,
+            pending["event"]["task_id"],
+            "review_decision_exit_proven",
+            {
+                "decision_event_id": pending["event_id"],
+                "decision_generation": pending["generation"],
+                "run_id": pending["run_id"],
+                "claim_lock": pending["claim_lock"],
+                "worker_pid": pending["worker_pid"],
+                "authority_id": pending["authority_id"],
+            },
+            run_id=pending["run_id"],
+        )
+
+
+def _finalize_pending_review_decision(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[Task]:
+    """Atomically retire a proven decision's run/claim and expose its successor."""
+    with write_txn(conn):
+        pending = _pending_review_decision(conn, task_id)
+        if pending is None:
+            return None
+        if not _pending_decision_exit_proven(conn, pending):
+            if not _authoritative_worker_exit(pending["worker_pid"]):
+                return None
+            _append_event(
+                conn,
+                task_id,
+                "review_decision_exit_proven",
+                {
+                    "decision_event_id": pending["event_id"],
+                    "decision_generation": pending["generation"],
+                    "run_id": pending["run_id"],
+                    "claim_lock": pending["claim_lock"],
+                    "worker_pid": pending["worker_pid"],
+                    "authority_id": pending["authority_id"],
+                },
+                run_id=pending["run_id"],
+            )
+        payload = pending["payload"]
+        if pending["kind"] == "review_approved":
+            successor = _canonical_assignee(payload.get("finalizer"))
+            outcome = "approved"
+            summary = str(payload.get("summary") or "")
+        else:
+            successor = _canonical_assignee(payload.get("programmer"))
+            outcome = "changes_requested"
+            summary = str(payload.get("reason") or "")
+        if not successor:
+            raise RuntimeError(
+                f"cannot finalize review decision for {task_id}: successor is missing"
+            )
+        current = conn.execute(
+            "SELECT status, assignee, claim_lock, claim_expires, worker_pid, "
+            "       current_run_id FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        if current is None or (
+            current["status"] not in _ACTIVE_REVIEW_TASK_STATUSES
+            or current["assignee"] != payload.get("reviewer")
+            or current["claim_lock"] != pending["claim_lock"]
+            or current["current_run_id"] != pending["run_id"]
+            or current["worker_pid"] != pending["worker_pid"]
+        ):
+            return None
+        gate = pending.get("gate")
+        if gate is not None and gate["state"] != "retired":
+            gate_cur = conn.execute(
+                "UPDATE task_launch_gates SET state='retired', closed_at=?, "
+                "reason='review decision finalized', recovery_required=0, "
+                "recovery_reason=NULL WHERE id=? AND task_id=? AND run_id=? "
+                "AND claim_lock=? AND gate_pid=? AND authority_id=? "
+                "AND state IN ('attached', 'authorized', 'prepared', 'released', "
+                "'revalidation_failed')",
+                (
+                    int(time.time()), gate["id"], task_id, pending["run_id"],
+                    pending["claim_lock"], pending["worker_pid"],
+                    pending["authority_id"],
+                ),
+            )
+            if gate_cur.rowcount != 1:
+                return None
+        cur = conn.execute(
+            "UPDATE tasks SET status='ready', assignee=?, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, completed_at=NULL, "
+            "block_kind=NULL, recovery_required=0, recovery_reason=NULL "
+            "WHERE id=? AND status IN ('review', 'running') "
+            "AND assignee=? AND current_run_id=? AND claim_lock=? AND worker_pid=?",
+            (
+                successor, task_id, payload.get("reviewer"), pending["run_id"],
+                pending["claim_lock"], pending["worker_pid"],
+            ),
+        )
+        if cur.rowcount != 1:
+            return None
+        reviewer_run_id = _end_run(
+            conn,
+            task_id,
+            outcome=outcome,
+            summary=summary,
+            expected_run_id=pending["run_id"],
+            metadata={
+                "decision_generation": pending["generation"],
+                "decision_event_id": pending["event_id"],
+                "physical_retirement": "reaped",
+            },
+        )
+        conn.execute(
+            "UPDATE task_runs SET recovery_required=0, recovery_reason=NULL "
+            "WHERE id=?",
+            (pending["run_id"],),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "review_decision_finalized",
+            {
+                "decision_event_id": pending["event_id"],
+                "decision_generation": pending["generation"],
+                "run_id": pending["run_id"],
+                "claim_lock": pending["claim_lock"],
+                "worker_pid": pending["worker_pid"],
+                "authority_id": pending["authority_id"],
+                "outcome": outcome,
+                "successor": successor,
+            },
+            run_id=reviewer_run_id,
+        )
+        if _has_sticky_block(conn, task_id):
+            _append_event(conn, task_id, "unblocked", {"source": outcome})
+        _REVIEW_LAUNCH_HANDLES.pop(int(pending["worker_pid"]), None)
+        return get_task(conn, task_id)
 
 
 def _latest_review_directive_id(conn: sqlite3.Connection, task_id: str) -> int:
@@ -5152,6 +5665,10 @@ def submit_task_for_review(
             return None
         if expected_status is not None and row["status"] != expected_status:
             return None
+        if _task_retirement_fenced(conn, task_id):
+            raise RuntimeError(
+                f"cannot submit {task_id}: physical retirement is unresolved"
+            )
         if row["status"] not in {"running", "blocked", "ready"}:
             raise RuntimeError(
                 f"cannot submit {task_id} for review from status {row['status']!r}"
@@ -5584,11 +6101,34 @@ def request_changes(
             raise ValueError("expected_run_id must be a positive integer")
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, claim_expires, assignee, current_run_id "
-            "FROM tasks WHERE id=?", (task_id,),
+            "SELECT status, claim_lock, claim_expires, assignee, current_run_id, "
+            "       worker_pid, recovery_required FROM tasks WHERE id=?",
+            (task_id,),
         ).fetchone()
         if not row:
             return None
+        if bool(row["recovery_required"]):
+            raise RuntimeError(
+                f"cannot request changes for {task_id}: recovery-required physical "
+                "retirement is unresolved"
+            )
+        pending = _pending_review_decision(conn, task_id)
+        if pending is not None:
+            if (
+                expected_run_id == pending["run_id"]
+                and _pending_decision_matches_call(
+                    pending,
+                    kind="changes_requested",
+                    reviewer=reviewer_name or "",
+                    programmer=programmer,
+                    reason=reason,
+                )
+            ):
+                return get_task(conn, task_id)
+            raise RuntimeError(
+                f"cannot request changes for {task_id}: reviewer decision is "
+                "recorded and physical retirement is still pending"
+            )
 
         if recovery:
             return _recover_stranded_review_changes(
@@ -5699,6 +6239,55 @@ def request_changes(
                     f"programmer profile {programmer!r} is unavailable"
                 )
 
+        # A live reviewer PID has recorded the decision but still owns the
+        # current run.  Persist only the verdict; the authoritative reaper
+        # performs the later CAS transition after physical exit is proven.
+        if row["worker_pid"] is not None:
+            if expected_run_id is None:
+                raise RuntimeError(
+                    f"cannot request changes for {task_id}: reviewer run is missing"
+                )
+            decision_run_id = int(expected_run_id)
+            claim_event = conn.execute(
+                "SELECT id FROM task_events WHERE task_id=? AND run_id=? "
+                "AND kind='claimed' ORDER BY id DESC LIMIT 1",
+                (task_id, decision_run_id),
+            ).fetchone()
+            authority = _latest_reviewer_authority(conn, task_id)
+            if claim_event is None or authority is None:
+                raise RuntimeError(
+                    f"cannot request changes for {task_id}: reviewer generation "
+                    "identity is incomplete"
+                )
+            gate = conn.execute(
+                "SELECT id, gate_token FROM task_launch_gates WHERE task_id=? "
+                "AND run_id=? AND claim_lock=? AND gate_pid=? "
+                "AND state IN ('attached', 'authorized', 'prepared', 'released', "
+                "'revalidation_failed') ORDER BY id DESC LIMIT 1",
+                (task_id, decision_run_id, row["claim_lock"], int(row["worker_pid"])),
+            ).fetchone()
+            generation = secrets.token_urlsafe(24)
+            payload: dict[str, object] = {
+                "programmer": programmer,
+                "reason": reason,
+                "reviewer": reviewer_name,
+                "decision_generation": generation,
+                "run_id": decision_run_id,
+                "claim_lock": row["claim_lock"],
+                "worker_pid": int(row["worker_pid"]),
+                "authority_id": int(authority[0]),
+                "claim_event_id": int(claim_event["id"]),
+                "pending_retirement": True,
+            }
+            if gate is not None:
+                payload["gate_id"] = int(gate["id"])
+                payload["gate_token"] = gate["gate_token"]
+            _append_event(
+                conn, task_id, "changes_requested", payload,
+                run_id=decision_run_id,
+            )
+            return get_task(conn, task_id)
+
         predicates = ["id = ?", "status IN ('review', 'running')"]
         params: list[object] = [task_id]
         if expected_run_id is not None:
@@ -5801,12 +6390,34 @@ def approve_review(
 
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, claim_expires, assignee, current_run_id "
-            "FROM tasks WHERE id=?",
+            "SELECT status, claim_lock, claim_expires, assignee, current_run_id, "
+            "       worker_pid, recovery_required FROM tasks WHERE id=?",
             (task_id,),
         ).fetchone()
         if not row:
             return None
+        if bool(row["recovery_required"]):
+            raise RuntimeError(
+                f"cannot approve {task_id}: recovery-required physical retirement "
+                "is unresolved"
+            )
+        pending = _pending_review_decision(conn, task_id)
+        if pending is not None:
+            if (
+                expected_run_id == pending["run_id"]
+                and _pending_decision_matches_call(
+                    pending,
+                    kind="review_approved",
+                    reviewer=reviewer_name,
+                    summary=summary,
+                    head_sha=head_sha,
+                )
+            ):
+                return get_task(conn, task_id)
+            raise RuntimeError(
+                f"cannot approve {task_id}: reviewer decision is recorded and "
+                "physical retirement is still pending"
+            )
 
         # A lost tool response may cause the same reviewer process to retry
         # after the transition already committed.  Accept only the identical
@@ -5877,6 +6488,54 @@ def approve_review(
             raise RuntimeError(
                 f"cannot approve {task_id}: reviewer cannot be its own finalizer"
             )
+
+        # A live reviewer PID has recorded the decision but still owns the
+        # current run. Persist only the verdict; the authoritative reaper later
+        # performs the identity-bound retirement/finalizer handoff.
+        if row["worker_pid"] is not None:
+            if expected_run_id is None:
+                raise RuntimeError(
+                    f"cannot approve {task_id}: reviewer run is missing"
+                )
+            decision_run_id = int(expected_run_id)
+            claim_event = conn.execute(
+                "SELECT id FROM task_events WHERE task_id=? AND run_id=? "
+                "AND kind='claimed' ORDER BY id DESC LIMIT 1",
+                (task_id, decision_run_id),
+            ).fetchone()
+            authority = _latest_reviewer_authority(conn, task_id)
+            if claim_event is None or authority is None:
+                raise RuntimeError(
+                    f"cannot approve {task_id}: reviewer generation identity is incomplete"
+                )
+            gate = conn.execute(
+                "SELECT id, gate_token FROM task_launch_gates WHERE task_id=? "
+                "AND run_id=? AND claim_lock=? AND gate_pid=? "
+                "AND state IN ('attached', 'authorized', 'prepared', 'released', "
+                "'revalidation_failed') ORDER BY id DESC LIMIT 1",
+                (task_id, decision_run_id, row["claim_lock"], int(row["worker_pid"])),
+            ).fetchone()
+            generation = secrets.token_urlsafe(24)
+            payload: dict[str, object] = {
+                "reviewer": reviewer_name,
+                "head_sha": head_sha,
+                "summary": summary,
+                "finalizer": finalizer_name,
+                "decision_generation": generation,
+                "run_id": decision_run_id,
+                "claim_lock": row["claim_lock"],
+                "worker_pid": int(row["worker_pid"]),
+                "authority_id": int(authority[0]),
+                "claim_event_id": int(claim_event["id"]),
+                "pending_retirement": True,
+            }
+            if gate is not None:
+                payload["gate_id"] = int(gate["id"])
+                payload["gate_token"] = gate["gate_token"]
+            _append_event(
+                conn, task_id, "review_approved", payload, run_id=decision_run_id,
+            )
+            return get_task(conn, task_id)
 
         predicates = [
             "id = ?", "status IN ('review', 'running')", "current_run_id = ?",
@@ -6037,7 +6696,7 @@ def failover_review_task(
         and preflight["current_run_id"] != int(expected_run_id)
     ):
         return None
-    if bool(preflight["recovery_required"]):
+    if _task_retirement_fenced(conn, task_id):
         return None
     if preflight["claim_lock"] is not None:
         if not _retire_review_launch_gate(
@@ -6075,7 +6734,7 @@ def failover_review_task(
         if (
             row is None
             or row["status"] != "review"
-            or bool(row["recovery_required"])
+            or _task_retirement_fenced(conn, task_id)
         ):
             return None
         attempted_profiles = {
@@ -6201,6 +6860,8 @@ def heartbeat_claim(
     expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
     lock = claimer or _claimer_id()
     with write_txn(conn):
+        if _task_retirement_fenced(conn, task_id):
+            return False
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
             "WHERE id = ? AND status IN ('running', 'review') AND claim_lock = ?",
@@ -6338,6 +6999,40 @@ def release_stale_claims(
                 reason="ttl_expired_worker_alive",
             )
             continue
+        if bool(row["recovery_required"]):
+            if not row["worker_pid"] or not _authoritative_worker_exit(
+                int(row["worker_pid"])
+            ):
+                _mark_recovery_required(
+                    conn,
+                    row["id"],
+                    row["claim_lock"],
+                    reason="stale claim recovery marker lacks authoritative exit proof",
+                    termination=termination,
+                )
+                continue
+        pending = _pending_review_decision(conn, row["id"])
+        if pending is not None:
+            _record_pending_decision_exit_proof(conn, pending)
+            if _finalize_pending_review_decision(conn, row["id"]) is not None:
+                continue
+            _mark_recovery_required(
+                conn,
+                row["id"],
+                row["claim_lock"],
+                reason="review decision finalization identity changed after retirement",
+                termination=termination,
+            )
+            continue
+        if _review_decision_needs_retirement(conn, row["id"]):
+            _mark_recovery_required(
+                conn,
+                row["id"],
+                row["claim_lock"],
+                reason="review decision identity changed before stale reclaim",
+                termination=termination,
+            )
+            continue
         gate_to_retire = conn.execute(
             "SELECT * FROM task_launch_gates WHERE task_id=? AND gate_pid=? "
             "AND claim_lock=? AND state IN ('attached', 'authorized', 'prepared', 'released', 'revalidation_failed') "
@@ -6445,6 +7140,7 @@ def reclaim_task(
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
+    pending = _pending_review_decision(conn, task_id)
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
@@ -6457,6 +7153,39 @@ def reclaim_task(
             termination=termination,
         )
         return False
+    if pending is not None:
+        _record_pending_decision_exit_proof(conn, pending)
+        if _finalize_pending_review_decision(conn, task_id) is not None:
+            return True
+        _mark_recovery_required(
+            conn,
+            task_id,
+            prev_lock,
+            reason="review decision finalization identity changed during reclaim",
+            termination=termination,
+        )
+        return False
+    if _review_decision_needs_retirement(conn, task_id):
+        _mark_recovery_required(
+            conn,
+            task_id,
+            prev_lock,
+            reason="review decision identity changed during reclaim",
+            termination=termination,
+        )
+        return False
+    if bool(row["recovery_required"]):
+        if not row["worker_pid"] or not _authoritative_worker_exit(
+            int(row["worker_pid"])
+        ):
+            _mark_recovery_required(
+                conn,
+                task_id,
+                prev_lock,
+                reason="manual reclaim recovery marker lacks authoritative exit proof",
+                termination=termination,
+            )
+            return False
     gate_to_retire = conn.execute(
         "SELECT * FROM task_launch_gates WHERE task_id=? AND gate_pid=? "
         "AND claim_lock=? AND state IN ('attached', 'authorized', 'prepared', 'released', 'revalidation_failed') "
@@ -6532,6 +7261,13 @@ def reassign_task(
     Returns True if the reassign landed. ``profile`` may be ``None`` to
     unassign entirely.
     """
+    guard = conn.execute(
+        "SELECT recovery_required FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    if guard is None:
+        return False
+    if _task_retirement_fenced(conn, task_id):
+        return False
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
         reclaim_task(conn, task_id, reason=reason or "reassign")
@@ -6728,6 +7464,10 @@ def complete_task(
         review_row = conn.execute(
             "SELECT status FROM tasks WHERE id=?", (task_id,),
         ).fetchone()
+        if review_row is not None and _task_retirement_fenced(conn, task_id):
+            raise RuntimeError(
+                f"cannot complete {task_id}: physical retirement is unresolved"
+            )
         if review_row is not None and review_row["status"] == "review":
             raise RuntimeError(
                 "reviewer cannot complete a review task; use kanban_approve "
@@ -6773,6 +7513,10 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        if _task_retirement_fenced(conn, task_id):
+            raise RuntimeError(
+                f"cannot complete {task_id}: physical retirement is unresolved"
+            )
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -7597,6 +8341,8 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    if _task_retirement_fenced(conn, task_id):
+        return False
     if kind == "dependency" and str(reason or "").startswith(REVIEW_HANDOFF_PREFIX):
         handled, transitioned, run_id = _try_direct_review_required_handoff(
             conn,
@@ -7629,6 +8375,8 @@ def block_task(
             (task_id,),
         ).fetchone()
         if cur_row is None:
+            return False
+        if _task_retirement_fenced(conn, task_id):
             return False
         prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
         prev_recurrences = (
@@ -7837,6 +8585,8 @@ def promote_task(
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
+    if _task_retirement_fenced(conn, task_id):
+        return False, f"task {task_id} has unresolved physical retirement"
 
     cur_status = row["status"]
     if cur_status not in ("todo", "blocked"):
@@ -7895,6 +8645,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     now = int(time.time())
     with write_txn(conn):
+        if _task_retirement_fenced(conn, task_id):
+            return False
         stale = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
@@ -8275,6 +9027,10 @@ def decompose_triage_task(
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
+        if _task_retirement_fenced(conn, task_id):
+            raise RuntimeError(
+                f"cannot archive {task_id}: physical retirement is unresolved"
+            )
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -8307,6 +9063,8 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     second deliberate action.
     """
     with write_txn(conn):
+        if _task_retirement_fenced(conn, task_id):
+            return False
         row = conn.execute(
             "SELECT status FROM tasks WHERE id = ?",
             (task_id,),
@@ -8336,6 +9094,8 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     if the task was not found.
     """
     with write_txn(conn):
+        if _task_retirement_fenced(conn, task_id):
+            return False
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
@@ -8701,6 +9461,8 @@ def schedule_task(
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
     with write_txn(conn):
+        if _task_retirement_fenced(conn, task_id):
+            return False
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -9090,6 +9852,57 @@ def _worker_survived_termination(termination: dict) -> bool:
     return bool(termination.get("prev_pid") and not termination.get("terminated"))
 
 
+def _mark_recovery_required_locked(
+    conn: sqlite3.Connection,
+    task_id: str,
+    claim_lock: Optional[str],
+    *,
+    reason: str,
+    termination: Optional[dict[str, Any]] = None,
+) -> None:
+    """Mark task, active run, and active launch gate in one open transaction."""
+    bounded = _bounded_review_error(reason)
+    row = conn.execute(
+        "SELECT current_run_id, worker_pid, recovery_required, recovery_reason "
+        "FROM tasks WHERE id=? AND claim_lock IS ? "
+        "AND status IN ('running', 'review')",
+        (task_id, claim_lock),
+    ).fetchone()
+    if row is None:
+        return
+    already_same = bool(row["recovery_required"]) and row["recovery_reason"] == bounded
+    conn.execute(
+        "UPDATE tasks SET recovery_required=1, recovery_reason=?, "
+        "last_failure_error=? WHERE id=? AND claim_lock IS ?",
+        (bounded, bounded, task_id, claim_lock),
+    )
+    run_id = row["current_run_id"]
+    if run_id is not None:
+        conn.execute(
+            "UPDATE task_runs SET recovery_required=1, recovery_reason=? "
+            "WHERE id=? AND task_id=? AND claim_lock IS ? AND ended_at IS NULL",
+            (bounded, int(run_id), task_id, claim_lock),
+        )
+        if row["worker_pid"] is not None:
+            conn.execute(
+                "UPDATE task_launch_gates SET recovery_required=1, recovery_reason=? "
+                "WHERE task_id=? AND run_id=? AND claim_lock IS ? AND gate_pid=? "
+                "AND state IN ('attached', 'authorized', 'prepared', 'released', "
+                "'revalidation_failed')",
+                (bounded, task_id, int(run_id), claim_lock, int(row["worker_pid"])),
+            )
+    if already_same:
+        return
+    payload: dict[str, Any] = {
+        "reason": bounded,
+        "claim_lock": claim_lock,
+        "run_id": int(run_id) if run_id is not None else None,
+    }
+    if termination:
+        payload.update(termination)
+    _append_event(conn, task_id, "recovery_required", payload, run_id=run_id)
+
+
 def _mark_recovery_required(
     conn: sqlite3.Connection,
     task_id: str,
@@ -9105,29 +9918,10 @@ def _mark_recovery_required(
     run, and reviewer authority remain intact and no successor may be
     assigned.
     """
-    bounded = _bounded_review_error(reason)
     with write_txn(conn):
-        row = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id=? AND claim_lock IS ? "
-            "AND status IN ('running', 'review')",
-            (task_id, claim_lock),
-        ).fetchone()
-        if row is None:
-            return
-        conn.execute(
-            "UPDATE tasks SET recovery_required=1, recovery_reason=?, "
-            "last_failure_error=? WHERE id=? AND claim_lock IS ?",
-            (bounded, bounded, task_id, claim_lock),
+        _mark_recovery_required_locked(
+            conn, task_id, claim_lock, reason=reason, termination=termination,
         )
-        run_id = row["current_run_id"]
-        payload: dict[str, Any] = {
-            "reason": bounded,
-            "claim_lock": claim_lock,
-            "run_id": int(run_id) if run_id is not None else None,
-        }
-        if termination:
-            payload.update(termination)
-        _append_event(conn, task_id, "recovery_required", payload, run_id=run_id)
 
 
 def _defer_reclaim_for_live_worker(
@@ -9160,9 +9954,23 @@ def _defer_reclaim_for_live_worker(
         run_id = _current_run_id(conn, task_id)
         if run_id is not None:
             conn.execute(
-                "UPDATE task_runs SET claim_expires = ? WHERE id = ?",
-                (grace, run_id),
+                "UPDATE task_runs SET claim_expires = ?, recovery_required=1, "
+                "recovery_reason=? WHERE id = ?",
+                (grace, "worker termination not proven", run_id),
             )
+            pid = termination.get("prev_pid")
+            if pid:
+                conn.execute(
+                    "UPDATE task_launch_gates SET recovery_required=1, "
+                    "recovery_reason=? WHERE task_id=? AND run_id=? "
+                    "AND claim_lock IS ? AND gate_pid=? AND state IN "
+                    "('attached', 'authorized', 'prepared', 'released', "
+                    "'revalidation_failed')",
+                    (
+                        "worker termination not proven", task_id, run_id,
+                        claim_lock, int(pid),
+                    ),
+                )
         payload = {
             "reason": reason,
             "claim_lock": claim_lock,
@@ -9262,7 +10070,8 @@ def enforce_max_runtime(
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
-        "       t.max_runtime_seconds, t.claim_lock, t.status "
+        "       t.max_runtime_seconds, t.claim_lock, t.status, "
+        "       t.recovery_required "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status IN ('running', 'review') "
@@ -9320,6 +10129,38 @@ def enforce_max_runtime(
                 tid,
                 lock,
                 reason="max-runtime worker termination was not proven",
+                termination=termination,
+            )
+            continue
+        if bool(row["recovery_required"]):
+            if not row["worker_pid"] or not _authoritative_worker_exit(pid):
+                _mark_recovery_required(
+                    conn,
+                    tid,
+                    lock,
+                    reason="max-runtime recovery marker lacks authoritative exit proof",
+                    termination=termination,
+                )
+                continue
+        pending = _pending_review_decision(conn, tid)
+        if pending is not None:
+            _record_pending_decision_exit_proof(conn, pending)
+            if _finalize_pending_review_decision(conn, tid) is not None:
+                continue
+            _mark_recovery_required(
+                conn,
+                tid,
+                lock,
+                reason="review decision finalization identity changed after max-runtime retirement",
+                termination=termination,
+            )
+            continue
+        if _review_decision_needs_retirement(conn, tid):
+            _mark_recovery_required(
+                conn,
+                tid,
+                lock,
+                reason="review decision identity changed before max-runtime reclaim",
                 termination=termination,
             )
             continue
@@ -9443,6 +10284,7 @@ def detect_stale_running(
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, t.status, "
+        "       t.recovery_required, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -9486,6 +10328,42 @@ def detect_stale_running(
             _defer_reclaim_for_live_worker(
                 conn, tid, lock, now, termination,
                 reason="heartbeat_stale_worker_alive",
+            )
+            continue
+
+        if bool(row["recovery_required"]):
+            if not row["worker_pid"] or not _authoritative_worker_exit(
+                int(row["worker_pid"])
+            ):
+                _mark_recovery_required(
+                    conn,
+                    tid,
+                    lock,
+                    reason="heartbeat-stale recovery marker lacks authoritative exit proof",
+                    termination=termination,
+                )
+                continue
+
+        pending = _pending_review_decision(conn, tid)
+        if pending is not None:
+            _record_pending_decision_exit_proof(conn, pending)
+            if _finalize_pending_review_decision(conn, tid) is not None:
+                continue
+            _mark_recovery_required(
+                conn,
+                tid,
+                lock,
+                reason="review decision finalization identity changed after heartbeat-stale retirement",
+                termination=termination,
+            )
+            continue
+        if _review_decision_needs_retirement(conn, tid):
+            _mark_recovery_required(
+                conn,
+                tid,
+                lock,
+                reason="review decision identity changed before heartbeat-stale reclaim",
+                termination=termination,
             )
             continue
 
@@ -9654,6 +10532,45 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
+def _reap_pending_review_decisions(conn: sqlite3.Connection) -> None:
+    """Finalize decisions only after an authoritative child wait/reap proof."""
+    rows = conn.execute(
+        "SELECT id, worker_pid, claim_lock FROM tasks "
+        "WHERE status IN ('review', 'running') AND worker_pid IS NOT NULL "
+        "AND current_run_id IS NOT NULL AND claim_lock IS NOT NULL"
+    ).fetchall()
+    for row in rows:
+        pending = _pending_review_decision(conn, row["id"])
+        if pending is None:
+            if _review_decision_needs_retirement(conn, row["id"]):
+                _mark_recovery_required(
+                    conn,
+                    row["id"],
+                    row["claim_lock"],
+                    reason="review decision identity changed before authoritative retirement",
+                )
+            continue
+        if _pid_alive(int(row["worker_pid"])):
+            continue
+        if not _pending_decision_exit_proven(conn, pending):
+            if not _authoritative_worker_exit(int(row["worker_pid"])):
+                _mark_recovery_required(
+                    conn,
+                    row["id"],
+                    row["claim_lock"],
+                    reason="review decision worker exit was not authoritatively reaped",
+                )
+                continue
+        _record_pending_decision_exit_proof(conn, pending)
+        if _finalize_pending_review_decision(conn, row["id"]) is None:
+            _mark_recovery_required(
+                conn,
+                row["id"],
+                row["claim_lock"],
+                reason="review decision finalization identity changed after authoritative retirement",
+            )
+
+
 def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
@@ -9690,13 +10607,17 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # clean-exit-but-still-running case, which is accounted against its
     # own bounded violation streak instead of the unified failure
     # counter (see the post-txn loop below).
+    # This pass is deliberately outside the generic crash transaction.  Exit
+    # proof is committed before finalization so a reaper crash can replay the
+    # exact same decision without releasing the claim early.
+    _reap_pending_review_decisions(conn)
     crash_details: list[tuple[str, int, str, bool, str]] = []
     # (task_id, pid, claimer, protocol_violation, error_text)
     review_crashes: dict[str, str] = {}
     with write_txn(conn):
         rows = conn.execute(
             "SELECT t.id, t.worker_pid, t.claim_lock, t.status, "
-            "       t.current_run_id, t.assignee, "
+            "       t.current_run_id, t.assignee, t.recovery_required, "
             "       COALESCE(r.started_at, t.started_at) AS active_started_at "
             "FROM tasks t "
             "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -9709,6 +10630,14 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
                 continue
+            # A durable terminal decision, including one whose identity was
+            # mutated, owns this generation until its exact retirement path
+            # succeeds. Generic crash handling must never turn it into ready.
+            if _review_decision_needs_retirement(conn, row["id"]):
+                continue
+            if bool(row["recovery_required"]):
+                if not _authoritative_worker_exit(int(row["worker_pid"])):
+                    continue
             # Skip liveness check inside the launch-window grace period
             # so a freshly-spawned worker isn't reclaimed before its PID
             # is visible on /proc.
@@ -9716,11 +10645,23 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 row["active_started_at"]
                 if "active_started_at" in row.keys() else None
             )
+            revalidation_failed = conn.execute(
+                "SELECT 1 FROM task_launch_gates WHERE task_id=? AND gate_pid=? "
+                "AND claim_lock=? AND state='revalidation_failed' "
+                "ORDER BY id DESC LIMIT 1",
+                (row["id"], row["worker_pid"], row["claim_lock"]),
+            ).fetchone() is not None
             if started_at is not None:
                 grace = _resolve_crash_grace_seconds()
-                if time.time() - started_at < grace:
+                if time.time() - started_at < grace and not revalidation_failed:
                     continue
             if _pid_alive(row["worker_pid"]):
+                continue
+
+            # A terminal decision owns a separate retirement path. Never let
+            # generic crash handling clear its run/claim or manufacture a
+            # successor when the finalizer CAS did not complete.
+            if _pending_review_decision(conn, row["id"]) is not None:
                 continue
 
             pid = int(row["worker_pid"])
@@ -10304,9 +11245,14 @@ def _review_launch_startup_matches(
         gate = child_conn.execute(
             "SELECT g.task_id, g.run_id, g.claim_lock, g.assignee, "
             "g.authority_id, g.gate_token, g.gate_pid, g.state, "
+            "g.recovery_required AS gate_recovery_required, "
             "t.status, t.current_run_id, t.claim_lock AS task_claim, "
+            "t.claim_expires AS task_claim_expires, "
             "t.assignee AS task_assignee, t.worker_pid, t.recovery_required, "
-            "r.status AS run_status, r.worker_pid AS run_pid "
+            "r.task_id AS run_task_id, r.profile AS run_profile, "
+            "r.claim_lock AS run_claim, r.claim_expires AS run_claim_expires, "
+            "r.status AS run_status, r.worker_pid AS run_pid, "
+            "r.recovery_required AS run_recovery_required, r.ended_at AS run_ended_at "
             "FROM task_launch_gates g "
             "JOIN tasks t ON t.id = g.task_id "
             "JOIN task_runs r ON r.id = g.run_id AND r.task_id = g.task_id "
@@ -10315,21 +11261,57 @@ def _review_launch_startup_matches(
         ).fetchone()
         if gate is None:
             return False
+        now = int(time.time())
         if (
             gate["task_id"] != task_id
             or int(gate["run_id"]) != int(run_id)
             or gate["claim_lock"] != claim_lock
+            or gate["gate_token"] != gate_token
             or _canonical_assignee(gate["assignee"]) != _canonical_assignee(assignee)
             or int(gate["authority_id"]) != int(authority_id)
             or gate["state"] not in ("authorized", "prepared", "released")
+            or bool(gate["gate_recovery_required"])
             or gate["status"] != "review"
             or gate["current_run_id"] != int(run_id)
             or gate["task_claim"] != claim_lock
+            or gate["task_claim_expires"] is None
+            or int(gate["task_claim_expires"]) <= now
             or _canonical_assignee(gate["task_assignee"]) != _canonical_assignee(assignee)
             or int(gate["worker_pid"]) != int(gate_pid)
             or bool(gate["recovery_required"])
+            or gate["run_task_id"] != task_id
+            or _canonical_assignee(gate["run_profile"]) != _canonical_assignee(assignee)
+            or gate["run_claim"] != claim_lock
+            or gate["run_claim_expires"] is None
+            or int(gate["run_claim_expires"]) <= now
             or gate["run_status"] != "running"
+            or gate["run_ended_at"] is not None
+            or bool(gate["run_recovery_required"])
             or int(gate["run_pid"]) != int(gate_pid)
+        ):
+            return False
+        claim_event = child_conn.execute(
+            "SELECT id, run_id, payload FROM task_events WHERE task_id=? "
+            "AND run_id=? AND kind='claimed' ORDER BY id DESC LIMIT 1",
+            (task_id, int(run_id)),
+        ).fetchone()
+        latest_claim = child_conn.execute(
+            "SELECT id, run_id FROM task_events WHERE task_id=? AND kind='claimed' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        claim_payload = _event_payload(claim_event)
+        if (
+            claim_event is None
+            or latest_claim is None
+            or int(latest_claim["id"]) != int(claim_event["id"])
+            or int(latest_claim["run_id"]) != int(run_id)
+            or claim_payload.get("source_status") != "review"
+            or claim_payload.get("run_id") != int(run_id)
+            or claim_payload.get("lock") != claim_lock
+            or claim_payload.get("review_authority_id") != int(authority_id)
+            or claim_payload.get("assignee") != _canonical_assignee(assignee)
+            or claim_payload.get("profile") != _canonical_assignee(assignee)
         ):
             return False
         return _latest_unconsumed_reviewer_authority(child_conn, task_id) == (
@@ -10462,7 +11444,7 @@ def _review_spawn_cas_matches(
 
     run = conn.execute(
         "SELECT task_id, profile, status, claim_lock, claim_expires, "
-        "worker_pid, ended_at FROM task_runs WHERE id=?",
+        "worker_pid, recovery_required, ended_at FROM task_runs WHERE id=?",
         (run_id,),
     ).fetchone()
     if run is None:
@@ -10472,6 +11454,7 @@ def _review_spawn_cas_matches(
         or run["status"] != "running"
         or run["ended_at"] is not None
         or run["claim_lock"] != expected_claim
+        or bool(run["recovery_required"])
         or (
             run["worker_pid"] != int(expected_worker_pid)
             if expected_worker_pid is not None
@@ -10521,6 +11504,8 @@ def _review_spawn_cas_matches(
         return False
     return bool(
         claim_payload.get("source_status") == "review"
+        and claim_payload.get("assignee") == assignee
+        and claim_payload.get("profile") == reviewer
         and bound_authority_id == authority_id
         and bound_run_id == run_id
         and claim_payload.get("lock") == expected_claim
@@ -10553,7 +11538,7 @@ def _authorize_review_spawn(
                 "SELECT * FROM task_launch_gates WHERE gate_token=? AND gate_pid=?",
                 (gate_token, int(gate_pid)),
             ).fetchone()
-            if gate is None or gate["state"] != "attached":
+            if gate is None or gate["state"] != "attached" or bool(gate["recovery_required"]):
                 return False
             if expected_run_id is None or expected_authority is None:
                 return False
@@ -10731,7 +11716,7 @@ def _materialize_review_launch_workspace(
             "AND gate_token=?",
             (task.id, int(pid), gate_token),
         ).fetchone()
-        if gate is None or gate["state"] != "authorized":
+        if gate is None or gate["state"] != "authorized" or bool(gate["recovery_required"]):
             return False
         if not _review_spawn_cas_matches(
             conn,
@@ -10808,7 +11793,7 @@ def _release_review_launch(
             "AND gate_token=?",
             (task.id, int(pid), gate_token),
         ).fetchone()
-        if gate is None or gate["state"] != "prepared":
+        if gate is None or gate["state"] != "prepared" or bool(gate["recovery_required"]):
             return False
         if not _review_spawn_cas_matches(
             conn,
@@ -10823,11 +11808,6 @@ def _release_review_launch(
         conn.execute(
             "UPDATE task_launch_gates SET state='released' WHERE id=? AND state='prepared'",
             (gate["id"],),
-        )
-        conn.execute(
-            "UPDATE tasks SET recovery_required=0, recovery_reason=NULL WHERE id=? "
-            "AND worker_pid=? AND current_run_id=? AND claim_lock=?",
-            (task.id, int(pid), int(run_id), task.claim_lock),
         )
         _append_event(
             conn,
@@ -10958,6 +11938,8 @@ def _set_worker_pid(
     then checked and updated in one immediate transaction.
     """
     pid = int(pid)
+    if _task_retirement_fenced(conn, task_id):
+        return False
     if expected_authority is None:
         # Keep the old helper signature compatible, but do not let an
         # authority-bound review use that signature as a CAS bypass. Older
@@ -11090,6 +12072,7 @@ def _plan_review_handoffs(
         rows = conn.execute(
             "SELECT id, assignee, status FROM tasks "
             "WHERE status IN ('todo', 'ready') AND claim_lock IS NULL "
+            "AND recovery_required=0 "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
     except sqlite3.Error:
@@ -11219,11 +12202,13 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, recovery_required FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
         return None
+    if bool(row["recovery_required"]) or _task_retirement_fenced(conn, task_id):
+        return "recovery_required"
 
     now = int(time.time())
 
@@ -11337,11 +12322,13 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     spawnable work the dispatcher "should" have picked up.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "    AND claim_lock IS NULL AND recovery_required=0"
     ).fetchall()
     for row in rows:
+        if _task_retirement_fenced(conn, row["id"]):
+            continue
         if _profile_is_configured(row["assignee"]):
             return True
     return False
@@ -11357,11 +12344,13 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     strict configured-profile resolver.
     """
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
-        "    AND claim_lock IS NULL"
+        "    AND claim_lock IS NULL AND recovery_required=0"
     ).fetchall()
     for row in rows:
+        if _task_retirement_fenced(conn, row["id"]):
+            continue
         if _profile_is_configured(row["assignee"]):
             return True
     return False
@@ -11521,7 +12510,8 @@ def _dispatch_once_locked(
     if not dry_run:
         with write_txn(conn):
             for parked in conn.execute(
-                "SELECT id FROM tasks WHERE status='ready' AND claim_lock IS NULL"
+                "SELECT id FROM tasks WHERE status='ready' AND claim_lock IS NULL "
+                "AND recovery_required=0"
             ).fetchall():
                 parked_id = parked["id"]
                 if pending_review_handoff(conn, parked_id) and _has_unfinished_parents(conn, parked_id):
@@ -11560,6 +12550,7 @@ def _dispatch_once_locked(
     if dry_run:
         ready_rows = conn.execute(
             "SELECT id, assignee FROM tasks WHERE claim_lock IS NULL AND "
+            "recovery_required=0 AND "
             "(status = 'ready' OR (status = 'todo' AND NOT EXISTS ("
             "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
             "WHERE l.child_id = tasks.id AND p.status NOT IN ('done', 'archived')"
@@ -11569,6 +12560,7 @@ def _dispatch_once_locked(
         ready_rows = conn.execute(
             "SELECT id, assignee FROM tasks "
             "WHERE status = 'ready' AND claim_lock IS NULL "
+            "AND recovery_required=0 "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
     # Honour kanban.max_in_progress: if the board already has enough running
@@ -11820,9 +12812,12 @@ def _dispatch_once_locked(
     review_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'review' AND claim_lock IS NULL "
+        "AND recovery_required=0 "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     for row in review_rows:
+        if _task_retirement_fenced(conn, row["id"]):
+            continue
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
         authority = _latest_unconsumed_reviewer_authority(conn, row["id"])

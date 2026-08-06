@@ -323,6 +323,9 @@ def test_completed_review_cycle_does_not_re_enter_review_lane(
             conn, task_id, "programmer", reason="fix tests",
             trusted_operator=True,
         ) is not None
+        # The reviewer verdict is durable but remains fenced until its
+        # deciding worker has an authoritative reap record.
+        kb._record_worker_exit(99, 0)
         spawned = []
         kb.dispatch_once(conn, spawn_fn=_spawn_recorder(spawned, pid=4243))
         assert spawned == [(task_id, "programmer")]

@@ -142,6 +142,370 @@ def _assert_no_mutation(conn, task_id, before, review):
     assert current is not None and current.current_run_id == review.current_run_id
 
 
+def _start_real_review_decision_child(conn, task_id, review, tmp_path, decision):
+    """Attach a real child as the reviewer PID, then let it record one verdict."""
+    ready = tmp_path / f"{decision}-ready"
+    go = tmp_path / f"{decision}-go"
+    recorded = tmp_path / f"{decision}-recorded"
+    finish = tmp_path / f"{decision}-finish"
+    script = tmp_path / f"{decision}-reviewer.py"
+    script.write_text(
+        "from pathlib import Path\n"
+        "import os, time\n"
+        "from hermes_cli import kanban_db as kb\n"
+        "ready = Path(os.environ['READY'])\n"
+        "go = Path(os.environ['GO'])\n"
+        "recorded = Path(os.environ['RECORDED'])\n"
+        "finish = Path(os.environ['FINISH'])\n"
+        "ready.write_text('ready')\n"
+        "while not go.exists(): time.sleep(0.01)\n"
+        "conn = kb.connect(db_path=Path(os.environ['KDB']))\n"
+        "task_id = os.environ['TASK']\n"
+        "run_id = int(os.environ['RUN_ID'])\n"
+        "claim = os.environ['CLAIM']\n"
+        "if os.environ['DECISION'] == 'approve':\n"
+        "    kb.approve_review(conn, task_id, reviewer=os.environ['REVIEWER'],\n"
+        "        summary='subprocess approval', head_sha=os.environ['HEAD'],\n"
+        "        expected_claim=claim, expected_run_id=run_id)\n"
+        "else:\n"
+        "    kb.request_changes(conn, task_id, os.environ['PROGRAMMER'],\n"
+        "        reviewer=os.environ['REVIEWER'], reason='subprocess correction',\n"
+        "        expected_claim=claim, expected_run_id=run_id)\n"
+        "recorded.write_text('recorded')\n"
+        "while not finish.exists(): time.sleep(0.01)\n"
+        "conn.close()\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(Path.cwd()) + os.pathsep + env.get("PYTHONPATH", "")
+    env.update({
+        "KDB": str(kb.kanban_db_path()),
+        "TASK": task_id,
+        "RUN_ID": str(review.current_run_id),
+        "CLAIM": str(review.claim_lock),
+        "REVIEWER": str(review.assignee),
+        "PROGRAMMER": "programmer",
+        "HEAD": HEAD_SHA,
+        "DECISION": decision,
+        "READY": str(ready),
+        "GO": str(go),
+        "RECORDED": str(recorded),
+        "FINISH": str(finish),
+    })
+    child = subprocess.Popen([sys.executable, str(script)], env=env, cwd=str(Path.cwd()))
+    deadline = time.time() + 5
+    while not ready.exists() and time.time() < deadline:
+        time.sleep(0.01)
+    assert ready.exists()
+    authority = kb._latest_reviewer_authority(conn, task_id)
+    assert authority is not None
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=? AND current_run_id=? "
+            "AND claim_lock=?",
+            (child.pid, task_id, review.current_run_id, review.claim_lock),
+        )
+        conn.execute(
+            "UPDATE task_runs SET worker_pid=? WHERE id=? AND task_id=? "
+            "AND claim_lock=?",
+            (child.pid, review.current_run_id, task_id, review.claim_lock),
+        )
+        conn.execute(
+            "INSERT INTO task_launch_gates "
+            "(task_id, run_id, claim_lock, assignee, authority_id, gate_token, "
+            "gate_pid, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'released', ?)",
+            (
+                task_id, review.current_run_id, review.claim_lock, review.assignee,
+                authority[0], f"test-token-{child.pid}", child.pid, int(time.time()),
+            ),
+        )
+    attached = conn.execute(
+        "SELECT worker_pid FROM tasks WHERE id=?", (task_id,),
+    ).fetchone()
+    assert attached is not None and attached["worker_pid"] == child.pid
+    go.write_text("go")
+    deadline = time.time() + 5
+    while not recorded.exists() and time.time() < deadline:
+        time.sleep(0.01)
+    assert recorded.exists()
+    return child, finish
+
+
+@pytest.mark.parametrize("decision", ["approve", "request_changes"])
+def test_real_terminal_decision_waits_for_physical_reviewer_retirement(
+    kanban_home, tmp_path, decision,
+):
+    """A durable verdict cannot clear the deciding run before its PID is reaped."""
+    with kb.connect() as conn:
+        task_id, review, _host = _review_card(conn)
+        child, finish = _start_real_review_decision_child(
+            conn, task_id, review, tmp_path, decision,
+        )
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.status == "review"
+        assert current.current_run_id == review.current_run_id
+        assert current.claim_lock == review.claim_lock
+        assert current.worker_pid == child.pid
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind=?",
+            (task_id, "review_approved" if decision == "approve" else "changes_requested"),
+        ).fetchone()[0] == 1
+
+        # The old implementation immediately exposed a ready successor here.
+        assert kb.claim_task(conn, task_id, claimer="local:successor") is None
+        assert kb.dispatch_once(conn).spawned == []
+        fenced = kb.get_task(conn, task_id)
+        assert fenced is not None and fenced.worker_pid == child.pid
+
+        finish.write_text("finish")
+        deadline = time.time() + 5
+        while kb._pid_alive(child.pid) and time.time() < deadline:
+            time.sleep(0.01)
+        assert not kb._pid_alive(child.pid)
+        kb.reap_worker_zombies()
+        assert kb.detect_crashed_workers(conn) == []
+        finalized = kb.get_task(conn, task_id)
+        assert finalized is not None
+        assert finalized.status == "ready"
+        assert finalized.assignee == "programmer"
+        assert finalized.worker_pid is None
+        successor = kb.claim_task(conn, task_id, claimer="local:successor")
+        assert successor is not None and successor.status == "running"
+
+
+def test_pending_review_decision_replays_after_reaper_crash(kanban_home, tmp_path, monkeypatch):
+    """A durable exit proof lets a later reaper finish an interrupted finalization."""
+    with kb.connect() as conn:
+        task_id, review, _host = _review_card(conn)
+        child, finish = _start_real_review_decision_child(
+            conn, task_id, review, tmp_path, "approve",
+        )
+        finish.write_text("finish")
+        deadline = time.time() + 5
+        while kb._pid_alive(child.pid) and time.time() < deadline:
+            time.sleep(0.01)
+        assert not kb._pid_alive(child.pid)
+        kb.reap_worker_zombies()
+
+        original = kb._finalize_pending_review_decision
+        monkeypatch.setattr(
+            kb,
+            "_finalize_pending_review_decision",
+            lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("reaper crashed")),
+        )
+        with pytest.raises(RuntimeError, match="reaper crashed"):
+            kb.detect_crashed_workers(conn)
+        pending = kb.get_task(conn, task_id)
+        assert pending is not None and pending.worker_pid == child.pid
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind='review_decision_exit_proven'",
+            (task_id,),
+        ).fetchone()[0] == 1
+
+        monkeypatch.setattr(kb, "_finalize_pending_review_decision", original)
+        assert kb.detect_crashed_workers(conn) == []
+        finalized = kb.get_task(conn, task_id)
+        assert finalized is not None and finalized.status == "ready"
+
+
+@pytest.mark.parametrize("reclaimer", ["max_runtime", "stale_running"])
+def test_pending_review_decision_stays_fenced_across_reclaimers(
+    kanban_home, reclaimer, monkeypatch,
+):
+    """Timeout/stale paths must not bypass the terminal-decision retirement fence."""
+    monkeypatch.setattr(kb, "_authoritative_worker_exit", lambda _pid: False)
+    with kb.connect() as conn:
+        task_id, review, _host = _review_card(conn)
+        reviewer_pid = 987654
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET worker_pid=?, started_at=0, "
+                "last_heartbeat_at=0, max_runtime_seconds=1 WHERE id=?",
+                (reviewer_pid, task_id),
+            )
+            conn.execute(
+                "UPDATE task_runs SET worker_pid=?, started_at=0 WHERE id=?",
+                (reviewer_pid, review.current_run_id),
+            )
+        kb.approve_review(
+            conn,
+            task_id,
+            reviewer=review.assignee,
+            summary="fenced decision",
+            head_sha=HEAD_SHA,
+            expected_claim=review.claim_lock,
+            expected_run_id=review.current_run_id,
+        )
+        assert kb._pending_review_decision(conn, task_id) is not None
+
+        if reclaimer == "max_runtime":
+            reclaimed = kb.enforce_max_runtime(
+                conn, signal_fn=lambda _pid, _sig: None,
+            )
+        else:
+            reclaimed = kb.detect_stale_running(
+                conn,
+                stale_timeout_seconds=1,
+                signal_fn=lambda _pid, _sig: None,
+            )
+
+        assert reclaimed == []
+        current = kb.get_task(conn, task_id)
+        assert current is not None
+        assert current.status == "review"
+        assert current.worker_pid == reviewer_pid
+        assert current.current_run_id == review.current_run_id
+        assert current.claim_lock == review.claim_lock
+        assert current.recovery_required is True
+        assert kb.claim_task(conn, task_id, claimer="local:successor") is None
+
+
+@pytest.mark.parametrize("marker", ["task", "run", "gate"])
+def test_recovery_required_reviewer_cannot_decide(kanban_home, marker):
+    with kb.connect() as conn:
+        task_id, review, _host = _review_card(conn)
+        if marker == "task":
+            conn.execute(
+                "UPDATE tasks SET recovery_required=1, recovery_reason='test' WHERE id=?",
+                (task_id,),
+            )
+        elif marker == "run":
+            conn.execute(
+                "UPDATE task_runs SET recovery_required=1, recovery_reason='test' WHERE id=?",
+                (review.current_run_id,),
+            )
+        else:
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET worker_pid=? WHERE id=?",
+                    (987654, task_id),
+                )
+                conn.execute(
+                    "UPDATE task_runs SET worker_pid=? WHERE id=?",
+                    (987654, review.current_run_id),
+                )
+                authority = kb._latest_reviewer_authority(conn, task_id)
+                assert authority is not None
+                conn.execute(
+                    "INSERT INTO task_launch_gates "
+                    "(task_id, run_id, claim_lock, assignee, authority_id, gate_token, "
+                    "gate_pid, state, recovery_required, recovery_reason, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'released', 1, 'test', ?)",
+                    (task_id, review.current_run_id, review.claim_lock, review.assignee,
+                     authority[0], "recovery-gate", 987654, int(time.time())),
+                )
+        conn.commit()
+        before = _snapshot(conn, task_id)
+        with pytest.raises(RuntimeError, match="recovery-required|recovery required"):
+            kb.approve_review(
+                conn, task_id, reviewer=review.assignee, summary="blocked",
+                head_sha=HEAD_SHA, expected_claim=review.claim_lock,
+                expected_run_id=review.current_run_id,
+            )
+        assert _snapshot(conn, task_id) == before
+
+
+def test_recovery_required_rejects_generic_claim_reassign_and_successor(kanban_home):
+    with kb.connect() as conn:
+        task_id, review, _host = _review_card(conn)
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, worker_pid=NULL, "
+            "recovery_required=1, recovery_reason='test' WHERE id=?",
+            (task_id,),
+        )
+        conn.commit()
+        assert kb.claim_task(conn, task_id, claimer="local:successor") is None
+        with pytest.raises(RuntimeError, match="recovery-required|recovery required"):
+            kb.assign_task(conn, task_id, "programmer-2")
+        assert kb.dispatch_once(conn).spawned == []
+        current = kb.get_task(conn, task_id)
+        assert current is not None and current.recovery_required is True
+
+
+@pytest.mark.parametrize("mutation", ["task_expiry", "run_expiry", "run_profile", "run_claim"])
+def test_real_review_startup_rejects_expired_or_mutated_run_identity(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path, mutation,
+):
+    """A stopped released child cannot pass a stale task/run identity to exec."""
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(
+        profiles, "list_profiles", lambda: [SimpleNamespace(name="code-reviewer")],
+    )
+    sentinel = tmp_path / "stale-identity-ran"
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        "from pathlib import Path\n"
+        "import os\n"
+        "Path(os.environ['REVIEW_SENTINEL']).write_text('ran')\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: [sys.executable, str(worker)])
+    monkeypatch.setenv(
+        "PYTHONPATH", str(Path(kb.__file__).resolve().parents[1]) + os.pathsep + os.environ.get("PYTHONPATH", ""),
+    )
+    monkeypatch.setenv("REVIEW_SENTINEL", str(sentinel))
+
+    with kb.connect() as conn:
+        task_id, _host = _unclaimed_review_card(conn, reviewer="code-reviewer")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        original_release = kb._ReviewLaunchGateHandle.release
+
+        def release_after_identity_mutation(handle):
+            os.kill(handle.pid, getattr(__import__('signal'), "SIGSTOP"))
+            released = original_release(handle)
+            run_id = conn.execute(
+                "SELECT current_run_id FROM tasks WHERE id=?", (task_id,),
+            ).fetchone()["current_run_id"]
+            with kb.write_txn(conn):
+                if mutation == "task_expiry":
+                    conn.execute("UPDATE tasks SET claim_expires=0 WHERE id=?", (task_id,))
+                elif mutation == "run_expiry":
+                    conn.execute(
+                        "UPDATE task_runs SET claim_expires=0 WHERE id=?",
+                        (run_id,),
+                    )
+                elif mutation == "run_profile":
+                    conn.execute(
+                        "UPDATE task_runs SET profile='stale-reviewer' WHERE id=?",
+                        (run_id,),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE task_runs SET claim_lock='stale-owner' WHERE id=?",
+                        (run_id,),
+                    )
+            os.kill(handle.pid, getattr(__import__('signal'), "SIGCONT"))
+            return released
+
+        monkeypatch.setattr(
+            kb._ReviewLaunchGateHandle, "release", release_after_identity_mutation,
+        )
+        result = kb.dispatch_once(conn)
+        assert result.spawned == [(task_id, "code-reviewer", str(kb.workspaces_root() / task_id))]
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            gate = conn.execute(
+                "SELECT state, gate_pid, workspace_path FROM task_launch_gates "
+                "WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if gate is not None and gate["state"] == "revalidation_failed":
+                break
+            time.sleep(0.01)
+        assert gate is not None and gate["state"] == "revalidation_failed"
+        assert not sentinel.exists()
+        assert gate["workspace_path"]
+        while kb._pid_alive(int(gate["gate_pid"])) and time.time() < deadline:
+            time.sleep(0.01)
+        kb.reap_worker_zombies()
+        assert kb.detect_crashed_workers(conn) == [task_id]
+        assert not Path(gate["workspace_path"]).exists()
+
+
 def test_real_review_child_is_dormant_until_authorized_release(
     kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
 ):
@@ -2357,13 +2721,17 @@ def test_approval_leaves_no_dead_pid_for_crash_reaper(kanban_home, monkeypatch):
         assert approved is not None
         before = _events(conn, task_id)
         assert kb.detect_crashed_workers(conn) == []
-        assert _events(conn, task_id) == before
+        after = _events(conn, task_id)
+        assert after == before + ["recovery_required"]
         current = kb.get_task(conn, task_id)
         assert current is not None
-        assert current.status == "ready"
-        assert current.worker_pid is None
-        assert current.last_failure_error is None
-        assert "protocol_violation" not in before
+        assert current.status == "review"
+        assert current.worker_pid == reviewer_pid
+        assert current.current_run_id == review.current_run_id
+        assert current.claim_lock == review.claim_lock
+        assert current.recovery_required is True
+        assert current.last_failure_error is not None
+        assert "protocol_violation" not in after
 
 
 def test_approved_card_is_claimable_by_fresh_finalizer(
