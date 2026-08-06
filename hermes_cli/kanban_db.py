@@ -72,6 +72,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import io
 import json
 import os
 import re
@@ -658,6 +659,15 @@ def _canonical_board_from_db_path(path: Path) -> Optional[str]:
     """
     try:
         resolved = path.expanduser().resolve(strict=False)
+        # A canonical custom-board layout identifies its slug without
+        # consulting the ambient board root.  This matters when the DB path is
+        # pinned by HERMES_KANBAN_DB but a worker changes HERMES_KANBAN_HOME.
+        if (
+            resolved.name == "kanban.db"
+            and resolved.parent.parent.name == "boards"
+            and resolved.parent.parent.parent.name == "kanban"
+        ):
+            return _normalize_board_slug(resolved.parent.name)
         default_db = (kanban_home() / "kanban.db").resolve(strict=False)
         if resolved == default_db:
             return DEFAULT_BOARD
@@ -1575,6 +1585,24 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Dispatcher-authoritative reviewer policy snapshot.  This is deliberately
+-- per-board state: consumers read it from the same SQLite connection that
+-- owns task generation/claims instead of resolving policy from a worker's
+-- ambient HERMES_KANBAN_HOME.  ``state='absent'`` is an explicit compatible
+-- discovery mode; a missing row is never treated as absent by consumers.
+CREATE TABLE IF NOT EXISTS kanban_reviewer_policy (
+    id                INTEGER PRIMARY KEY CHECK (id = 1),
+    state             TEXT NOT NULL CHECK (state IN ('absent', 'pinned', 'invalid')),
+    profile           TEXT,
+    error_code        TEXT,
+    error_detail      TEXT,
+    authority_db_path TEXT NOT NULL,
+    source_path       TEXT,
+    source_digest     TEXT,
+    policy_version    INTEGER NOT NULL DEFAULT 1,
+    updated_at        INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -2410,8 +2438,12 @@ def connect(
         if resolved_board is None:
             resolved_board = _canonical_board_from_db_path(path)
     else:
-        resolved_board = resolved_board or get_current_board()
         path = kanban_db_path(board=board)
+        resolved_board = (
+            resolved_board
+            or _canonical_board_from_db_path(path)
+            or get_current_board()
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive
@@ -2549,7 +2581,9 @@ def init_db(
     re-runs the migration pass. Callers that know the on-disk schema
     may have drifted — tests that write legacy event kinds directly,
     external tools that upgrade an old DB file — can call this to
-    force re-migration.
+    force re-migration. Reviewer policy synchronization is intentionally not
+    part of generic initialization: only the authoritative non-dry-run
+    dispatcher tick may resolve and persist the DB-bound policy snapshot.
     """
     if db_path is not None:
         path = db_path
@@ -4061,7 +4095,23 @@ def create_task(
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
-    board_slug = _dependency_board(conn, board)
+    # An arbitrary explicit DB path is still a valid target for legacy,
+    # dependency-free task creation. Do not infer its board from ambient
+    # state; use the neutral default label only for this non-provider path.
+    # Dependency-bearing and project-linked tasks remain fail-closed until
+    # their connection has an explicit or canonical board binding.
+    allow_unbound_simple_task = (
+        not parents
+        and not project_id
+        and (dependency_kind is None or dependency_kind == "completion")
+        and provider_name is None
+        and not dependency_metadata
+    )
+    board_slug = _dependency_board(
+        conn,
+        board,
+        allow_unbound=allow_unbound_simple_task,
+    )
     idempotency_key = str(idempotency_key).strip() if idempotency_key else None
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
@@ -4803,7 +4853,15 @@ class DependencyResolution:
 def _dependency_board(
     conn: sqlite3.Connection,
     board: Optional[str] = None,
+    *,
+    allow_unbound: bool = False,
 ) -> str:
+    """Resolve a board without consulting ambient state for unbound DBs.
+
+    ``allow_unbound`` is reserved for dependency-free legacy task creation,
+    which needs only a stable label for board metadata. Provider, dependency,
+    and project paths keep the strict fail-closed behavior.
+    """
     explicit = _normalize_board_slug(board)
     bound = getattr(conn, "_hermes_kanban_board", None)
     if bound:
@@ -4820,6 +4878,8 @@ def _dependency_board(
     derived = _canonical_board_from_db_path(path) if path is not None else None
     if derived:
         return derived
+    if allow_unbound:
+        return DEFAULT_BOARD
     raise ValueError(
         "kanban connection has no bound board; pass board= explicitly for "
         "custom or ambiguous db_path connections"
@@ -8382,10 +8442,14 @@ class _ReviewerPolicyResult:
     state: _ReviewerPolicyState
     profile: Optional[str] = None
     failure: Optional[dict[str, str]] = None
+    error_code: Optional[str] = None
+    source_path: Optional[str] = None
+    source_digest: Optional[str] = None
+    policy_version: int = 0
 
 
 def _invalid_reviewer_policy(
-    error: str, *, profile: object = "",
+    error: str, *, profile: object = "", error_code: str = "invalid_value",
 ) -> _ReviewerPolicyResult:
     return _ReviewerPolicyResult(
         state=_ReviewerPolicyState.INVALID,
@@ -8393,60 +8457,164 @@ def _invalid_reviewer_policy(
             "profile": _bounded_review_error(profile),
             "error": _bounded_review_error(error),
         },
+        error_code=_bounded_review_error(error_code),
     )
 
 
-def _load_reviewer_policy() -> _ReviewerPolicyResult:
-    """Load reviewer policy from the dispatcher-owned board root.
+def _reviewer_policy_source_path(
+    conn: sqlite3.Connection,
+) -> Optional[Path]:
+    """Return the policy source derived only from the bound DB path.
 
-    Reviewer routing is control-plane state. It deliberately does not use
-    :func:`hermes_cli.config.load_config`, whose profile-scoped last-known-good
-    fallback would make malformed policy indistinguishable from an absent
-    policy. ``kanban_home()`` is the board/dispatcher authority; workers carry
-    that existing root through ``HERMES_KANBAN_HOME`` while retaining their
-    profile-specific ``HERMES_HOME`` for all unrelated configuration.
-
-    Missing/empty/null policy is the legacy dynamic-discovery mode. Every
-    malformed, unreadable, or invalid policy is fail-closed and returns bounded
-    evidence without exposing YAML parser text or config values.
+    This is intentionally not ``kanban_home() / config.yaml``.  A worker is
+    allowed to inherit or override ambient path variables, but the database
+    connection already identifies the board authority.  Default boards use
+    the DB's parent root; canonical custom boards walk back from
+    ``kanban/boards/<slug>/kanban.db`` to that same root.
     """
-    policy_path = kanban_home() / "config.yaml"
+    db_path = _connection_db_path(conn)
+    if db_path is None:
+        return None
+    try:
+        resolved = db_path.expanduser().resolve(strict=False)
+    except (OSError, RuntimeError):
+        return None
+    if (
+        resolved.name == "kanban.db"
+        and resolved.parent.parent.name == "boards"
+        and resolved.parent.parent.parent.name == "kanban"
+    ):
+        root = resolved.parent.parent.parent.parent
+    else:
+        root = resolved.parent
+    return root / "config.yaml"
+
+
+def _with_policy_source(
+    policy: _ReviewerPolicyResult,
+    source_path: Optional[Path],
+    source_digest: Optional[str],
+) -> _ReviewerPolicyResult:
+    return _ReviewerPolicyResult(
+        state=policy.state,
+        profile=policy.profile,
+        failure=policy.failure,
+        error_code=policy.error_code,
+        source_path=str(source_path) if source_path is not None else None,
+        source_digest=source_digest,
+        policy_version=policy.policy_version,
+    )
+
+
+def _parse_reviewer_policy_source(
+    policy_path: Optional[Path],
+) -> _ReviewerPolicyResult:
+    """Parse the DB-bound policy source without consulting profile config."""
+    if policy_path is None:
+        return _with_policy_source(
+            _invalid_reviewer_policy(
+                "reviewer policy authority is unavailable",
+                error_code="authority_unavailable",
+            ),
+            None,
+            None,
+        )
     try:
         from utils import fast_safe_load
 
-        with policy_path.open("r", encoding="utf-8") as stream:
-            raw_config = fast_safe_load(stream)
+        raw_bytes = policy_path.read_bytes()
+        source_digest = hashlib.sha256(raw_bytes).hexdigest()
+        raw_config = fast_safe_load(
+            io.StringIO(raw_bytes.decode("utf-8"))
+        )
     except FileNotFoundError:
-        return _ReviewerPolicyResult(state=_ReviewerPolicyState.ABSENT)
+        return _with_policy_source(
+            _ReviewerPolicyResult(
+                state=_ReviewerPolicyState.ABSENT,
+                error_code="source_absent",
+            ),
+            policy_path,
+            None,
+        )
     except (OSError, UnicodeError):
-        return _invalid_reviewer_policy("reviewer policy config is unreadable")
+        return _with_policy_source(
+            _invalid_reviewer_policy(
+                "reviewer policy config is unreadable",
+                error_code="source_unreadable",
+            ),
+            policy_path,
+            None,
+        )
     except Exception:
         # Never persist PyYAML's parser excerpt: it may echo arbitrary config
         # values. The state itself is enough to prevent discovery.
-        return _invalid_reviewer_policy("reviewer policy config is malformed YAML")
+        return _with_policy_source(
+            _invalid_reviewer_policy(
+                "reviewer policy config is malformed YAML",
+                error_code="malformed_yaml",
+            ),
+            policy_path,
+            None,
+        )
 
     if raw_config is None:
-        return _ReviewerPolicyResult(state=_ReviewerPolicyState.ABSENT)
+        return _with_policy_source(
+            _ReviewerPolicyResult(
+                state=_ReviewerPolicyState.ABSENT,
+                error_code="not_configured",
+            ),
+            policy_path,
+            source_digest,
+        )
     if not isinstance(raw_config, Mapping):
-        return _invalid_reviewer_policy(
-            "reviewer policy config must be a mapping",
+        return _with_policy_source(
+            _invalid_reviewer_policy(
+                "reviewer policy config must be a mapping",
+                error_code="invalid_document",
+            ),
+            policy_path,
+            source_digest,
         )
 
     kanban_config = raw_config.get("kanban")
     if kanban_config is None:
-        return _ReviewerPolicyResult(state=_ReviewerPolicyState.ABSENT)
+        return _with_policy_source(
+            _ReviewerPolicyResult(
+                state=_ReviewerPolicyState.ABSENT,
+                error_code="not_configured",
+            ),
+            policy_path,
+            source_digest,
+        )
     if not isinstance(kanban_config, Mapping):
-        return _invalid_reviewer_policy(
-            "kanban.reviewer_profile is unavailable: kanban must be a mapping",
+        return _with_policy_source(
+            _invalid_reviewer_policy(
+                "kanban.reviewer_profile is unavailable: kanban must be a mapping",
+                error_code="invalid_document",
+            ),
+            policy_path,
+            source_digest,
         )
 
     configured = kanban_config.get("reviewer_profile")
     if configured is None:
-        return _ReviewerPolicyResult(state=_ReviewerPolicyState.ABSENT)
+        return _with_policy_source(
+            _ReviewerPolicyResult(
+                state=_ReviewerPolicyState.ABSENT,
+                error_code="not_configured",
+            ),
+            policy_path,
+            source_digest,
+        )
     if not isinstance(configured, str) or not configured.strip():
-        return _invalid_reviewer_policy(
-            "kanban.reviewer_profile must be a nonempty string or null",
-            profile=configured,
+        return _with_policy_source(
+            _invalid_reviewer_policy(
+                "kanban.reviewer_profile must be a nonempty string or null",
+                profile=configured,
+                error_code="invalid_value",
+            ),
+            policy_path,
+            source_digest,
         )
 
     try:
@@ -8455,29 +8623,233 @@ def _load_reviewer_policy() -> _ReviewerPolicyResult:
         canonical = normalize_profile_name(configured)
         validate_profile_name(canonical)
     except Exception as exc:
-        return _invalid_reviewer_policy(
-            _bounded_review_error(exc), profile=configured,
+        return _with_policy_source(
+            _invalid_reviewer_policy(
+                _bounded_review_error(exc),
+                profile=configured,
+                error_code="invalid_profile",
+            ),
+            policy_path,
+            source_digest,
         )
 
     if not canonical.startswith("code-reviewer"):
-        return _invalid_reviewer_policy(
-            "configured reviewer profile must start with code-reviewer",
-            profile=canonical,
+        return _with_policy_source(
+            _invalid_reviewer_policy(
+                "configured reviewer profile must start with code-reviewer",
+                profile=canonical,
+                error_code="invalid_role",
+            ),
+            policy_path,
+            source_digest,
         )
-    return _ReviewerPolicyResult(
-        state=_ReviewerPolicyState.PINNED,
-        profile=canonical,
+    return _with_policy_source(
+        _ReviewerPolicyResult(
+            state=_ReviewerPolicyState.PINNED,
+            profile=canonical,
+            error_code=None,
+        ),
+        policy_path,
+        source_digest,
     )
 
 
-def _configured_reviewer_profile() -> tuple[Optional[str], Optional[dict[str, str]]]:
+def _synchronize_reviewer_policy(conn: sqlite3.Connection) -> None:
+    """Initialize/update the durable policy from the connection-bound source.
+
+    The source is derived from the authoritative DB path, never from ambient
+    worker environment. The dispatcher calls this reconciliation before a
+    non-dry-run admission tick so startup, config changes, direct CLI dispatch,
+    and process restart converge before reviewer routing. A missing config file
+    becomes a persisted explicit ABSENT state for compatibility;
+    malformed/unreadable input becomes persisted INVALID state.
+    """
+    source_path = _reviewer_policy_source_path(conn)
+    parsed = _parse_reviewer_policy_source(source_path)
+    authority_db_path = _connection_db_path(conn)
+    authority_db_value = str(authority_db_path) if authority_db_path else ""
+    source_path_value = parsed.source_path
+    profile_value = parsed.profile
+    if parsed.state is _ReviewerPolicyState.INVALID and parsed.failure:
+        profile_value = parsed.failure.get("profile") or None
+    error_detail = (
+        parsed.failure.get("error")
+        if parsed.failure is not None
+        else None
+    )
+
+    try:
+        current = conn.execute(
+            "SELECT state, profile, error_code, error_detail, "
+            "authority_db_path, source_path, source_digest, policy_version "
+            "FROM kanban_reviewer_policy WHERE id=1"
+        ).fetchone()
+    except sqlite3.DatabaseError:
+        # A caller holding an older connection or a read-only legacy DB cannot
+        # be upgraded here. Consumers will fail closed on the missing row.
+        return
+
+    comparable = (
+        parsed.state.value,
+        profile_value,
+        parsed.error_code,
+        error_detail,
+        authority_db_value,
+        source_path_value,
+        parsed.source_digest,
+    )
+    if current is not None and comparable == tuple(current[key] for key in (
+        "state", "profile", "error_code", "error_detail",
+        "authority_db_path", "source_path", "source_digest",
+    )):
+        return
+
+    try:
+        with write_txn(conn):
+            latest = conn.execute(
+                "SELECT policy_version FROM kanban_reviewer_policy WHERE id=1"
+            ).fetchone()
+            version = int(latest["policy_version"]) + 1 if latest else 1
+            conn.execute(
+                """
+                INSERT INTO kanban_reviewer_policy (
+                    id, state, profile, error_code, error_detail,
+                    authority_db_path, source_path, source_digest,
+                    policy_version, updated_at
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    state=excluded.state,
+                    profile=excluded.profile,
+                    error_code=excluded.error_code,
+                    error_detail=excluded.error_detail,
+                    authority_db_path=excluded.authority_db_path,
+                    source_path=excluded.source_path,
+                    source_digest=excluded.source_digest,
+                    policy_version=excluded.policy_version,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    parsed.state.value,
+                    profile_value,
+                    parsed.error_code,
+                    error_detail,
+                    authority_db_value,
+                    source_path_value,
+                    parsed.source_digest,
+                    version,
+                    int(time.time()),
+                ),
+            )
+    except (sqlite3.DatabaseError, OSError):
+        # Policy admission remains fail-closed if an external read-only or
+        # transient DB condition prevents the snapshot update.
+        _log.debug("unable to synchronize reviewer policy", exc_info=True)
+
+
+def _load_reviewer_policy(conn: sqlite3.Connection) -> _ReviewerPolicyResult:
+    """Read only the durable policy snapshot bound to *conn*.
+
+    There is deliberately no ambient-path fallback.  Missing rows, authority
+    path mismatches, malformed state, and invalid pinned values all return
+    INVALID so dynamic discovery cannot be reopened by a worker environment.
+    ``_synchronize_reviewer_policy`` is the dispatcher-authoritative
+    initialization/update path. Workers and lifecycle helpers only consume
+    this DB-bound snapshot; they never re-resolve policy from ambient paths.
+    """
+    source_path = _reviewer_policy_source_path(conn)
+    authority_db_path = _connection_db_path(conn)
+    expected_db = str(authority_db_path) if authority_db_path else ""
+    expected_source = str(source_path) if source_path is not None else None
+    try:
+        row = conn.execute(
+            "SELECT state, profile, error_code, error_detail, "
+            "authority_db_path, source_path, source_digest, policy_version "
+            "FROM kanban_reviewer_policy WHERE id=1"
+        ).fetchone()
+    except sqlite3.DatabaseError:
+        row = None
+    if row is None:
+        return _invalid_reviewer_policy(
+            "reviewer policy is not initialized",
+            error_code="uninitialized",
+        )
+    if row["authority_db_path"] != expected_db or row["source_path"] != expected_source:
+        return _invalid_reviewer_policy(
+            "reviewer policy authority mismatch",
+            error_code="authority_mismatch",
+        )
+    try:
+        state = _ReviewerPolicyState(str(row["state"]))
+    except (TypeError, ValueError):
+        return _invalid_reviewer_policy(
+            "reviewer policy state is invalid",
+            error_code="invalid_state",
+        )
+    try:
+        version = int(row["policy_version"])
+    except (TypeError, ValueError):
+        version = 0
+    if version <= 0:
+        return _invalid_reviewer_policy(
+            "reviewer policy version is invalid",
+            error_code="invalid_version",
+        )
+    if state is _ReviewerPolicyState.INVALID:
+        return _invalid_reviewer_policy(
+            row["error_detail"] or "reviewer policy is invalid",
+            profile=row["profile"] or "",
+            error_code=row["error_code"] or "invalid_value",
+        )
+    if state is _ReviewerPolicyState.ABSENT:
+        if row["profile"] is not None:
+            return _invalid_reviewer_policy(
+                "absent reviewer policy carries a profile",
+                error_code="invalid_state",
+            )
+        return _ReviewerPolicyResult(
+            state=state,
+            error_code=row["error_code"],
+            source_path=row["source_path"],
+            source_digest=row["source_digest"],
+            policy_version=version,
+        )
+    profile = row["profile"]
+    try:
+        from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+        canonical = normalize_profile_name(profile)
+        validate_profile_name(canonical)
+    except Exception:
+        return _invalid_reviewer_policy(
+            "pinned reviewer profile is invalid",
+            profile=profile or "",
+            error_code="invalid_profile",
+        )
+    if canonical != profile or not canonical.startswith("code-reviewer"):
+        return _invalid_reviewer_policy(
+            "pinned reviewer profile is invalid",
+            profile=profile or "",
+            error_code="invalid_role",
+        )
+    return _ReviewerPolicyResult(
+        state=state,
+        profile=canonical,
+        source_path=row["source_path"],
+        source_digest=row["source_digest"],
+        policy_version=version,
+    )
+
+
+def _configured_reviewer_profile(
+    conn: sqlite3.Connection,
+) -> tuple[Optional[str], Optional[dict[str, str]]]:
     """Return the canonical pinned reviewer, or one bounded config failure.
 
     ``None`` is the compatibility value: it leaves reviewer discovery
     unchanged. Any explicit non-null value is a closed-world policy, so an
     invalid setting must not fall through to discovered reviewer profiles.
     """
-    policy = _load_reviewer_policy()
+    policy = _load_reviewer_policy(conn)
     if policy.state is _ReviewerPolicyState.INVALID:
         return None, policy.failure or {
             "profile": "",
@@ -8489,7 +8861,8 @@ def _configured_reviewer_profile() -> tuple[Optional[str], Optional[dict[str, st
 
 
 def _reviewer_candidates(
-    current: Optional[str], *, required_skill: str = "sdlc-review",
+    current: Optional[str], *, conn: sqlite3.Connection,
+    required_skill: str = "sdlc-review",
 ) -> tuple[list[str], list[dict[str, str]]]:
     """Return compatible reviewer profiles and preflight failures.
 
@@ -8498,7 +8871,7 @@ def _reviewer_candidates(
     reported before a worker is spawned and does not consume a task retry.
     """
     failures: list[dict[str, str]] = []
-    configured, config_failure = _configured_reviewer_profile()
+    configured, config_failure = _configured_reviewer_profile(conn)
     if config_failure is not None:
         return [], [config_failure]
     try:
@@ -8570,7 +8943,30 @@ def _reviewer_candidates(
     return compatible, failures
 
 
-def _select_review_handoff_reviewer(current: Optional[str]) -> Optional[str]:
+def _reviewer_candidates_for_connection(
+    current: Optional[str],
+    conn: sqlite3.Connection,
+) -> tuple[list[str], list[dict[str, str]]]:
+    """Call the policy-bound candidate resolver while preserving test seams.
+
+    A few integrations replace the private resolver with the historical
+    one-argument callable.  The production resolver always receives the
+    authoritative connection; the narrow compatibility fallback is only for
+    those explicit replacements and never reintroduces ambient policy lookup
+    in the real path.
+    """
+    try:
+        return _reviewer_candidates(current, conn=conn)
+    except TypeError as exc:
+        if "unexpected keyword argument 'conn'" not in str(exc):
+            raise
+        return _reviewer_candidates(current)  # type: ignore[call-arg]
+
+
+def _select_review_handoff_reviewer(
+    conn: sqlite3.Connection,
+    current: Optional[str],
+) -> Optional[str]:
     """Select one configured reviewer for a programmer handoff.
 
     ``_reviewer_candidates`` is the single profile/configuration preflight for
@@ -8579,7 +8975,7 @@ def _select_review_handoff_reviewer(current: Optional[str]) -> Optional[str]:
     exclude the programmer and choose a ``code-reviewer*`` candidate.
     """
     current_name = _canonical_assignee(current)
-    candidates, _ = _reviewer_candidates(current)
+    candidates, _ = _reviewer_candidates_for_connection(current, conn)
     for candidate in candidates:
         reviewer = _canonical_assignee(candidate)
         if (
@@ -8761,7 +9157,7 @@ def _failover_review_after_recovery(
     if authority is None:
         return task
     current = authority[1]
-    candidates, preflight = _reviewer_candidates(current)
+    candidates, preflight = _reviewer_candidates_for_connection(current, conn)
     attempts = _review_attempts_for_generation(conn, task_id)
     attempted_names = {
         _canonical_assignee(item.get("profile")) for item in attempts
@@ -10182,7 +10578,7 @@ def _try_direct_review_required_handoff(
     if not row["claim_lock"] or not row["current_run_id"]:
         return False, False, None
 
-    reviewer = _select_review_handoff_reviewer(current)
+    reviewer = _select_review_handoff_reviewer(conn, current)
     if not reviewer:
         return False, False, None
     submitted = submit_task_for_review(
@@ -14492,7 +14888,9 @@ def _plan_review_handoffs(
             )
             if not dependency_resolution.satisfied:
                 continue
-            candidates, _preflight = _reviewer_candidates(row["assignee"])
+            candidates, _preflight = _reviewer_candidates_for_connection(
+                row["assignee"], conn,
+            )
             reviewer = next(
                 (name for name in candidates if name != row["assignee"]),
                 None,
@@ -14804,6 +15202,12 @@ def dispatch_once(
     with _dispatch_tick_lock(db_path) as held:
         if not held:
             return DispatchResult(skipped_locked=True)
+        if not dry_run:
+            # Only the dispatcher-authoritative tick may initialize/update
+            # the durable reviewer snapshot. Workers and direct lifecycle
+            # callers consume the existing row and fail closed if it is
+            # missing or mismatched.
+            _synchronize_reviewer_policy(conn)
         result = _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
@@ -15260,7 +15664,9 @@ def _dispatch_once_locked(
                 result.skipped_unassigned.append(row["id"])
             continue
         current_reviewer = authority[1]
-        candidates, preflight_failures = _reviewer_candidates(current_reviewer)
+        candidates, preflight_failures = _reviewer_candidates_for_connection(
+            current_reviewer, conn,
+        )
         if not candidates:
             if not dry_run:
                 failover_review_task(

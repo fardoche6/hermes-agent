@@ -40,6 +40,11 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
+    # Reviewer admission is authoritative only through a non-dry-run
+    # dispatcher tick; generic init_db intentionally leaves the policy
+    # snapshot unsynchronized.
+    with kb.connect() as conn:
+        kb.dispatch_once(conn, dry_run=False)
     return home
 
 

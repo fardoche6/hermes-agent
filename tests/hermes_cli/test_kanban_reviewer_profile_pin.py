@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -54,19 +54,29 @@ def _write_reviewer_config(home: Path, value: object) -> None:
 
 
 def _run_policy_probe(hermes_home: Path, policy_home: Path) -> dict[str, object]:
+    db_path = policy_home / "kanban.db"
+    with kb.connect_closing(db_path=db_path) as conn:
+        # This is the dispatcher-authoritative initialization.  The subprocess
+        # below is the restarted worker/direct-CLI consumer.
+        kb._synchronize_reviewer_policy(conn)
     script = "\n".join(
         (
             "import json",
             "from hermes_cli import kanban_db as kb",
-            "candidates, failures = kb._reviewer_candidates(None)",
-            "print(json.dumps({'candidates': candidates, 'failures': failures}))",
+            "with kb.connect_closing() as conn:",
+            "    candidates, failures = kb._reviewer_candidates(None, conn=conn)",
+            "    policy = kb._load_reviewer_policy(conn)",
+            "print(json.dumps({'candidates': candidates, 'failures': failures, "
+            "'state': policy.state.value, 'version': policy.policy_version}))",
         )
     )
     repo_root = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env["HERMES_HOME"] = str(hermes_home)
-    env["HERMES_KANBAN_HOME"] = str(policy_home)
-    env.pop("HERMES_KANBAN_DB", None)
+    env["HERMES_KANBAN_DB"] = str(policy_home / "kanban.db")
+    env["HERMES_KANBAN_HOME"] = str(
+        policy_home.parent / "worker-controlled-kanban-home"
+    )
     env.pop("HERMES_KANBAN_BOARD", None)
     env["PYTHONPATH"] = os.pathsep.join(
         part for part in (str(repo_root), env.get("PYTHONPATH", "")) if part
@@ -82,6 +92,20 @@ def _run_policy_probe(hermes_home: Path, policy_home: Path) -> dict[str, object]
     return cast(dict[str, object], json.loads(completed.stdout))
 
 
+def _policy_state(home: Path) -> kb._ReviewerPolicyResult:
+    with kb.connect_closing(db_path=home / "kanban.db") as conn:
+        kb._synchronize_reviewer_policy(conn)
+        return kb._load_reviewer_policy(conn)
+
+
+def _reviewer_candidates(
+    current: str | None,
+) -> tuple[list[str], list[dict[str, str]]]:
+    with kb.connect_closing() as conn:
+        kb._synchronize_reviewer_policy(conn)
+        return kb._reviewer_candidates(current, conn=conn)
+
+
 def test_reviewer_profile_is_registered_in_config_schema():
     from hermes_cli.config import DEFAULT_CONFIG, _validate_config_key
 
@@ -90,19 +114,72 @@ def test_reviewer_profile_is_registered_in_config_schema():
     assert _validate_config_key("kanban.reviewer_profile") == (True, None)
 
 
+def test_generic_explicit_init_does_not_initialize_reviewer_policy(
+    reviewer_home, tmp_path,
+):
+    """Generic schema init must not become reviewer-policy authority."""
+    db_path = tmp_path / "owners.db"
+    _write_reviewer_config(tmp_path, "code-reviewer")
+
+    kb.init_db(db_path)
+    with kb.connect(db_path=db_path) as conn:
+        tables = {
+            row["name"]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        row = conn.execute(
+            "SELECT state FROM kanban_reviewer_policy"
+        ).fetchone()
+        reviewer_candidates = cast(Any, getattr(kb, "_reviewer_candidates"))
+        candidates, failures = reviewer_candidates(None, conn=conn)
+
+    assert "kanban_reviewer_policy" in tables
+    assert row is None
+    assert candidates == []
+    assert failures == [
+        {
+            "profile": "reviewer failed",
+            "error": "reviewer policy is not initialized",
+        }
+    ]
+
+
+def test_unbound_explicit_db_keeps_dependency_admission_fail_closed(
+    reviewer_home, tmp_path,
+):
+    db_path = tmp_path / "owners.db"
+    kb.init_db(db_path)
+
+    with kb.connect(db_path=db_path) as conn:
+        parent_id = kb.create_task(conn, title="unbound parent")
+        with pytest.raises(ValueError, match="no bound board"):
+            kb.create_task(
+                conn,
+                title="unbound child",
+                parents=[parent_id],
+            )
+
+
+
 def test_reviewer_policy_loader_has_explicit_absent_pinned_and_invalid_states(
     reviewer_home,
 ):
-    load_policy = getattr(kb, "_load_reviewer_policy")
-    assert load_policy().state.value == "absent"
+    assert _policy_state(reviewer_home).state.value == "absent"
 
     _write_reviewer_config(reviewer_home, "code-reviewer")
-    assert load_policy().state.value == "pinned"
+    pinned = _policy_state(reviewer_home)
+    assert pinned.state.value == "pinned"
+    assert pinned.profile == "code-reviewer"
+    assert pinned.policy_version >= 2
 
     (reviewer_home / "config.yaml").write_text(
         "kanban:\n  reviewer_profile: [\n", encoding="utf-8",
     )
-    assert load_policy().state.value == "invalid"
+    invalid = _policy_state(reviewer_home)
+    assert invalid.state.value == "invalid"
+    assert invalid.error_code == "malformed_yaml"
 
 
 def test_public_handoff_uses_dispatcher_policy_under_programmer_profile_home(
@@ -111,15 +188,21 @@ def test_public_handoff_uses_dispatcher_policy_under_programmer_profile_home(
 ):
     dispatcher_home = reviewer_home / "dispatcher-home"
     worker_home = reviewer_home / "programmer-home"
+    ambient_home = reviewer_home / "worker-controlled-kanban-home"
     dispatcher_home.mkdir()
+    ambient_home.mkdir()
+    _write_reviewer_config(ambient_home, None)
     _write_profile(worker_home, "programmer")
     _write_profile(worker_home, "code-reviewer-unauthorized")
     _write_profile(worker_home, "code-reviewer-authorized")
     _write_reviewer_config(dispatcher_home, "code-reviewer-authorized")
     monkeypatch.setenv("HERMES_HOME", str(worker_home))
-    monkeypatch.setenv("HERMES_KANBAN_HOME", str(dispatcher_home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(dispatcher_home / "kanban.db"))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(ambient_home))
     kb._INITIALIZED_PATHS.clear()
-    kb.init_db()
+    kb.init_db(dispatcher_home / "kanban.db")
+    with kb.connect_closing() as conn:
+        kb._synchronize_reviewer_policy(conn)
 
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
@@ -211,7 +294,7 @@ def test_configured_reviewer_pin_excludes_discovered_profiles(
         lambda: pytest.fail("a configured reviewer pin must not discover reviewers"),
     )
 
-    candidates, failures = kb._reviewer_candidates("code-reviewer-claudecode")
+    candidates, failures = _reviewer_candidates("code-reviewer-claudecode")
 
     assert candidates == ["code-reviewer"]
     assert failures == []
@@ -222,14 +305,15 @@ def test_disallowed_current_reviewer_is_not_reinserted_for_pinned_lane(reviewer_
     _write_profile(reviewer_home, "code-reviewer-claudecode")
     _write_reviewer_config(reviewer_home, "code-reviewer")
 
-    candidates, failures = kb._reviewer_candidates("code-reviewer-claudecode")
+    candidates, failures = _reviewer_candidates("code-reviewer-claudecode")
 
     assert failures == []
     assert "code-reviewer-claudecode" not in candidates
-    assert (
-        kb._select_review_handoff_reviewer("code-reviewer-claudecode")
-        == "code-reviewer"
-    )
+    with kb.connect_closing() as conn:
+        selected = kb._select_review_handoff_reviewer(
+            conn, "code-reviewer-claudecode",
+        )
+    assert selected == "code-reviewer"
 
 
 @pytest.mark.parametrize("configured_null", [False, True])
@@ -242,7 +326,7 @@ def test_absent_or_null_reviewer_pin_preserves_dynamic_discovery(
     if configured_null:
         _write_reviewer_config(reviewer_home, None)
 
-    candidates, failures = kb._reviewer_candidates("code-reviewer-claudecode")
+    candidates, failures = _reviewer_candidates("code-reviewer-claudecode")
 
     assert failures == []
     assert candidates[0] == "code-reviewer-claudecode"
@@ -275,7 +359,7 @@ def test_malformed_or_unavailable_pin_fails_closed_with_bounded_evidence(
         lambda: pytest.fail("invalid pins must not fall back to discovery"),
     )
 
-    candidates, failures = kb._reviewer_candidates("code-reviewer-claudecode")
+    candidates, failures = _reviewer_candidates("code-reviewer-claudecode")
 
     assert candidates == []
     assert len(failures) == 1
@@ -287,7 +371,7 @@ def test_pinned_reviewer_requires_the_review_skill(reviewer_home):
     _write_profile(reviewer_home, "code-reviewer", with_review_skill=False)
     _write_reviewer_config(reviewer_home, "code-reviewer")
 
-    candidates, failures = kb._reviewer_candidates("code-reviewer-claudecode")
+    candidates, failures = _reviewer_candidates("code-reviewer-claudecode")
 
     assert candidates == []
     assert failures == [
@@ -305,6 +389,8 @@ def test_failover_moves_preexisting_disallowed_authority_to_pinned_reviewer(
     _write_profile(reviewer_home, "code-reviewer-claudecode")
     _write_reviewer_config(reviewer_home, "code-reviewer")
     kb.init_db()
+    with kb.connect_closing() as conn:
+        kb._synchronize_reviewer_policy(conn)
 
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
@@ -339,3 +425,180 @@ def test_failover_moves_preexisting_disallowed_authority_to_pinned_reviewer(
         payload = json.loads(event["payload"])
         assert payload["failed_reviewer"] == "code-reviewer-claudecode"
         assert payload["next_reviewer"] == "code-reviewer"
+
+
+def test_custom_board_db_binds_policy_when_ambient_home_is_stale(
+    reviewer_home,
+    monkeypatch,
+):
+    worker_home = reviewer_home / "programmer-home"
+    ambient_home = reviewer_home / "stale-kanban-home"
+    custom_db = reviewer_home / "kanban" / "boards" / "project" / "kanban.db"
+    ambient_home.mkdir()
+    _write_reviewer_config(reviewer_home, "code-reviewer-authorized")
+    _write_reviewer_config(ambient_home, None)
+    _write_profile(worker_home, "programmer")
+    _write_profile(worker_home, "code-reviewer-unauthorized")
+    _write_profile(worker_home, "code-reviewer-authorized")
+    monkeypatch.setenv("HERMES_HOME", str(worker_home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(custom_db))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(ambient_home))
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db(custom_db)
+    with kb.connect_closing() as conn:
+        kb._synchronize_reviewer_policy(conn)
+
+    with kb.connect_closing() as conn:
+        policy = kb._load_reviewer_policy(conn)
+        assert policy.state is kb._ReviewerPolicyState.PINNED
+        assert policy.profile == "code-reviewer-authorized"
+        assert policy.source_path == str(reviewer_home / "config.yaml")
+        candidates, failures = kb._reviewer_candidates(None, conn=conn)
+        assert failures == []
+        assert candidates == ["code-reviewer-authorized"]
+
+        task_id = kb.create_task(
+            conn,
+            title="custom board reviewer handoff",
+            assignee="programmer",
+        )
+        host = kb._claimer_id().split(":", 1)[0]
+        assert kb.claim_task(conn, task_id, claimer=f"{host}:implementation")
+        implementation = kb.get_task(conn, task_id)
+        assert implementation is not None
+        assert kb.block_task(
+            conn,
+            task_id,
+            kind="dependency",
+            reason="review-required: custom board handoff",
+            expected_run_id=implementation.current_run_id,
+            expected_assignee=implementation.assignee,
+            expected_claim=implementation.claim_lock,
+        )
+        review = kb.get_task(conn, task_id)
+        assert review is not None
+        assert review.status == "review"
+        assert review.assignee == "code-reviewer-authorized"
+
+
+def test_legacy_init_migrates_and_explicitly_initializes_compatibility_state(
+    reviewer_home,
+):
+    legacy_db = reviewer_home / "legacy" / "kanban.db"
+    legacy_db.parent.mkdir()
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db(legacy_db)
+    with kb.connect_closing(db_path=legacy_db) as conn:
+        kb._synchronize_reviewer_policy(conn)
+
+    with kb.connect_closing(db_path=legacy_db) as conn:
+        table = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='kanban_reviewer_policy'"
+        ).fetchone()
+        assert table is not None
+        policy = kb._load_reviewer_policy(conn)
+        assert policy.state is kb._ReviewerPolicyState.ABSENT
+        assert policy.error_code == "source_absent"
+        row = conn.execute(
+            "SELECT state, profile, policy_version FROM kanban_reviewer_policy "
+            "WHERE id=1"
+        ).fetchone()
+        assert row["state"] == "absent"
+        assert row["profile"] is None
+        assert row["policy_version"] == 1
+
+
+def test_authoritative_source_change_to_malformed_stays_invalid_after_restart(
+    reviewer_home,
+):
+    _write_profile(reviewer_home, "code-reviewer")
+    _write_reviewer_config(reviewer_home, "code-reviewer")
+    kb.init_db()
+    first = _policy_state(reviewer_home)
+    assert first.state is kb._ReviewerPolicyState.PINNED
+
+    (reviewer_home / "config.yaml").write_text(
+        "kanban:\n  reviewer_profile: [\n", encoding="utf-8",
+    )
+    kb._INITIALIZED_PATHS.clear()
+    after_change = _policy_state(reviewer_home)
+    assert after_change.state is kb._ReviewerPolicyState.INVALID
+    assert after_change.error_code == "malformed_yaml"
+    with kb.connect_closing() as conn:
+        candidates, failures = kb._reviewer_candidates(None, conn=conn)
+        assert candidates == []
+        assert failures[0]["error"] == "reviewer policy config is malformed YAML"
+
+
+def test_direct_cli_block_then_dispatch_reconciles_from_bound_snapshot(
+    reviewer_home,
+    monkeypatch,
+):
+    dispatcher_home = reviewer_home / "dispatcher-home"
+    worker_home = reviewer_home / "programmer-home"
+    ambient_home = reviewer_home / "stale-worker-home"
+    dispatcher_home.mkdir()
+    ambient_home.mkdir()
+    _write_reviewer_config(dispatcher_home, "code-reviewer-authorized")
+    _write_reviewer_config(ambient_home, None)
+    _write_profile(worker_home, "programmer")
+    _write_profile(worker_home, "code-reviewer-unauthorized")
+    _write_profile(worker_home, "code-reviewer-authorized")
+    db_path = dispatcher_home / "kanban.db"
+    monkeypatch.setenv("HERMES_HOME", str(worker_home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(ambient_home))
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db(db_path)
+    with kb.connect_closing() as conn:
+        kb._synchronize_reviewer_policy(conn)
+        task_id = kb.create_task(
+            conn,
+            title="direct CLI review handoff",
+            assignee="programmer",
+            initial_status="running",
+        )
+
+    env = os.environ.copy()
+    block = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "kanban",
+            "block",
+            "--kind",
+            "dependency",
+            task_id,
+            "review-required: direct CLI handoff",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert block.returncode == 0, block.stderr
+    dispatch = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "kanban",
+            "dispatch",
+            "--max",
+            "0",
+            "--json",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert dispatch.returncode == 0, dispatch.stderr
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "review"
+        assert task.assignee == "code-reviewer-authorized"

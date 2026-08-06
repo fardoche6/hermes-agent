@@ -595,6 +595,25 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
 | `auto_subscribe_on_create` | `true` | When a worker calls `kanban_create` from inside a session with a persistent delivery channel (messaging gateway or TUI), the originating session is auto-subscribed to the new task's completion/block events. The dispatcher still drives the delivery — this only changes whether the caller's chat/key shows up in the notify-sub table. Set to `false` to require explicit `kanban_notify-subscribe` calls per task. |
 
+Reviewer-policy authority is bound to the board database, not to a worker's
+ambient `HERMES_KANBAN_HOME`. On first connection (including legacy-board
+migration), Kanban creates or upgrades the per-board policy snapshot table.
+The dispatcher then performs the authoritative reconciliation before a
+non-dry-run admission tick, parsing `config.yaml` from the root derived from
+that connection's DB path. The snapshot records explicit `absent`, `pinned`,
+or `invalid` state, the normalized profile (when pinned), a bounded error
+code, source provenance, and a version/digest. Missing or `null` configuration
+is persisted as the intentional compatibility `absent` state; a missing or
+mismatched snapshot is never treated as absent and fails closed.
+
+The dispatcher and direct CLI dispatch reconcile the snapshot before admission,
+and a restart reuses the same DB-bound record. A config edit is picked up on
+the next dispatcher tick; no profile restart is required. Workers only consume
+the snapshot, so changing or removing `HERMES_KANBAN_HOME` cannot weaken an
+initialized pin or turn an initialized invalid state into discovery. A
+malformed or unreadable DB-bound source records `invalid` and leaves the
+reviewer candidate set empty until the authoritative source is repaired.
+
 And the two auxiliary LLM slots:
 
 | Key | Purpose |
