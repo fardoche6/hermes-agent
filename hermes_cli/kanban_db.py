@@ -87,6 +87,7 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
@@ -8366,6 +8367,109 @@ def _bounded_review_error(error: object) -> str:
     return text[:500]
 
 
+class _ReviewerPolicyState(str, Enum):
+    """Resolution states for the dispatcher-owned reviewer policy source."""
+
+    ABSENT = "absent"
+    PINNED = "pinned"
+    INVALID = "invalid"
+
+
+@dataclass(frozen=True)
+class _ReviewerPolicyResult:
+    """A bounded, explicit result for the reviewer policy control plane."""
+
+    state: _ReviewerPolicyState
+    profile: Optional[str] = None
+    failure: Optional[dict[str, str]] = None
+
+
+def _invalid_reviewer_policy(
+    error: str, *, profile: object = "",
+) -> _ReviewerPolicyResult:
+    return _ReviewerPolicyResult(
+        state=_ReviewerPolicyState.INVALID,
+        failure={
+            "profile": _bounded_review_error(profile),
+            "error": _bounded_review_error(error),
+        },
+    )
+
+
+def _load_reviewer_policy() -> _ReviewerPolicyResult:
+    """Load reviewer policy from the dispatcher-owned board root.
+
+    Reviewer routing is control-plane state. It deliberately does not use
+    :func:`hermes_cli.config.load_config`, whose profile-scoped last-known-good
+    fallback would make malformed policy indistinguishable from an absent
+    policy. ``kanban_home()`` is the board/dispatcher authority; workers carry
+    that existing root through ``HERMES_KANBAN_HOME`` while retaining their
+    profile-specific ``HERMES_HOME`` for all unrelated configuration.
+
+    Missing/empty/null policy is the legacy dynamic-discovery mode. Every
+    malformed, unreadable, or invalid policy is fail-closed and returns bounded
+    evidence without exposing YAML parser text or config values.
+    """
+    policy_path = kanban_home() / "config.yaml"
+    try:
+        from utils import fast_safe_load
+
+        with policy_path.open("r", encoding="utf-8") as stream:
+            raw_config = fast_safe_load(stream)
+    except FileNotFoundError:
+        return _ReviewerPolicyResult(state=_ReviewerPolicyState.ABSENT)
+    except (OSError, UnicodeError):
+        return _invalid_reviewer_policy("reviewer policy config is unreadable")
+    except Exception:
+        # Never persist PyYAML's parser excerpt: it may echo arbitrary config
+        # values. The state itself is enough to prevent discovery.
+        return _invalid_reviewer_policy("reviewer policy config is malformed YAML")
+
+    if raw_config is None:
+        return _ReviewerPolicyResult(state=_ReviewerPolicyState.ABSENT)
+    if not isinstance(raw_config, Mapping):
+        return _invalid_reviewer_policy(
+            "reviewer policy config must be a mapping",
+        )
+
+    kanban_config = raw_config.get("kanban")
+    if kanban_config is None:
+        return _ReviewerPolicyResult(state=_ReviewerPolicyState.ABSENT)
+    if not isinstance(kanban_config, Mapping):
+        return _invalid_reviewer_policy(
+            "kanban.reviewer_profile is unavailable: kanban must be a mapping",
+        )
+
+    configured = kanban_config.get("reviewer_profile")
+    if configured is None:
+        return _ReviewerPolicyResult(state=_ReviewerPolicyState.ABSENT)
+    if not isinstance(configured, str) or not configured.strip():
+        return _invalid_reviewer_policy(
+            "kanban.reviewer_profile must be a nonempty string or null",
+            profile=configured,
+        )
+
+    try:
+        from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+        canonical = normalize_profile_name(configured)
+        validate_profile_name(canonical)
+    except Exception as exc:
+        return _invalid_reviewer_policy(
+            _bounded_review_error(exc), profile=configured,
+        )
+
+    if not canonical.startswith("code-reviewer"):
+        return _invalid_reviewer_policy(
+            "configured reviewer profile must start with code-reviewer",
+            profile=canonical,
+        )
+    return _ReviewerPolicyResult(
+        state=_ReviewerPolicyState.PINNED,
+        profile=canonical,
+    )
+
+
 def _configured_reviewer_profile() -> tuple[Optional[str], Optional[dict[str, str]]]:
     """Return the canonical pinned reviewer, or one bounded config failure.
 
@@ -8373,44 +8477,15 @@ def _configured_reviewer_profile() -> tuple[Optional[str], Optional[dict[str, st
     unchanged. Any explicit non-null value is a closed-world policy, so an
     invalid setting must not fall through to discovered reviewer profiles.
     """
-    try:
-        from hermes_cli.config import load_config
-        from hermes_cli.profiles import normalize_profile_name, validate_profile_name
-
-        config = load_config()
-        kanban_config = config.get("kanban") if isinstance(config, dict) else None
-        if kanban_config is None:
-            return None, None
-        if not isinstance(kanban_config, dict):
-            return None, {
-                "profile": "",
-                "error": "kanban.reviewer_profile is unavailable: kanban must be a mapping",
-            }
-        configured = kanban_config.get("reviewer_profile")
-        if configured is None:
-            return None, None
-        if not isinstance(configured, str) or not configured.strip():
-            return None, {
-                "profile": _bounded_review_error(configured),
-                "error": (
-                    "kanban.reviewer_profile must be a nonempty string or null"
-                ),
-            }
-        canonical = normalize_profile_name(configured)
-        validate_profile_name(canonical)
-    except Exception as exc:
-        configured_text = locals().get("configured", "")
-        return None, {
-            "profile": _bounded_review_error(configured_text),
-            "error": _bounded_review_error(exc),
+    policy = _load_reviewer_policy()
+    if policy.state is _ReviewerPolicyState.INVALID:
+        return None, policy.failure or {
+            "profile": "",
+            "error": "reviewer policy is invalid",
         }
-
-    if not canonical.startswith("code-reviewer"):
-        return None, {
-            "profile": _bounded_review_error(canonical),
-            "error": "configured reviewer profile must start with code-reviewer",
-        }
-    return canonical, None
+    if policy.state is _ReviewerPolicyState.PINNED:
+        return policy.profile, None
+    return None, None
 
 
 def _reviewer_candidates(
@@ -15894,6 +15969,11 @@ def _default_spawn(
     # dispatcher's. Belt-and-braces with the `get_default_hermes_root()`
     # resolution in `kanban_home()` — symmetric resolution is the norm,
     # but unusual symlink / Docker layouts are caught here too.
+    resolved_kanban_home = kanban_home()
+    # Reviewer policy is dispatcher-owned control-plane state. Propagate the
+    # existing board-root authority instead of copying config into the worker
+    # profile or adding a second policy environment variable.
+    env["HERMES_KANBAN_HOME"] = str(resolved_kanban_home)
     env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
     env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
     _retag_legacy_worker_sessions(env["HERMES_KANBAN_WORKSPACES_ROOT"])
