@@ -88,3 +88,16 @@ def test_misbehaving_hook_does_not_break_transition(kanban_home, monkeypatch):
             conn.close()
     finally:
         mgr._hooks = saved
+
+
+def test_explicit_beta_board_reaches_completion_hook(kanban_home, captured_hooks, monkeypatch):
+    monkeypatch.setattr(kb, "get_current_board", lambda: "default")
+    conn = kb.connect(db_path=kanban_home / "beta.db", board="beta")
+    try:
+        tid = kb.create_task(conn, title="beta task", assignee="worker", board="beta")
+        assert kb.complete_task(conn, tid, summary="done", board="beta") is True
+    finally:
+        conn.close()
+    fired = [e for e in captured_hooks if e[0] == "kanban_task_completed"]
+    assert len(fired) == 1
+    assert fired[0][1]["board"] == "beta"

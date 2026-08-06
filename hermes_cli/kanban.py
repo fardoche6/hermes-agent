@@ -1944,10 +1944,12 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
 
 
 def _cmd_reclaim(args: argparse.Namespace) -> int:
-    with kb.connect_closing() as conn:
+    board = getattr(args, "board", None)
+    with kb.connect_closing(board=board) as conn:
         ok = kb.reclaim_task(
             conn, args.task_id,
             reason=getattr(args, "reason", None),
+            board=board,
         )
     if not ok:
         print(
@@ -1961,11 +1963,13 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
 
 def _cmd_reassign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
-    with kb.connect_closing() as conn:
+    board = getattr(args, "board", None)
+    with kb.connect_closing(board=board) as conn:
         ok = kb.reassign_task(
             conn, args.task_id, profile,
             reclaim_first=bool(getattr(args, "reclaim", False)),
             reason=getattr(args, "reason", None),
+            board=board,
         )
     if not ok:
         print(
@@ -2154,13 +2158,14 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 
 def _cmd_claim(args: argparse.Namespace) -> int:
-    with kb.connect_closing() as conn:
+    board = getattr(args, "board", None)
+    with kb.connect_closing(board=board) as conn:
         task = kb.claim_task(
             conn,
             args.task_id,
             ttl_seconds=args.ttl,
             claimer=getattr(args, "claimer", None),
-            board=getattr(args, "board", None),
+            board=board,
         )
         if task is None:
             # Report why
@@ -2174,7 +2179,7 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        workspace = kb.resolve_workspace(task, board=getattr(args, "board", None))
+        workspace = kb.resolve_workspace(task, board=board, conn=conn)
         kb.set_workspace_path(conn, task.id, str(workspace))
     print(f"Claimed {task.id}")
     print(f"Workspace: {workspace}")
@@ -2406,9 +2411,11 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 
 
 def _cmd_review(args: argparse.Namespace) -> int:
-    with kb.connect_closing() as conn:
+    board = getattr(args, "board", None)
+    with kb.connect_closing(board=board) as conn:
         task = kb.submit_task_for_review(
             conn, args.task_id, args.reviewer, trusted_operator=True,
+            board=board,
         )
     if task is None:
         print(f"cannot submit {args.task_id} for review: task not found", file=sys.stderr)
@@ -2425,7 +2432,8 @@ def _cmd_approve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    with kb.connect_closing() as conn:
+    board = getattr(args, "board", None)
+    with kb.connect_closing(board=board) as conn:
         task = kb.approve_review(
             conn,
             args.task_id,
@@ -2433,6 +2441,7 @@ def _cmd_approve(args: argparse.Namespace) -> int:
             head_sha=args.head_sha,
             summary=summary,
             trusted_operator=True,
+            board=board,
         )
     if task is None:
         print(f"cannot approve {args.task_id}: task not found", file=sys.stderr)
@@ -2451,12 +2460,14 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    with kb.connect_closing() as conn:
+    board = getattr(args, "board", None)
+    with kb.connect_closing(board=board) as conn:
         task = kb.request_changes(
             conn, args.task_id, args.programmer, reason=reason,
             reviewer=reviewer,
             trusted_operator=True,
             recovery=recovery,
+            board=board,
         )
     if task is None:
         print(f"cannot request changes for {args.task_id}: task not found", file=sys.stderr)
@@ -2481,6 +2492,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 reason=reason,
                 kind=kind,
                 expected_run_id=_worker_run_id_for(tid),
+                board=getattr(args, "board", None),
             ):
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)

@@ -891,6 +891,7 @@ def _handle_block(args: dict, **kw) -> str:
                 expected_run_id=_worker_run_id(tid),
                 expected_assignee=os.environ.get("HERMES_PROFILE"),
                 expected_claim=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"),
+                board=board,
             )
             if not ok:
                 return tool_error(
@@ -934,6 +935,7 @@ def _handle_submit_review(args: dict, **kw) -> str:
                 expected_assignee=os.environ.get("HERMES_PROFILE"),
                 expected_claim=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"),
                 expected_run_id=_worker_run_id(tid),
+                board=args.get("board"),
             )
             if task is None:
                 return tool_error(f"could not submit {tid} for review")
@@ -990,6 +992,7 @@ def _handle_request_changes(args: dict, **kw) -> str:
                 reviewer=reviewer,
                 expected_claim=claim,
                 expected_run_id=run_id,
+                board=args.get("board"),
             )
             if task is None:
                 return tool_error(f"could not request changes for {tid}")
@@ -1023,6 +1026,7 @@ def _handle_approve(args: dict, **kw) -> str:
                 head_sha=str(head_sha).strip(),
                 expected_claim=claim,
                 expected_run_id=run_id,
+                board=args.get("board"),
             )
             if task is None:
                 return tool_error(f"could not approve {tid}")

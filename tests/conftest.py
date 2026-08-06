@@ -5,11 +5,9 @@ Hermetic-test invariants enforced here (see AGENTS.md for rationale):
 1. **No credential env vars.** All provider/credential-shaped env vars
    (ending in _API_KEY, _TOKEN, _SECRET, _PASSWORD, _CREDENTIALS, etc.)
    are unset before every test. Local developer keys cannot leak in.
-2. **Isolated HERMES_HOME.** HERMES_HOME points to a per-test tempdir so
-   code reading ``~/.hermes/*`` via ``get_hermes_home()`` can't see the
-   real one. (We do NOT also redirect HOME — that broke subprocesses in
-   CI. Code using ``Path.home() / ".hermes"`` instead of the canonical
-   ``get_hermes_home()`` is a bug to fix at the callsite.)
+2. **Isolated homes.** Both ``HERMES_HOME`` and ``HOME`` point to
+   per-test/session tempdirs so code reading either ``get_hermes_home()`` or
+   ``Path.home() / ".hermes"`` can't see or write the real profile.
 3. **Deterministic runtime.** TZ=UTC, LANG=C.UTF-8, PYTHONHASHSEED=0.
 4. **No HERMES_SESSION_* inheritance** — the agent's current gateway
    session must not leak into tests.
@@ -58,10 +56,22 @@ if str(PROJECT_ROOT) not in sys.path:
 # would silently stop protecting the operator's actual ~/.hermes (#69385).
 _PRE_SANDBOX_KANBAN_OVERRIDE = os.environ.get("HERMES_KANBAN_HOME", "").strip()
 _PRE_SANDBOX_HERMES_HOME = os.environ.get("HERMES_HOME", "")
-if not os.environ.get("HERMES_HOME"):
-    _SESSION_HERMES_HOME = tempfile.mkdtemp(prefix="hermes-test-home-")
-    os.environ["HERMES_HOME"] = _SESSION_HERMES_HOME
-    atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
+_PRE_SANDBOX_HOME = os.environ.get("HOME", "")
+_PRE_SANDBOX_HOME_PATH = (
+    Path(_PRE_SANDBOX_HOME).expanduser().resolve()
+    if _PRE_SANDBOX_HOME
+    else Path.home().resolve()
+)
+# Collection-time imports can read either HOME or HERMES_HOME before pytest
+# fixtures run. Redirect both for the whole process, not only individual
+# tests, so a subprocess or import cannot create an ambient ``~/.hermes``
+# artifact in the checkout.
+_SESSION_HERMES_HOME = tempfile.mkdtemp(prefix="hermes-test-home-")
+_SESSION_HOME = tempfile.mkdtemp(prefix="hermes-test-user-")
+os.environ["HERMES_HOME"] = _SESSION_HERMES_HOME
+os.environ["HOME"] = _SESSION_HOME
+atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
+atexit.register(shutil.rmtree, _SESSION_HOME, True)
 
 #: HERMES_HOME as it stood when conftest was imported - i.e. before any test
 #: module could import code that configures logging. Recorded so the guard in
@@ -415,23 +425,18 @@ def _hermetic_environment(tmp_path, monkeypatch):
     for name in _HERMES_BEHAVIORAL_VARS:
         monkeypatch.delenv(name, raising=False)
 
-    # Honcho's fallback host/config resolution legitimately reads the user's
-    # global ~/.honcho/config.json. Keep HOME stable (subprocess tests depend
-    # on it), but pin the host so ordinary tests cannot inherit a developer's
-    # defaultHost and silently select the wrong nested config block. Tests of
-    # custom host resolution override/delete this explicitly.
+    # Pin the host so ordinary tests cannot inherit a developer's defaultHost
+    # and silently select the wrong nested config block. Tests of custom host
+    # resolution override/delete this explicitly.
     monkeypatch.setenv("HERMES_HONCHO_HOST", "hermes")
 
-    # 3. Redirect HERMES_HOME to a per-test tempdir. Code that reads
-    #    ``~/.hermes/*`` via ``get_hermes_home()`` now gets the tempdir.
-    #
-    #    NOTE: We do NOT also redirect HOME. Doing so broke CI because
-    #    some tests (and their transitive deps) spawn subprocesses that
-    #    inherit HOME and expect it to be stable. If a test genuinely
-    #    needs HOME isolated, it should set it explicitly in its own
-    #    fixture. Any code in the codebase reading ``~/.hermes/*`` via
-    #    ``Path.home() / ".hermes"`` instead of ``get_hermes_home()``
-    #    is a bug to fix at the callsite.
+    # 3. Redirect both HOME and HERMES_HOME to per-test tempdirs. Code that
+    #    reads either ``Path.home() / ".hermes"`` or ``get_hermes_home()``
+    #    now stays inside the test sandbox, including inherited subprocesses.
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    (fake_home / ".hermes").mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
     fake_hermes_home = tmp_path / "hermes_test"
     fake_hermes_home.mkdir()
     (fake_hermes_home / "sessions").mkdir()
@@ -579,13 +584,22 @@ def _capture_real_kanban_root() -> Path:
     if _PRE_SANDBOX_KANBAN_OVERRIDE:
         return Path(_PRE_SANDBOX_KANBAN_OVERRIDE).expanduser().resolve()
     if _PRE_SANDBOX_HERMES_HOME:
-        # HERMES_HOME was genuinely set before the sandbox — honor it via the
-        # normal resolver (it may be a profile dir whose root matters).
+        # HERMES_HOME was genuinely set before the sandbox. Temporarily use
+        # that value while resolving its canonical root; the process env is
+        # already pinned to the session sandbox for collection/subprocesses.
         from hermes_constants import get_default_hermes_root
-        return get_default_hermes_root().resolve()
+        previous = os.environ.get("HERMES_HOME")
+        try:
+            os.environ["HERMES_HOME"] = _PRE_SANDBOX_HERMES_HOME
+            return get_default_hermes_root().resolve()
+        finally:
+            if previous is None:
+                os.environ.pop("HERMES_HOME", None)
+            else:
+                os.environ["HERMES_HOME"] = previous
     # No pre-existing HERMES_HOME: the real root is the platform default,
-    # NOT the sandbox tempdir now sitting in the env.
-    return (Path.home() / ".hermes").resolve()
+    # NOT the sandbox tempdir now sitting in HOME.
+    return (_PRE_SANDBOX_HOME_PATH / ".hermes").resolve()
 
 
 _REAL_KANBAN_ROOT = _capture_real_kanban_root()

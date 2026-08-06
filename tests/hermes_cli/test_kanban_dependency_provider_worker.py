@@ -1,5 +1,7 @@
 import asyncio
+import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -33,6 +35,13 @@ _BOUND_PROVIDER = _BoundProvider().provide
 def _flood_provider(_context):
     os.write(1, b"x" * (128 * 1024))
     return {"status": "satisfied"}
+
+
+def _environment_probe_provider(context):
+    Path(context.link["metadata"]["env_file"]).write_text(
+        json.dumps(dict(os.environ), sort_keys=True)
+    )
+    return {"status": "satisfied", "generation": "environment"}
 
 
 def _context():
@@ -81,3 +90,52 @@ def test_worker_fails_closed_on_stdout_flood():
     result = evaluate_kanban_dependency_provider("probe.flood", "test", _context())
     assert result.status == "unknown"
     assert result.diagnostics["reason"] == "provider_output_too_large"
+
+
+def test_worker_uses_strict_clean_environment(tmp_path, monkeypatch):
+    forbidden = (
+        "HERMES_HOME",
+        "HERMES_PROFILE",
+        "HERMES_KANBAN_HOME",
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_BOARD",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+    )
+    ambient_home = tmp_path / "ambient-hermes_home"
+    for name in forbidden:
+        value = str(ambient_home) if name == "HERMES_HOME" else f"ambient-{name.lower()}"
+        monkeypatch.setenv(name, value)
+    env_file = tmp_path / "provider-env.json"
+    register_kanban_dependency_provider(
+        "probe.environment",
+        "test",
+        _environment_probe_provider,
+        timeout_seconds=5.0,
+    )
+    context = KanbanDependencyContext(
+        "alpha",
+        {"id": "task"},
+        {
+            "parent_id": "parent",
+            "child_id": "task",
+            "metadata": {"env_file": str(env_file)},
+        },
+        {"id": "parent"},
+    )
+
+    result = evaluate_kanban_dependency_provider(
+        "probe.environment", "test", context
+    )
+
+    assert result.status == "satisfied"
+    observed = json.loads(env_file.read_text())
+    assert set(observed) <= {
+        "LANG",
+        "LC_ALL",
+        "PYTHONPATH",
+        "PYTHONUNBUFFERED",
+        "PYTHONUTF8",
+        "TZ",
+    }
+    assert all(name not in observed for name in forbidden)
+    assert not (Path(__file__).resolve().parents[2] / "ambient-hermes_home").exists()

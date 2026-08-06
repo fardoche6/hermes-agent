@@ -12,12 +12,14 @@ timeouts, and malformed output, is normalized to fail-closed ``unknown``.
 from __future__ import annotations
 
 import json
+import io
 import logging
 import math
 import os
 import pathlib
 import re
 import selectors
+import secrets
 import signal
 import subprocess
 import sys
@@ -298,11 +300,134 @@ _PROVIDER_LOCK = threading.RLock()
 _PROVIDERS: dict[tuple[str, str], _RegisteredProvider] = {}
 _ACTIVE_INVOCATIONS: dict[
     tuple[str, str],
-    dict[int, tuple[subprocess.Popen[bytes], threading.Event]],
+    dict[int, tuple[subprocess.Popen[bytes], threading.Event, Optional[_ProcessContainment]]],
 ] = {}
 _GLOBAL_ADMISSION = threading.BoundedSemaphore(8)
 _PROVIDER_ADMISSION: dict[tuple[str, str], threading.BoundedSemaphore] = {}
 _INVOCATION_IDS = itertools.count(1)
+
+
+@dataclass
+class _ProcessContainment:
+    """A delegated cgroup-v2 boundary for one provider worker."""
+
+    path: pathlib.Path
+    relative_path: str
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _closed: bool = field(default=False, init=False, repr=False)
+
+    def worker_argument(self) -> str:
+        return str(self.path)
+
+    def worker_is_contained(self, pid: int) -> bool:
+        try:
+            for line in pathlib.Path(f"/proc/{pid}/cgroup").read_text(
+                encoding="utf-8"
+            ).splitlines():
+                hierarchy, separator, relative = line.partition("::")
+                if separator and hierarchy == "0":
+                    return relative == self.relative_path
+        except (OSError, UnicodeError):
+            return False
+        return False
+
+    def _populated(self) -> Optional[bool]:
+        try:
+            for line in (self.path / "cgroup.events").read_text(
+                encoding="utf-8"
+            ).splitlines():
+                key, _, value = line.partition(" ")
+                if key == "populated":
+                    return value.strip() == "1"
+        except (OSError, UnicodeError, ValueError):
+            return None
+        return None
+
+    def terminate(self, timeout_seconds: float = 2.0) -> bool:
+        """Kill the complete boundary and prove that it became empty."""
+        with self._lock:
+            if self._closed:
+                return True
+            if not self.path.exists():
+                self._closed = True
+                return True
+            kill_file = self.path / "cgroup.kill"
+            try:
+                kill_file.write_text("1")
+            except OSError:
+                return False
+            deadline = time.monotonic() + timeout_seconds
+            while time.monotonic() < deadline:
+                populated = self._populated()
+                if populated is False:
+                    try:
+                        self.path.rmdir()
+                    except OSError:
+                        if self.path.exists():
+                            time.sleep(0.01)
+                            continue
+                    self._closed = not self.path.exists()
+                    return self._closed
+                time.sleep(0.01)
+            return False
+
+
+def _containment_parent() -> Optional[tuple[pathlib.Path, str]]:
+    """Return a writable cgroup-v2 parent with a kill controller."""
+    if os.name != "posix" or not sys.platform.startswith("linux"):
+        return None
+    try:
+        relative: Optional[str] = None
+        for line in pathlib.Path("/proc/self/cgroup").read_text(
+            encoding="utf-8"
+        ).splitlines():
+            if line.startswith("0::"):
+                relative = line[3:]
+                break
+        if relative is None:
+            return None
+        mount = pathlib.Path("/sys/fs/cgroup")
+        parent = mount / relative.lstrip("/")
+        if not parent.is_dir() or not os.access(parent, os.W_OK):
+            return None
+        if not os.access(parent / "cgroup.procs", os.W_OK):
+            return None
+        if not os.access(parent / "cgroup.kill", os.W_OK):
+            return None
+    except (OSError, StopIteration, UnicodeError):
+        return None
+    return parent, relative.rstrip("/") or "/"
+
+
+def _containment_available() -> bool:
+    return _containment_parent() is not None
+
+
+def _new_process_containment(invocation_id: int) -> Optional[_ProcessContainment]:
+    parent_info = _containment_parent()
+    if parent_info is None:
+        return None
+    parent, relative_parent = parent_info
+    for _ in range(3):
+        name = f"hermes-provider-{os.getpid()}-{invocation_id}-{secrets.token_hex(4)}"
+        path = parent / name
+        try:
+            path.mkdir(mode=0o700)
+            relative = (
+                f"{relative_parent.rstrip('/')}/{name}"
+                if relative_parent != "/"
+                else f"/{name}"
+            )
+            if not (path / "cgroup.kill").is_file():
+                path.rmdir()
+                return None
+            return _ProcessContainment(path=path, relative_path=relative)
+        except OSError:
+            try:
+                path.rmdir()
+            except OSError:
+                pass
+    return None
 
 
 def register_kanban_dependency_provider(
@@ -380,10 +505,14 @@ def register_kanban_dependency_provider(
         _PROVIDER_ADMISSION.setdefault(key, threading.BoundedSemaphore(2))
 
 
-def _stop_process(process: Any) -> None:
-    """Terminate and reap one provider helper without leaving a child behind."""
+def _stop_process(
+    process: Any,
+    boundary: Optional[_ProcessContainment] = None,
+) -> bool:
+    """Terminate and reap a provider boundary, failing closed if unproven."""
+    boundary_ok = boundary is None or boundary.terminate()
     if process is None:
-        return
+        return boundary_ok
     try:
         if process.poll() is None:
             if os.name == "posix":
@@ -407,19 +536,22 @@ def _stop_process(process: Any) -> None:
         else:
             process.wait(timeout=0)
     except (OSError, subprocess.TimeoutExpired):
-        # A process that failed during start or was already reaped is not a
-        # lifecycle leak.  There is no useful recovery at this layer.
-        return
+        return False
+    return boundary_ok
 
 
-def _cancel_invocations(invocations: list[tuple[Any, threading.Event]]) -> None:
-    for process, cancelled in invocations:
+def _cancel_invocations(
+    invocations: list[tuple[Any, threading.Event, Optional[_ProcessContainment]]],
+) -> None:
+    for process, cancelled, boundary in invocations:
         cancelled.set()
-        _stop_process(process)
+        _stop_process(process, boundary)
 
 
-def _remove_provider_keys(keys: list[tuple[str, str]]) -> list[tuple[Any, threading.Event]]:
-    invocations: list[tuple[Any, threading.Event]] = []
+def _remove_provider_keys(
+    keys: list[tuple[str, str]],
+) -> list[tuple[Any, threading.Event, Optional[_ProcessContainment]]]:
+    invocations: list[tuple[Any, threading.Event, Optional[_ProcessContainment]]] = []
     with _PROVIDER_LOCK:
         for key in keys:
             _PROVIDERS.pop(key, None)
@@ -518,19 +650,18 @@ def _run_provider_process(
     if len(request) > MAX_BYTES:
         return _unknown("provider_request_too_large")
     env = {
-        name: value for name, value in os.environ.items()
-        if name in {
-            "HERMES_HOME", "HERMES_PROFILE", "HERMES_KANBAN_HOME",
-            "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD",
-            "HERMES_KANBAN_WORKSPACES_ROOT", "TZ", "LANG", "LC_ALL",
-        }
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "TZ": "UTC",
     }
     repo_root = str(pathlib.Path(__file__).resolve().parents[1])
     env["PYTHONPATH"] = os.pathsep.join(
         dict.fromkeys((repo_root, *provider.pythonpath))
     )
     env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONUTF8"] = "1"
     process: Optional[subprocess.Popen[bytes]] = None
+    boundary: Optional[_ProcessContainment] = None
     cancelled = threading.Event()
     invocation_id = next(_INVOCATION_IDS)
     admission = _PROVIDER_ADMISSION[key]
@@ -544,8 +675,16 @@ def _run_provider_process(
         _GLOBAL_ADMISSION.release()
         return _unknown("provider_busy")
     try:
+        boundary = _new_process_containment(invocation_id)
+        command = [
+            sys.executable,
+            "-m",
+            "hermes_cli.kanban_provider_worker",
+        ]
+        if boundary is not None:
+            command.extend(("--containment-cgroup", boundary.worker_argument()))
         process = subprocess.Popen(
-            [sys.executable, "-m", "hermes_cli.kanban_provider_worker"],
+            command,
             cwd=repo_root,
             env=env,
             stdin=subprocess.PIPE,
@@ -554,10 +693,26 @@ def _run_provider_process(
             close_fds=True,
             start_new_session=(os.name == "posix"),
         )
+        if boundary is not None:
+            containment_deadline = min(request_deadline, time.monotonic() + 1.0)
+            while not boundary.worker_is_contained(process.pid):
+                now = time.monotonic()
+                if process.poll() is not None or now >= containment_deadline:
+                    reason = (
+                        "provider_timeout"
+                        if now >= request_deadline
+                        else "provider_containment_unavailable"
+                    )
+                    return _unknown(reason)
+                time.sleep(0.005)
         with _PROVIDER_LOCK:
             if _PROVIDERS.get(key) is not provider:
                 return _unknown("provider_unavailable")
-            _ACTIVE_INVOCATIONS.setdefault(key, {})[invocation_id] = (process, cancelled)
+            _ACTIVE_INVOCATIONS.setdefault(key, {})[invocation_id] = (
+                process,
+                cancelled,
+                boundary,
+            )
         assert process.stdin is not None
         process.stdin.write(request)
         process.stdin.close()
@@ -565,21 +720,27 @@ def _run_provider_process(
         output = bytearray()
         selector: Optional[selectors.BaseSelector] = selectors.DefaultSelector()
         assert process.stdout is not None
-        os.set_blocking(process.stdout.fileno(), False)
-        selector.register(process.stdout, selectors.EVENT_READ)
+        process_stdout = process.stdout
+        if not isinstance(process_stdout, io.BufferedReader):
+            return _unknown("provider_unavailable")
+        os.set_blocking(process_stdout.fileno(), False)
+        selector.register(process_stdout, selectors.EVENT_READ)
         while time.monotonic() < deadline:
             if cancelled.is_set():
                 return _unknown("provider_unavailable")
             remaining = deadline - time.monotonic()
             events = selector.select(min(remaining, 0.05))
             for stream, _ in events:
-                chunk = stream.fileobj.read(8192)
+                stream_fileobj = stream.fileobj
+                if not isinstance(stream_fileobj, io.BufferedReader):
+                    continue
+                chunk = stream_fileobj.read(8192)
                 if chunk:
                     output.extend(chunk)
                     if len(output) > MAX_BYTES:
                         return _unknown("provider_output_too_large")
                 else:
-                    selector.unregister(stream.fileobj)
+                    selector.unregister(stream_fileobj)
             if process.poll() is not None and not selector.get_map():
                 break
         else:
@@ -614,7 +775,9 @@ def _run_provider_process(
                 selector.close()
         except UnboundLocalError:
             pass
-        _stop_process(process)
+        cleanup_ok = _stop_process(process, boundary)
+        if not cleanup_ok:
+            raise RuntimeError("provider process containment cleanup was not proven")
         with _PROVIDER_LOCK:
             active = _ACTIVE_INVOCATIONS.get(key)
             if active is not None:

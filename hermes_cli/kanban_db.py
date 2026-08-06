@@ -143,6 +143,7 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+DEPENDENCY_LINK_VERSION = 1
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -235,7 +236,9 @@ def _assert_not_delegated_child_mutation() -> None:
         )
 
 
-def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
+def _fire_kanban_lifecycle_hook(
+    event: str, task_id: str, *, board: str, **fields: Any
+) -> None:
     """Fire a kanban lifecycle plugin hook, fully best-effort.
 
     Called by the claim/complete/block transitions AFTER their write txn has
@@ -255,7 +258,13 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
             profile_name = get_active_profile_name()
         except Exception:
             profile_name = "default"
-        invoke_hook(event, task_id=task_id, profile_name=profile_name, **fields)
+        invoke_hook(
+            event,
+            task_id=task_id,
+            profile_name=profile_name,
+            board=board,
+            **fields,
+        )
     except Exception as exc:  # pragma: no cover - defensive
         _log.debug("kanban lifecycle hook %s failed: %s", event, exc)
 
@@ -635,6 +644,39 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     if slug == DEFAULT_BOARD:
         return kanban_home() / "kanban.db"
     return board_dir(slug) / "kanban.db"
+
+
+def _canonical_board_from_db_path(path: Path) -> Optional[str]:
+    """Derive a board slug only from one of the canonical board DB layouts.
+
+    An arbitrary ``db_path`` is deliberately not treated as the active board:
+    doing that would let a lower-level API silently route a temporary/custom
+    database through whatever board happens to be selected in the ambient
+    process.  The legacy default path and ``boards/<slug>/kanban.db`` are the
+    only layouts whose slug is unambiguous from the path itself.
+    """
+    try:
+        resolved = path.expanduser().resolve(strict=False)
+        default_db = (kanban_home() / "kanban.db").resolve(strict=False)
+        if resolved == default_db:
+            return DEFAULT_BOARD
+        boards = boards_root().resolve(strict=False)
+        if resolved.name != "kanban.db" or resolved.parent.parent != boards:
+            return None
+        return _normalize_board_slug(resolved.parent.name)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _connection_board_path(conn: sqlite3.Connection) -> Optional[Path]:
+    """Return the path captured when ``conn`` was opened, if available."""
+    raw = getattr(conn, "_hermes_kanban_db_path", None)
+    if not raw:
+        return None
+    try:
+        return Path(str(raw))
+    except (TypeError, ValueError):
+        return None
 
 
 def workspaces_root(board: Optional[str] = None) -> Path:
@@ -1619,10 +1661,17 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
 def _bind_kanban_connection_board(
     conn: sqlite3.Connection,
     board: Optional[str],
+    db_path: Optional[str] = None,
 ) -> sqlite3.Connection:
-    """Bind the resolved board for APIs whose legacy signature lacks board."""
+    """Bind the resolved board and DB path for legacy APIs.
+
+    The path is captured as well as the slug because a dispatcher connection
+    may have been opened from an explicit test/custom path while an ambient
+    ``HERMES_KANBAN_DB`` points somewhere else.
+    """
     try:
         setattr(conn, "_hermes_kanban_board", board)
+        setattr(conn, "_hermes_kanban_db_path", db_path)
     except Exception:
         # sqlite3.Connection normally permits attributes; callers still pass
         # explicit board values when a custom connection implementation does
@@ -2357,6 +2406,8 @@ def connect(
     resolved_board = _normalize_board_slug(board)
     if db_path is not None:
         path = db_path
+        if resolved_board is None:
+            resolved_board = _canonical_board_from_db_path(path)
     else:
         resolved_board = resolved_board or get_current_board()
         path = kanban_db_path(board=board)
@@ -2375,7 +2426,7 @@ def connect(
     resolved = str(path.resolve())
     if resolved in _INITIALIZED_PATHS:
         conn = _bind_kanban_connection_board(
-            _sqlite_connect(path), resolved_board
+            _sqlite_connect(path), resolved_board, resolved
         )
         try:
             conn.row_factory = sqlite3.Row
@@ -2408,7 +2459,7 @@ def connect(
         _guard_existing_db_is_healthy(path)
         resolved = str(path.resolve())
         conn = _bind_kanban_connection_board(
-            _sqlite_connect(path), resolved_board
+            _sqlite_connect(path), resolved_board, resolved
         )
         try:
             conn.row_factory = sqlite3.Row
@@ -2509,7 +2560,7 @@ def init_db(
     # schema + migration pass unconditionally.
     with _INIT_LOCK:
         _INITIALIZED_PATHS.discard(resolved)
-    with contextlib.closing(connect(path)):
+    with contextlib.closing(connect(path, board=board)):
         pass
     return path
 
@@ -3593,6 +3644,348 @@ def _normalize_dependency_spec(
     return kind, provider, safe_metadata
 
 
+def _idempotency_json_marker(raw: Any) -> dict[str, str]:
+    """Represent malformed legacy JSON without raising during replay checks."""
+    try:
+        rendered = json.dumps(raw, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        rendered = str(raw)
+    return {"__malformed_json__": rendered}
+
+
+def _idempotency_list(raw: Any) -> Optional[list[Any]]:
+    if raw is None or raw == "":
+        return None
+    value = raw
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return [_idempotency_json_marker(raw)]
+    if not isinstance(value, list):
+        return [_idempotency_json_marker(raw)]
+    return [str(item) for item in value]
+
+
+def _idempotency_metadata(raw: Any) -> dict[str, Any]:
+    if raw is None or raw == "":
+        return {}
+    value = raw
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return _idempotency_json_marker(raw)
+    if not isinstance(value, Mapping):
+        return _idempotency_json_marker(raw)
+    try:
+        return validate_dependency_metadata(value)
+    except (TypeError, ValueError):
+        return _idempotency_json_marker(raw)
+
+
+def _idempotency_links(
+    raw_links: Any,
+    *,
+    parents: list[str],
+    dependency_kind: Any,
+    provider_name: Any,
+    dependency_metadata: Any,
+) -> list[dict[str, Any]]:
+    if raw_links is None:
+        source = [
+            {
+                "parent_id": parent,
+                "dependency_kind": dependency_kind,
+                "provider_name": provider_name,
+                "dependency_metadata": dependency_metadata,
+            }
+            for parent in parents
+        ]
+    else:
+        value = raw_links
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return [{"__malformed_json__": json.dumps(str(raw_links))}]
+        if not isinstance(value, list):
+            return [_idempotency_json_marker(raw_links)]
+        source = value
+
+    links: list[dict[str, Any]] = []
+    for item in source:
+        if not isinstance(item, Mapping):
+            links.append(_idempotency_json_marker(item))
+            continue
+        parent = item.get("parent_id", item.get("parent"))
+        if parent is None:
+            links.append(_idempotency_json_marker(item))
+            continue
+        links.append(
+            {
+                "parent_id": str(parent),
+                "dependency_kind": str(
+                    item.get("dependency_kind", "completion") or "completion"
+                ).strip(),
+                "provider_name": (
+                    str(item["provider_name"]).strip()
+                    if item.get("provider_name") is not None
+                    else None
+                ),
+                "dependency_metadata": _idempotency_metadata(
+                    item.get("dependency_metadata", item.get("metadata"))
+                ),
+            }
+        )
+    return sorted(
+        links,
+        key=lambda item: json.dumps(item, sort_keys=True, default=str),
+    )
+
+
+def _normalize_task_idempotency_spec(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Canonicalize request, event, and legacy-row replay specifications."""
+    parents_raw = _idempotency_list(raw.get("parents")) or []
+    parents = sorted({str(parent) for parent in parents_raw})
+    dependency_kind = str(raw.get("dependency_kind", "completion") or "completion").strip()
+    provider_name = (
+        str(raw["provider_name"]).strip()
+        if raw.get("provider_name") is not None
+        else None
+    )
+    dependency_metadata = _idempotency_metadata(raw.get("dependency_metadata"))
+    links = _idempotency_links(
+        raw.get("links"),
+        parents=parents,
+        dependency_kind=dependency_kind,
+        provider_name=provider_name,
+        dependency_metadata=dependency_metadata,
+    )
+    if not parents and links and all("parent_id" in item for item in links):
+        parents = sorted({str(item["parent_id"]) for item in links})
+
+    skills = _idempotency_list(raw.get("skills"))
+    if skills == []:
+        skills = None
+    def _int_or_marker(value: Any) -> Any:
+        if value is None or value == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return _idempotency_json_marker(value)
+
+    def _bool_value(value: Any) -> bool:
+        if isinstance(value, str):
+            return value.strip().lower() not in {"", "0", "false", "no", "off", "null"}
+        return bool(value)
+
+    def _text(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        return str(value)
+
+    return {
+        "title": str(raw.get("title", "")).strip(),
+        "body": raw.get("body"),
+        "assignee": _text(raw.get("assignee")),
+        "created_by": _text(raw.get("created_by")),
+        "workspace_kind": str(raw.get("workspace_kind", "scratch") or "scratch"),
+        "workspace_path": _text(raw.get("workspace_path")),
+        "branch_name": _text(raw.get("branch_name")),
+        "tenant": _text(raw.get("tenant")),
+        "priority": _int_or_marker(raw.get("priority", 0)),
+        "parents": parents,
+        "links": links,
+        "triage": _bool_value(raw.get("triage", False)),
+        "max_runtime_seconds": _int_or_marker(raw.get("max_runtime_seconds")),
+        "skills": skills,
+        "max_retries": _int_or_marker(raw.get("max_retries")),
+        "model_override": _text(raw.get("model_override")),
+        "provider_override": _text(raw.get("provider_override")),
+        "reasoning_effort": _text(raw.get("reasoning_effort")),
+        "goal_mode": _bool_value(raw.get("goal_mode", False)),
+        "goal_max_turns": _int_or_marker(raw.get("goal_max_turns")),
+        "initial_status": str(raw.get("initial_status", "running") or "running"),
+        "session_id": _text(raw.get("session_id")),
+        "project_id": _text(raw.get("project_id")),
+        "project_source_task_id": _text(raw.get("project_source_task_id")),
+        "dependency_kind": dependency_kind,
+        "provider_name": provider_name,
+        "dependency_metadata": dependency_metadata,
+    }
+
+
+def _task_idempotency_spec(
+    *,
+    title: str,
+    body: Optional[str],
+    assignee: Optional[str],
+    created_by: Optional[str],
+    workspace_kind: str,
+    workspace_path: Optional[str],
+    branch_name: Optional[str],
+    tenant: Optional[str],
+    priority: int,
+    parents: tuple[str, ...],
+    triage: bool,
+    max_runtime_seconds: Optional[int],
+    skills: Optional[list[str]],
+    max_retries: Optional[int],
+    model_override: Optional[str],
+    provider_override: Optional[str],
+    reasoning_effort: Optional[str],
+    goal_mode: bool,
+    goal_max_turns: Optional[int],
+    initial_status: str,
+    session_id: Optional[str],
+    project_id: Optional[str],
+    project_source_task_id: Optional[str],
+    dependency_kind: str,
+    provider_name: Optional[str],
+    dependency_metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Build one canonical immutable creation/link specification."""
+    return _normalize_task_idempotency_spec(
+        {
+            "title": title,
+            "body": body,
+            "assignee": assignee,
+            "created_by": created_by,
+            "workspace_kind": workspace_kind,
+            "workspace_path": workspace_path,
+            "branch_name": branch_name,
+            "tenant": tenant,
+            "priority": priority,
+            "parents": list(parents),
+            "triage": triage,
+            "max_runtime_seconds": max_runtime_seconds,
+            "skills": skills,
+            "max_retries": max_retries,
+            "model_override": model_override,
+            "provider_override": provider_override,
+            "reasoning_effort": reasoning_effort,
+            "goal_mode": goal_mode,
+            "goal_max_turns": goal_max_turns,
+            "initial_status": initial_status,
+            "session_id": session_id,
+            "project_id": project_id,
+            "project_source_task_id": project_source_task_id,
+            "dependency_kind": dependency_kind,
+            "provider_name": provider_name,
+            "dependency_metadata": dependency_metadata,
+        }
+    )
+
+
+def _legacy_task_idempotency_spec(
+    conn: sqlite3.Connection, row: sqlite3.Row
+) -> dict[str, Any]:
+    keys = set(row.keys())
+    def _row(name: str, default: Any = None) -> Any:
+        return row[name] if name in keys else default
+
+    links = conn.execute(
+        "SELECT parent_id, dependency_kind, provider_name, metadata "
+        "FROM task_links WHERE child_id = ?",
+        (row["id"],),
+    ).fetchall()
+    link_specs = [
+        {
+            "parent_id": link["parent_id"],
+            "dependency_kind": link["dependency_kind"] or "completion",
+            "provider_name": link["provider_name"],
+            "dependency_metadata": _idempotency_metadata(link["metadata"]),
+        }
+        for link in links
+    ]
+    parent_ids = [str(link["parent_id"]) for link in links]
+    first_link = link_specs[0] if link_specs else {}
+    return _normalize_task_idempotency_spec(
+        {
+            "title": _row("title", ""),
+            "body": _row("body"),
+            "assignee": _row("assignee"),
+            "created_by": _row("created_by"),
+            "workspace_kind": _row("workspace_kind", "scratch"),
+            "workspace_path": _row("workspace_path"),
+            "branch_name": _row("branch_name"),
+            "tenant": _row("tenant"),
+            "priority": _row("priority", 0),
+            "parents": parent_ids,
+            "links": link_specs,
+            "triage": _row("status") == "triage",
+            "max_runtime_seconds": _row("max_runtime_seconds"),
+            "skills": _row("skills"),
+            "max_retries": _row("max_retries"),
+            "model_override": _row("model_override"),
+            "provider_override": _row("provider_override"),
+            "reasoning_effort": _row("reasoning_effort"),
+            "goal_mode": _row("goal_mode", False),
+            "goal_max_turns": _row("goal_max_turns"),
+            "initial_status": "blocked" if _row("status") == "blocked" else "running",
+            "session_id": _row("session_id"),
+            "project_id": _row("project_id"),
+            "project_source_task_id": None,
+            "dependency_kind": first_link.get("dependency_kind", "completion"),
+            "provider_name": first_link.get("provider_name"),
+            "dependency_metadata": first_link.get("dependency_metadata", {}),
+        }
+    )
+
+
+def _created_event_idempotency_spec(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[dict[str, Any]]:
+    task_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if task_row is None:
+        return None
+    persisted = _legacy_task_idempotency_spec(conn, task_row)
+    event_row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'created' ORDER BY id LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if event_row is None or not event_row["payload"]:
+        return persisted
+    try:
+        payload = json.loads(event_row["payload"])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return persisted
+    raw_spec = payload.get("idempotency_spec") if isinstance(payload, dict) else None
+    if not isinstance(raw_spec, Mapping):
+        return persisted
+    merged = dict(persisted)
+    merged.update(raw_spec)
+    for field_name in ("workspace_path", "branch_name"):
+        if raw_spec.get(field_name) is None:
+            merged[field_name] = persisted[field_name]
+    return _normalize_task_idempotency_spec(merged)
+
+
+def _assert_idempotency_replay_matches(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    requested_spec: dict[str, Any],
+) -> None:
+    existing_spec = _created_event_idempotency_spec(conn, row["id"])
+    if existing_spec is None:
+        existing_spec = _legacy_task_idempotency_spec(conn, row)
+    effective_request = dict(requested_spec)
+    # Null workspace/branch inputs mean "use the canonical persisted default".
+    # Compare against the winner's effective values, including project-derived
+    # ``.worktrees/<winner-id>`` paths, rather than comparing raw request nulls.
+    for field_name in ("workspace_path", "branch_name"):
+        if effective_request.get(field_name) is None:
+            effective_request[field_name] = existing_spec[field_name]
+    effective_request = _normalize_task_idempotency_spec(effective_request)
+    if existing_spec != effective_request:
+        raise ValueError(
+            "idempotency key conflict: canonical task or link specification differs"
+        )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3668,6 +4061,7 @@ def create_task(
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     board_slug = _dependency_board(conn, board)
+    idempotency_key = str(idempotency_key).strip() if idempotency_key else None
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
@@ -3706,6 +4100,8 @@ def create_task(
     # is set. Projects live in the creator's per-profile projects.db; the repo
     # path is absolute (profile-independent) and the branch name is pure, so the
     # cross-profile dispatcher needs no projects.db access at dispatch time.
+    from hermes_cli import projects_db as _pdb
+
     project_obj = None
     # Primary repo of a project-linked worktree task whose path we still need to
     # derive (a fresh worktree dir under the repo, computed once task_id exists).
@@ -3713,8 +4109,6 @@ def create_task(
     if project_id is not None:
         project_id = str(project_id).strip() or None
     if project_id:
-        from hermes_cli import projects_db as _pdb
-
         try:
             with _pdb.connect_closing() as _pconn:
                 project_obj = _pdb.get_project(_pconn, project_id)
@@ -3788,7 +4182,7 @@ def create_task(
                 # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
                 project_repo = str(project_obj.primary_path)
 
-    parents = tuple(dict.fromkeys(p for p in parents if p))
+    parents = tuple(sorted({str(p) for p in parents if p}))
     dependency_kind, provider_name, dependency_metadata = _normalize_dependency_spec(
         dependency_kind,
         provider_name,
@@ -3840,55 +4234,6 @@ def create_task(
             )
         skills_list = cleaned
 
-    # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT * FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key,),
-        ).fetchone()
-        if row:
-            existing_links = conn.execute(
-                "SELECT parent_id, dependency_kind, provider_name, metadata "
-                "FROM task_links WHERE child_id = ? ORDER BY parent_id",
-                (row["id"],),
-            ).fetchall()
-            existing_specs = [
-                (
-                    link["parent_id"],
-                    *_normalize_dependency_spec(
-                        link["dependency_kind"] or "completion",
-                        link["provider_name"],
-                        _decode_dependency_metadata(link["metadata"]),
-                    ),
-                )
-                for link in existing_links
-            ]
-            requested_specs = [
-                (parent, dependency_kind, provider_name, dependency_metadata)
-                for parent in parents
-            ]
-            comparable = (
-                row["title"], row["body"], row["assignee"], row["tenant"],
-                int(row["priority"] or 0), row["workspace_kind"],
-                row["workspace_path"], row["branch_name"], row["project_id"],
-                existing_specs,
-            )
-            requested = (
-                title.strip(), body, assignee, tenant, int(priority), workspace_kind,
-                workspace_path, branch_name, project_id, requested_specs,
-            )
-            if comparable != requested:
-                raise ValueError(
-                    "idempotency key conflict: canonical task, parents, or dependency binding differs"
-                )
-            return row["id"]
-
     now = int(time.time())
 
     # Resolve workspace_path from board-level default_workdir when the
@@ -3910,11 +4255,51 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
+    requested_replay_spec = _task_idempotency_spec(
+        title=title,
+        body=body,
+        assignee=assignee,
+        created_by=created_by,
+        workspace_kind=workspace_kind,
+        workspace_path=workspace_path,
+        branch_name=branch_name,
+        tenant=tenant,
+        priority=priority,
+        parents=parents,
+        triage=triage,
+        max_runtime_seconds=max_runtime_seconds,
+        skills=skills_list,
+        max_retries=max_retries,
+        model_override=model_override,
+        provider_override=provider_override,
+        reasoning_effort=reasoning_effort,
+        goal_mode=goal_mode,
+        goal_max_turns=goal_max_turns,
+        initial_status=initial_status,
+        session_id=session_id,
+        project_id=project_id,
+        project_source_task_id=project_source_task_id,
+        dependency_kind=dependency_kind,
+        provider_name=provider_name,
+        dependency_metadata=dependency_metadata,
+    )
+
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
         try:
             with write_txn(conn):
+                if idempotency_key:
+                    winner = conn.execute(
+                        "SELECT * FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if winner is not None:
+                        _assert_idempotency_replay_matches(
+                            conn, winner, requested_replay_spec
+                        )
+                        return winner["id"]
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -3939,23 +4324,33 @@ def create_task(
                     if missing:
                         raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
 
+                insert_workspace_path = workspace_path
+                insert_branch_name = branch_name
+
                 # Project-linked worktree: a fresh worktree dir under the repo
                 # plus a deterministic branch (project slug + task id). Together
                 # these kill the random ``wt/<task-id>`` worker fallback and the
                 # unanchored ``.worktrees/<id>`` under the dispatcher's cwd.
                 if project_obj is not None and workspace_kind == "worktree":
-                    if project_repo and not workspace_path:
-                        workspace_path = os.path.join(
+                    if project_repo and not insert_workspace_path:
+                        insert_workspace_path = os.path.join(
                             project_repo, ".worktrees", task_id
                         )
-                    if not branch_name:
+                    if not insert_branch_name:
                         # _pdb was imported above when project_obj was resolved.
                         try:
-                            branch_name = _pdb.branch_name_for(
+                            insert_branch_name = _pdb.branch_name_for(
                                 project_obj, task_id, title=title or ""
                             )
                         except Exception:
-                            branch_name = None
+                            insert_branch_name = None
+
+                actual_replay_spec = dict(requested_replay_spec)
+                actual_replay_spec["workspace_path"] = insert_workspace_path
+                actual_replay_spec["branch_name"] = insert_branch_name
+                actual_replay_spec = _normalize_task_idempotency_spec(
+                    actual_replay_spec
+                )
 
                 conn.execute(
                     """
@@ -3979,8 +4374,8 @@ def create_task(
                         created_by,
                         now,
                         workspace_kind,
-                        workspace_path,
-                        branch_name,
+                        insert_workspace_path,
+                        insert_branch_name,
                         project_id,
                         tenant,
                         idempotency_key,
@@ -4025,8 +4420,8 @@ def create_task(
                         "parents": list(parents),
                         "tenant": tenant,
                         "workspace_kind": workspace_kind,
-                        "workspace_path": workspace_path,
-                        "branch_name": branch_name,
+                        "workspace_path": insert_workspace_path,
+                        "branch_name": insert_branch_name,
                         "project_id": project_id,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
@@ -4035,6 +4430,7 @@ def create_task(
                         "dependency_kind": dependency_kind,
                         "provider_name": provider_name,
                         "dependency_metadata": dependency_metadata or None,
+                        "idempotency_spec": actual_replay_spec,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -4049,10 +4445,25 @@ def create_task(
                             (task_id,),
                         )
             return task_id
-        except sqlite3.IntegrityError:
+        except sqlite3.IntegrityError as exc:
+            if idempotency_key and "idempotency_key" in str(exc).lower():
+                with write_txn(conn):
+                    winner = conn.execute(
+                        "SELECT * FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if winner is None:
+                        raise RuntimeError(
+                            "idempotency collision has no canonical winning task"
+                        ) from exc
+                    _assert_idempotency_replay_matches(
+                        conn, winner, requested_replay_spec
+                    )
+                    return winner["id"]
             if attempt == 1:
                 raise
-            # Retry with a fresh id.
+            # Retry only an unrelated random task-id collision.
             continue
     raise RuntimeError("unreachable")
 
@@ -4190,13 +4601,20 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
-def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
+def assign_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    profile: Optional[str],
+    *,
+    board: Optional[str] = None,
+) -> bool:
     """Assign or reassign a task.  Returns True on success.
 
     Refuses to reassign a task that has a live claim, including a reviewer
     claim that deliberately remains in the ``review`` column. Reassign after
     the current run completes or reclaim the stale claim first if needed.
     """
+    _dependency_board(conn, board)
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
@@ -4393,7 +4811,25 @@ def _dependency_board(
         return explicit
     if bound:
         return bound
-    return get_current_board()
+    path = _connection_board_path(conn)
+    derived = _canonical_board_from_db_path(path) if path is not None else None
+    if derived:
+        return derived
+    raise ValueError(
+        "kanban connection has no bound board; pass board= explicitly for "
+        "custom or ambiguous db_path connections"
+    )
+
+
+def _connection_db_path(conn: sqlite3.Connection) -> Optional[Path]:
+    """Return the immutable database path captured when ``conn`` opened."""
+    raw = getattr(conn, "_hermes_kanban_db_path", None)
+    if not raw:
+        return None
+    try:
+        return Path(str(raw)).expanduser().resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
 
 
 def _dependency_task_context(task: Task, *, board: str) -> dict[str, Any]:
@@ -4450,6 +4886,37 @@ def _dependency_metadata_digest(metadata: Mapping[str, Any]) -> str:
     ).hexdigest()
 
 
+def _dependency_link_identity_error(
+    row: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> Optional[str]:
+    metadata_digest = row["metadata_digest"]
+    edge_identity = row["edge_identity"]
+    link_version = row["link_version"]
+    if link_version is None:
+        return "missing_or_invalid_link_version"
+    try:
+        normalized_version = int(link_version)
+    except (TypeError, ValueError):
+        return "missing_or_invalid_link_version"
+    if normalized_version != DEPENDENCY_LINK_VERSION:
+        return "unsupported_link_version"
+    if not isinstance(metadata_digest, str) or not metadata_digest:
+        return "missing_metadata_digest"
+    if metadata_digest != _dependency_metadata_digest(metadata):
+        return "metadata_digest_mismatch"
+    expected_edge = _dependency_edge_identity(
+        str(row["parent_id"]),
+        str(row["child_id"]),
+        str(row["dependency_kind"] or "completion"),
+        row["provider_name"],
+        metadata,
+    )
+    if not isinstance(edge_identity, str) or edge_identity != expected_edge:
+        return "edge_identity_mismatch"
+    return None
+
+
 def resolve_task_dependencies(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4474,7 +4941,7 @@ def resolve_task_dependencies(
         )
     rows = conn.execute(
         "SELECT parent_id, child_id, dependency_kind, provider_name, metadata, "
-        "edge_identity, link_version FROM task_links WHERE child_id = ? "
+        "metadata_digest, edge_identity, link_version FROM task_links WHERE child_id = ? "
         "ORDER BY parent_id",
         (task_id,),
     ).fetchall()
@@ -4514,6 +4981,26 @@ def resolve_task_dependencies(
             )
             aggregate_diagnostics.append(
                 {"reason": "malformed_link_metadata", "parent_id": parent_id}
+            )
+            all_satisfied = False
+            continue
+        identity_error = _dependency_link_identity_error(row, link_metadata)
+        if identity_error is not None:
+            evidence.append(
+                DependencyEvidence(
+                    parent_id=parent_id,
+                    child_id=child_id,
+                    dependency_kind=kind,
+                    provider_name=provider_name,
+                    status="unknown",
+                    metadata=link_metadata,
+                    diagnostics={"reason": identity_error},
+                    edge_identity=row["edge_identity"],
+                    link_version=row["link_version"],
+                )
+            )
+            aggregate_diagnostics.append(
+                {"reason": identity_error, "parent_id": parent_id}
             )
             all_satisfied = False
             continue
@@ -4597,6 +5084,9 @@ def resolve_task_dependencies(
                         "dependency_kind": kind,
                         "provider_name": str(provider_name),
                         "metadata": link_metadata,
+                        "metadata_digest": row["metadata_digest"],
+                        "edge_identity": row["edge_identity"],
+                        "link_version": int(row["link_version"]),
                     },
                     parent=_dependency_task_context(parent, board=board_slug),
                 )
@@ -4652,6 +5142,10 @@ def resolve_task_dependencies(
                     "child_id": child_id,
                     "dependency_kind": kind,
                     "provider_name": str(provider_name),
+                    "metadata": link_metadata,
+                    "metadata_digest": row["metadata_digest"],
+                    "edge_identity": row["edge_identity"],
+                    "link_version": int(row["link_version"]),
                     "generation": generation,
                     "workspace_base": workspace_base,
                 }
@@ -4671,6 +5165,8 @@ def resolve_task_dependencies(
         binding = {
             "board": board_slug,
             "dependencies": provider_bindings,
+            "snapshot_digest": snapshot_digest,
+            "link_version": snapshot_version,
         }
         pinned = [item["workspace_base"] for item in provider_bindings if item["workspace_base"]]
         if pinned:
@@ -5551,7 +6047,7 @@ def claim_task(
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
         snapshot_rows = conn.execute(
             "SELECT parent_id, child_id, dependency_kind, provider_name, metadata, "
-            "edge_identity, link_version FROM task_links WHERE child_id = ? "
+            "metadata_digest, edge_identity, link_version FROM task_links WHERE child_id = ? "
             "ORDER BY parent_id",
             (task_id,),
         ).fetchall()
@@ -5697,6 +6193,7 @@ def claim_review_task(
     claimer: Optional[str] = None,
     expected_authority: Optional[tuple[int, str]] = None,
     expected_assignee: object = _EXPECTED_REVIEW_ASSIGNEE_UNSET,
+    board: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically claim a ``review`` task without leaving the review column.
 
@@ -5717,6 +6214,7 @@ def claim_review_task(
     A writer that changes either the authority generation or the observed task
     assignee therefore makes this call return ``None`` without creating a run.
     """
+    _dependency_board(conn, board)
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -6869,6 +7367,7 @@ def submit_task_for_review(
     expected_run_id: Optional[int] = None,
     handoff_reason: Optional[str] = None,
     trusted_operator: bool = False,
+    board: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically hand an implementation run to a reviewer.
 
@@ -6878,6 +7377,7 @@ def submit_task_for_review(
     closed before the reviewer assignment is installed, so no claim or run is
     orphaned.
     """
+    _dependency_board(conn, board)
     reviewer = _canonical_assignee(reviewer)
     if not reviewer:
         raise ValueError("reviewer is required")
@@ -7303,6 +7803,7 @@ def request_changes(
     expected_run_id: Optional[int] = None,
     trusted_operator: bool = False,
     recovery: bool = False,
+    board: Optional[str] = None,
 ) -> Optional[Task]:
     """Return a review to the programmer on the SAME card via ``ready``.
 
@@ -7312,6 +7813,7 @@ def request_changes(
     operator path for an unclaimed stranded review with a durable literal
     ``REQUEST_CHANGES`` verdict; it never authorizes approval.
     """
+    _dependency_board(conn, board)
     programmer = _canonical_assignee(programmer)
     reviewer_name = _canonical_assignee(reviewer)
     if not programmer:
@@ -7596,6 +8098,7 @@ def approve_review(
     expected_claim: Optional[str] = None,
     expected_run_id: Optional[int] = None,
     trusted_operator: bool = False,
+    board: Optional[str] = None,
 ) -> Optional[Task]:
     """Record an exact-head approval and hand the same card to its finalizer.
 
@@ -7606,6 +8109,7 @@ def approve_review(
     its claim and active run id; the explicit trusted-operator mode is for the
     CLI/dashboard control plane.
     """
+    _dependency_board(conn, board)
     expected_claim = (expected_claim or "").strip() or None
     reviewer_name = _canonical_assignee(reviewer)
     if not reviewer_name:
@@ -7903,6 +8407,7 @@ def failover_review_task(
     error: Optional[str] = None,
     attempted: Optional[list[dict[str, str]]] = None,
     expected_run_id: Optional[int] = None,
+    board: Optional[str] = None,
 ) -> Optional[Task]:
     """Keep a failed reviewer handoff in ``review`` or block it terminally.
 
@@ -7910,6 +8415,7 @@ def failover_review_task(
     failed and the card must be surfaced to a human; it never passes through
     ``ready``/``running`` and never creates a child card.
     """
+    _dependency_board(conn, board)
     reviewer = _canonical_assignee(reviewer) if reviewer else None
     bounded = _bounded_review_error(error) if error else None
     sanitized_attempted = _sanitize_review_attempts(attempted)
@@ -8052,8 +8558,10 @@ def _failover_review_after_recovery(
     *,
     error: Optional[str],
     attempted: Optional[Iterable[Mapping[str, object]]] = None,
+    board: Optional[str] = None,
 ) -> Optional[Task]:
     """Move recovery from a failed reviewer to one bounded alternate lane."""
+    board_slug = _dependency_board(conn, board)
     task = get_task(conn, task_id)
     if task is None or task.status != "review":
         return task
@@ -8080,6 +8588,7 @@ def _failover_review_after_recovery(
         next_reviewer,
         error=error,
         attempted=attempts,
+        board=board_slug,
     )
 
 
@@ -8120,6 +8629,7 @@ def release_stale_claims(
     conn: sqlite3.Connection,
     *,
     signal_fn=None,
+    board: Optional[str] = None,
 ) -> int:
     """Reset any ``running`` task whose claim has expired.
 
@@ -8146,6 +8656,7 @@ def release_stale_claims(
     Returns the number of stale claims actually reclaimed (live-pid
     extensions don't count). Safe to call often.
     """
+    board_slug = _dependency_board(conn, board)
     now = int(time.time())
     reclaimed = 0
     review_reclaimed: dict[str, str] = {}
@@ -8361,6 +8872,7 @@ def release_stale_claims(
             conn,
             task_id,
             error=terminal_error,
+            board=board_slug,
         )
     return reclaimed
 
@@ -8371,6 +8883,7 @@ def reclaim_task(
     *,
     reason: Optional[str] = None,
     signal_fn=None,
+    board: Optional[str] = None,
 ) -> bool:
     """Operator-driven reclaim: release the claim and reset to ``ready``.
 
@@ -8383,6 +8896,7 @@ def reclaim_task(
     Returns True if a reclaim happened, False if the task isn't in a
     reclaimable state (not running, or doesn't exist).
     """
+    _dependency_board(conn, board)
     row = conn.execute(
         "SELECT status, claim_lock, worker_pid, worker_boot_id, "
         "worker_starttime, recovery_required FROM tasks WHERE id = ?",
@@ -8507,6 +9021,7 @@ def reassign_task(
     *,
     reclaim_first: bool = False,
     reason: Optional[str] = None,
+    board: Optional[str] = None,
 ) -> bool:
     """Reassign a task, optionally reclaiming a stuck running worker first.
 
@@ -8519,6 +9034,7 @@ def reassign_task(
     Returns True if the reassign landed. ``profile`` may be ``None`` to
     unassign entirely.
     """
+    board_slug = _dependency_board(conn, board)
     guard = conn.execute(
         "SELECT recovery_required FROM tasks WHERE id=?", (task_id,)
     ).fetchone()
@@ -8528,10 +9044,12 @@ def reassign_task(
         return False
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
-        reclaim_task(conn, task_id, reason=reason or "reassign")
+        reclaim_task(
+            conn, task_id, reason=reason or "reassign", board=board_slug
+        )
     # assign_task handles its own txn + the still-running guard.
     try:
-        return assign_task(conn, task_id, profile)
+        return assign_task(conn, task_id, profile, board=board_slug)
     except RuntimeError:
         # Task is still running and reclaim_first was False; caller
         # needs to decide whether to retry with reclaim.
@@ -8908,7 +9426,7 @@ def complete_task(
     _fire_kanban_lifecycle_hook(
         "kanban_task_completed",
         task_id,
-        board=get_current_board(),
+        board=board_slug,
         assignee=_done_task.assignee if _done_task else None,
         run_id=run_id,
         summary=(summary if summary is not None else result),
@@ -9429,6 +9947,7 @@ def _try_direct_review_required_handoff(
     expected_run_id: Optional[int],
     expected_assignee: Optional[str],
     expected_claim: Optional[str],
+    board: Optional[str] = None,
 ) -> tuple[bool, bool, Optional[int]]:
     """Route a live programmer handoff before dependency auto-promotion.
 
@@ -9439,6 +9958,7 @@ def _try_direct_review_required_handoff(
     so the existing dependency path remains the fallback and its parent gating
     semantics stay unchanged.
     """
+    board_slug = _dependency_board(conn, board)
     row = conn.execute(
         "SELECT status, assignee, claim_lock, current_run_id "
         "FROM tasks WHERE id=?",
@@ -9482,6 +10002,7 @@ def _try_direct_review_required_handoff(
         expected_claim=expected_claim,
         expected_run_id=expected_run_id,
         handoff_reason=reason,
+        board=board_slug,
     )
     if submitted is None:
         return False, False, None
@@ -9569,6 +10090,7 @@ def block_task(
     expected_run_id: Optional[int] = None,
     expected_assignee: Optional[str] = None,
     expected_claim: Optional[str] = None,
+    board: Optional[str] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -9601,6 +10123,7 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    board_slug = _dependency_board(conn, board)
     if _task_retirement_fenced(conn, task_id):
         return False
     if kind == "dependency" and str(reason or "").startswith(REVIEW_HANDOFF_PREFIX):
@@ -9611,6 +10134,7 @@ def block_task(
             expected_run_id=expected_run_id,
             expected_assignee=expected_assignee,
             expected_claim=expected_claim,
+            board=board_slug,
         )
         if handled:
             if transitioned:
@@ -9618,7 +10142,7 @@ def block_task(
                 _fire_kanban_lifecycle_hook(
                     "kanban_task_blocked",
                     task_id,
-                    board=get_current_board(),
+                    board=board_slug,
                     assignee=_blocked_task.assignee if _blocked_task else None,
                     run_id=run_id,
                     reason=reason,
@@ -9684,7 +10208,7 @@ def block_task(
             _fire_kanban_lifecycle_hook(
                 "kanban_task_blocked",
                 task_id,
-                board=get_current_board(),
+                board=board_slug,
                 assignee=_blocked_task.assignee if _blocked_task else None,
                 run_id=run_id,
                 reason=reason,
@@ -9812,7 +10336,7 @@ def block_task(
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
         task_id,
-        board=get_current_board(),
+        board=board_slug,
         assignee=_blocked_task.assignee if _blocked_task else None,
         run_id=run_id,
         reason=reason,
@@ -10527,30 +11051,124 @@ def _verify_workspace_base_pin(repo_root: Path, path: Path, pin: KanbanWorkspace
         )
 
 
-def _workspace_base_pin_for_task(
+def _validate_dependency_binding(
     task: Task,
+    binding: dict[str, Any],
     *,
-    board: Optional[str] = None,
-) -> Optional[KanbanWorkspaceBasePin]:
-    binding = task.dependency_binding
-    if not binding:
-        return None
-    if not isinstance(binding, dict):
-        raise RuntimeError(f"task {task.id} has a malformed dependency binding")
-    expected_board = _dependency_board_for_workspace(board)
+    expected_board: str,
+    conn: Optional[sqlite3.Connection] = None,
+) -> None:
     if binding.get("board") != expected_board:
         raise RuntimeError(
             f"task {task.id} dependency binding belongs to board "
             f"{binding.get('board')!r}, not {expected_board!r}"
         )
     dependencies = binding.get("dependencies")
-    if not isinstance(dependencies, list):
+    if not isinstance(dependencies, list) or not dependencies:
         raise RuntimeError(f"task {task.id} dependency binding has no dependency list")
+    snapshot_digest = binding.get("snapshot_digest")
+    root_link_version = binding.get("link_version")
+    if not isinstance(snapshot_digest, str) or not snapshot_digest:
+        raise RuntimeError(f"task {task.id} dependency binding has no snapshot digest")
+    if root_link_version != DEPENDENCY_LINK_VERSION:
+        raise RuntimeError(f"task {task.id} dependency binding has an invalid link version")
     for dependency in dependencies:
         if not isinstance(dependency, dict) or dependency.get("child_id") != task.id:
             raise RuntimeError(f"task {task.id} dependency binding has wrong task identity")
         if not dependency.get("generation"):
             raise RuntimeError(f"task {task.id} dependency binding has no provider generation")
+        metadata = dependency.get("metadata")
+        if not isinstance(metadata, Mapping):
+            raise RuntimeError(f"task {task.id} dependency binding has no link metadata")
+        identity_error = _dependency_link_identity_error(dependency, metadata)
+        if identity_error is not None:
+            raise RuntimeError(
+                f"task {task.id} dependency binding identity is invalid: {identity_error}"
+            )
+        if conn is not None:
+            row = conn.execute(
+                "SELECT parent_id, child_id, dependency_kind, provider_name, metadata, "
+                "metadata_digest, edge_identity, link_version "
+                "FROM task_links WHERE parent_id = ? AND child_id = ?",
+                (dependency["parent_id"], dependency["child_id"]),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(f"task {task.id} dependency binding link is missing")
+            try:
+                row_metadata = _decode_dependency_metadata(row["metadata"])
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"task {task.id} dependency binding link metadata is malformed"
+                ) from exc
+            for field_name in (
+                "parent_id",
+                "child_id",
+                "dependency_kind",
+                "provider_name",
+                "metadata_digest",
+                "edge_identity",
+                "link_version",
+            ):
+                row_value = row[field_name]
+                if field_name == "dependency_kind":
+                    row_value = row_value or "completion"
+                if row_value != dependency.get(field_name):
+                    raise RuntimeError(
+                        f"task {task.id} dependency binding does not match stored link"
+                    )
+            if row_metadata != dict(metadata):
+                raise RuntimeError(
+                    f"task {task.id} dependency binding metadata does not match stored link"
+                )
+            if _dependency_link_identity_error(row, row_metadata) is not None:
+                raise RuntimeError(
+                    f"task {task.id} stored dependency link identity is invalid"
+                )
+    if conn is not None:
+        rows = conn.execute(
+            "SELECT parent_id, child_id, dependency_kind, provider_name, metadata, "
+            "metadata_digest, edge_identity, link_version "
+            "FROM task_links WHERE child_id = ? ORDER BY parent_id",
+            (task.id,),
+        ).fetchall()
+        snapshot_payload = [dict(row) for row in rows]
+        current_digest = hashlib.sha256(
+            json.dumps(
+                snapshot_payload, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        if current_digest != snapshot_digest:
+            raise RuntimeError(
+                f"task {task.id} dependency binding snapshot is stale"
+            )
+        current_version = max(
+            (int(row["link_version"] or 0) for row in rows),
+            default=0,
+        )
+        if current_version != root_link_version:
+            raise RuntimeError(
+                f"task {task.id} dependency binding link version is stale"
+            )
+
+
+def _workspace_base_pin_for_task(
+    task: Task,
+    *,
+    board: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Optional[KanbanWorkspaceBasePin]:
+    binding = task.dependency_binding
+    if not binding:
+        return None
+    if not isinstance(binding, dict):
+        raise RuntimeError(f"task {task.id} has a malformed dependency binding")
+    expected_board = _dependency_board_for_workspace(board, conn=conn)
+    _validate_dependency_binding(
+        task,
+        binding,
+        expected_board=expected_board,
+        conn=conn,
+    )
     raw_pin = binding.get("workspace_base")
     if raw_pin is None:
         return None
@@ -10570,8 +11188,13 @@ def _workspace_base_pin_for_task(
         raise RuntimeError(f"task {task.id} has a malformed workspace base pin") from exc
 
 
-def _dependency_board_for_workspace(board: Optional[str]) -> str:
-    return _normalize_board_slug(board) or get_current_board()
+def _dependency_board_for_workspace(
+    board: Optional[str], *, conn: Optional[sqlite3.Connection] = None
+) -> str:
+    if conn is not None:
+        return _dependency_board(conn, board)
+    explicit = _normalize_board_slug(board)
+    return explicit or get_current_board()
 
 
 def _ensure_git_worktree(
@@ -10633,7 +11256,11 @@ def _ensure_git_worktree(
 
 
 def _resolve_worktree_workspace(
-    task: Task, *, board: Optional[str] = None, materialize: bool = True
+    task: Task,
+    *,
+    board: Optional[str] = None,
+    materialize: bool = True,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> tuple[Path, str]:
     """Resolve a linked git worktree for ``task``.
 
@@ -10651,12 +11278,12 @@ def _resolve_worktree_workspace(
     anywhere, we fail loudly rather than guess.
     """
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
-    base_pin = _workspace_base_pin_for_task(task, board=board)
+    base_pin = _workspace_base_pin_for_task(task, board=board, conn=conn)
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
         # The dispatcher's CWD is incidental (gateway launch dir) and using it
         # scatters worktrees under whatever repo the gateway started in.
-        board_slug = board if board else get_current_board()
+        board_slug = _dependency_board_for_workspace(board, conn=conn)
         board_default = (read_board_metadata(board_slug).get("default_workdir") or "").strip()
         if not board_default:
             raise ValueError(
@@ -10764,7 +11391,11 @@ def _resolve_worktree_workspace(
 
 
 def resolve_workspace(
-    task: Task, *, board: Optional[str] = None, materialize: bool = True
+    task: Task,
+    *,
+    board: Optional[str] = None,
+    materialize: bool = True,
+    conn: Optional[sqlite3.Connection] = None,
 ) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
@@ -10791,10 +11422,11 @@ def resolve_workspace(
     Persist the resolved path back to the task row via ``set_workspace_path``
     so subsequent runs reuse the same directory.
     """
+    board_slug = _dependency_board_for_workspace(board, conn=conn)
     kind = task.workspace_kind or "scratch"
     # Validate any admitted provider binding even for non-worktree workspace
     # kinds. A provider cannot smuggle an unused pin through admission.
-    _workspace_base_pin_for_task(task, board=board)
+    _workspace_base_pin_for_task(task, board=board_slug, conn=conn)
     if kind == "scratch":
         if task.workspace_path:
             # Legacy scratch tasks that were set to an explicit path get the
@@ -10807,7 +11439,7 @@ def resolve_workspace(
                     f"{task.workspace_path!r}; workspace paths must be absolute"
                 )
         else:
-            p = workspaces_root(board=board) / task.id
+            p = workspaces_root(board=board_slug) / task.id
         if materialize:
             p.mkdir(parents=True, exist_ok=True)
         return p
@@ -10828,7 +11460,7 @@ def resolve_workspace(
         return p
     if kind == "worktree":
         p, _branch_name = _resolve_worktree_workspace(
-            task, board=board, materialize=materialize,
+            task, board=board_slug, materialize=materialize, conn=conn,
         )
         return p
     raise ValueError(f"unknown workspace_kind: {kind}")
@@ -11505,6 +12137,7 @@ def enforce_max_runtime(
     conn: sqlite3.Connection,
     *,
     signal_fn=None,
+    board: Optional[str] = None,
 ) -> list[str]:
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
@@ -11519,6 +12152,7 @@ def enforce_max_runtime(
     test hook; production signalling is allowed only through a verified
     exact-identity pidfd.
     """
+    board_slug = _dependency_board(conn, board)
     timed_out: list[str] = []
     review_timeouts: dict[str, str] = {}
     now = int(time.time())
@@ -11670,6 +12304,7 @@ def enforce_max_runtime(
             conn,
             task_id,
             error=error_text,
+            board=board_slug,
         )
     return timed_out
 
@@ -11686,6 +12321,7 @@ def detect_stale_running(
     *,
     stale_timeout_seconds: int = 0,
     signal_fn=None,
+    board: Optional[str] = None,
 ) -> list[str]:
     """Reclaim ``running``/claimed ``review`` tasks that show no progress (heartbeat) within the
     staleness window.
@@ -11710,6 +12346,7 @@ def detect_stale_running(
     immediately).  ``signal_fn`` is a test hook; production signalling is
     allowed only through a verified exact-identity pidfd.
     """
+    board_slug = _dependency_board(conn, board)
     if stale_timeout_seconds <= 0:
         return []
 
@@ -11885,6 +12522,7 @@ def detect_stale_running(
             conn,
             task_id,
             error=terminal_error,
+            board=board_slug,
         )
     return reclaimed
 
@@ -12020,7 +12658,11 @@ def _reap_pending_review_decisions(conn: sqlite3.Connection) -> None:
             )
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def detect_crashed_workers(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Appends a ``crashed`` event and drops the task back to ``ready``.
@@ -12048,6 +12690,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     The ids are returned via the ``_last_rate_limited`` function attribute
     (the public return stays the crashed-only ``list[str]``).
     """
+    board_slug = _dependency_board(conn, board)
     crashed: list[str] = []
     rate_limited: list[str] = []
     # Per-crash details collected inside the main txn, used after it
@@ -12259,6 +12902,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             conn,
             task_id,
             error=_bounded_review_error(error_text),
+            board=board_slug,
         )
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the task transitions ready → blocked with a ``gave_up`` event
@@ -13229,10 +13873,10 @@ def _materialize_review_launch_workspace(
         before_exists = planned_workspace.exists()
         if current.workspace_kind == "worktree":
             actual, branch_name = _resolve_worktree_workspace(
-                current, board=board, materialize=True,
+                current, board=board, materialize=True, conn=conn,
             )
         else:
-            actual = resolve_workspace(current, board=board, materialize=True)
+            actual = resolve_workspace(current, board=board, materialize=True, conn=conn)
             branch_name = current.branch_name
         if actual.resolve(strict=False) != planned_workspace.resolve(strict=False):
             raise RuntimeError(
@@ -13622,6 +14266,8 @@ _clear_spawn_failures = _clear_failure_counter
 
 def _plan_review_handoffs(
     conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
 ) -> list[tuple[str, str, int, str, str]]:
     """Read-only plan including task status for the apply-time CAS.
 
@@ -13629,6 +14275,7 @@ def _plan_review_handoffs(
     routing decision as a real tick without mutating the board. The applier
     (:func:`reconcile_review_handoffs`) executes this plan verbatim.
     """
+    _dependency_board(conn, board)
     plan: list[tuple[str, str, int, str, str]] = []
     try:
         rows = conn.execute(
@@ -13669,7 +14316,11 @@ def _plan_review_handoffs(
     return plan
 
 
-def reconcile_review_handoffs(conn: sqlite3.Connection) -> list[str]:
+def reconcile_review_handoffs(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+) -> list[str]:
     """Move parked ``review-required:`` handoffs into the reviewer lane.
 
     The documented worker handoff is
@@ -13694,8 +14345,11 @@ def reconcile_review_handoffs(conn: sqlite3.Connection) -> list[str]:
 
     Returns the list of reconciled task ids.
     """
+    board_slug = _dependency_board(conn, board)
     moved: list[str] = []
-    for task_id, reviewer, directive_id, assignee, status in _plan_review_handoffs(conn):
+    for task_id, reviewer, directive_id, assignee, status in _plan_review_handoffs(
+        conn, board=board_slug
+    ):
         try:
             if submit_task_for_review(
                 conn, task_id, reviewer,
@@ -13703,6 +14357,7 @@ def reconcile_review_handoffs(conn: sqlite3.Connection) -> list[str]:
                 expected_assignee=assignee,
                 expected_status=status,
                 trusted_operator=True,
+                board=board_slug,
             ) is not None:
                 moved.append(task_id)
         except Exception:
@@ -13947,25 +14602,8 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
-    try:
-        db_path = kanban_db_path(board=board)
-    except Exception:
-        # Path resolution should never fail, but if it somehow does we
-        # must not lose the tick — fall through to an unguarded dispatch
-        # rather than dropping work.
-        return _dispatch_once_locked(
-            conn,
-            spawn_fn=spawn_fn,
-            ttl_seconds=ttl_seconds,
-            dry_run=dry_run,
-            max_spawn=max_spawn,
-            max_in_progress=max_in_progress,
-            failure_limit=failure_limit,
-            stale_timeout_seconds=stale_timeout_seconds,
-            board=board,
-            default_assignee=default_assignee,
-            max_in_progress_per_profile=max_in_progress_per_profile,
-        )
+    board_slug = _dependency_board(conn, board)
+    db_path = _connection_db_path(conn) or kanban_db_path(board=board_slug)
     with _dispatch_tick_lock(db_path) as held:
         if not held:
             return DispatchResult(skipped_locked=True)
@@ -13978,7 +14616,7 @@ def dispatch_once(
             max_in_progress=max_in_progress,
             failure_limit=failure_limit,
             stale_timeout_seconds=stale_timeout_seconds,
-            board=board,
+            board=board_slug,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
@@ -14030,17 +14668,20 @@ def _dispatch_once_locked(
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
     """
+    board_slug = _dependency_board(conn, board)
+    board = board_slug
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
 
     result = DispatchResult()
     if not dry_run:
-        result.reclaimed = release_stale_claims(conn)
+        result.reclaimed = release_stale_claims(conn, board=board)
         result.stale = detect_stale_running(
             conn, stale_timeout_seconds=stale_timeout_seconds,
+            board=board,
         )
-        result.crashed = detect_crashed_workers(conn)
+        result.crashed = detect_crashed_workers(conn, board=board)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
@@ -14058,7 +14699,7 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     if not dry_run:
-        result.timed_out = enforce_max_runtime(conn)
+        result.timed_out = enforce_max_runtime(conn, board=board)
         result.promoted = recompute_ready(
             conn,
             failure_limit=failure_limit,
@@ -14091,9 +14732,9 @@ def _dispatch_once_locked(
                     )
     _review_plan: dict[str, str] = {}
     if not dry_run:
-        result.review_reconciled = reconcile_review_handoffs(conn)
+        result.review_reconciled = reconcile_review_handoffs(conn, board=board)
     else:
-        _plan = _plan_review_handoffs(conn)
+        _plan = _plan_review_handoffs(conn, board=board)
         _review_plan = {task_id: reviewer for task_id, reviewer, *_ in _plan}
         result.review_reconciled = [task_id for task_id, *_ in _plan]
 
@@ -14315,9 +14956,11 @@ def _dispatch_once_locked(
         try:
             resolved_branch_name = None
             if claimed.workspace_kind == "worktree":
-                workspace, resolved_branch_name = _resolve_worktree_workspace(claimed, board=board)
+                workspace, resolved_branch_name = _resolve_worktree_workspace(
+                    claimed, board=board, conn=conn,
+                )
             else:
-                workspace = resolve_workspace(claimed, board=board)
+                workspace = resolve_workspace(claimed, board=board, conn=conn)
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
@@ -14405,6 +15048,7 @@ def _dispatch_once_locked(
                 failover_review_task(
                     conn, row["id"], None,
                     attempted=preflight_failures,
+                    board=board,
                 )
             else:
                 result.skipped_nonspawnable.append(row["id"])
@@ -14424,6 +15068,7 @@ def _dispatch_once_locked(
                         else "current reviewer unavailable"
                     ),
                     attempted=preflight_failures,
+                    board=board,
                 )
             else:
                 result.skipped_nonspawnable.append(row["id"])
@@ -14478,6 +15123,7 @@ def _dispatch_once_locked(
                 ttl_seconds=ttl_seconds,
                 expected_authority=expected_authority,
                 expected_assignee=candidate_task.assignee,
+                board=board,
             )
             if claimed is None:
                 attempted.append({
@@ -14494,18 +15140,18 @@ def _dispatch_once_locked(
                 if spawn_fn is None:
                     if claimed.workspace_kind == "worktree":
                         workspace, resolved_branch_name = _resolve_worktree_workspace(
-                            claimed, board=board, materialize=False,
+                            claimed, board=board, materialize=False, conn=conn,
                         )
                     else:
                         workspace = resolve_workspace(
-                            claimed, board=board, materialize=False,
+                            claimed, board=board, materialize=False, conn=conn,
                         )
                 elif claimed.workspace_kind == "worktree":
                     workspace, resolved_branch_name = _resolve_worktree_workspace(
-                        claimed, board=board,
+                        claimed, board=board, conn=conn,
                     )
                 else:
-                    workspace = resolve_workspace(claimed, board=board)
+                    workspace = resolve_workspace(claimed, board=board, conn=conn)
 
                 claimed.skills = ["sdlc-review"]
                 if not _authorize_review_spawn(
@@ -14667,6 +15313,7 @@ def _dispatch_once_locked(
                     conn, claimed.id, next_reviewer,
                     error=_bounded_review_error(exc), attempted=attempted,
                     expected_run_id=claimed.current_run_id,
+                    board=board,
                 )
                 if failed_over is None or failed_over.status != "review":
                     dispatch_deferred = True
@@ -14690,6 +15337,7 @@ def _dispatch_once_locked(
                 attempted=attempted or [
                     {"profile": row["assignee"], "error": "reviewer failed"}
                 ],
+                board=board,
             )
     return result
 

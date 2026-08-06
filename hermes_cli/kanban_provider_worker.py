@@ -5,9 +5,11 @@ import asyncio
 import ctypes
 import importlib
 import importlib.util
+import io
 import inspect
 import json
 import os
+import pathlib
 import signal
 import sys
 from typing import Any
@@ -47,15 +49,46 @@ def _write_envelope(envelope: dict[str, Any]) -> int:
     encoded = json.dumps(envelope, sort_keys=True, separators=(",", ":")).encode("utf-8")
     if len(encoded) > MAX_FRAME_BYTES:
         return 3
-    sys.__stdout__.buffer.write(encoded)
-    sys.__stdout__.buffer.flush()
+    stdout = sys.__stdout__
+    if stdout is None:
+        return 4
+    stdout_buffer = stdout.buffer
+    if not isinstance(stdout_buffer, io.RawIOBase):
+        return 4
+    stdout_buffer.write(encoded)
+    stdout_buffer.flush()
     return 0
 
 
+def _containment_argument() -> tuple[bool, str | None]:
+    args = sys.argv[1:]
+    try:
+        index = args.index("--containment-cgroup")
+        return True, args[index + 1]
+    except (ValueError, IndexError):
+        return False, None
+
+
+def _enter_containment(path_value: str | None) -> bool:
+    if not path_value:
+        return False
+    try:
+        path = pathlib.Path(path_value)
+        if not path.is_dir() or not (path / "cgroup.kill").is_file():
+            return False
+        (path / "cgroup.procs").write_text(str(os.getpid()))
+        return True
+    except OSError:
+        return False
+
+
 def main() -> int:
+    containment_requested, containment_path = _containment_argument()
+    if containment_requested and not _enter_containment(containment_path):
+        return 4
     if os.name == "posix" and sys.platform.startswith("linux"):
-        # Descendants inherit this and are killed when this worker dies,
-        # covering providers that deliberately create a second session.
+        # This is supplemental to the cgroup boundary owned by the parent;
+        # PDEATHSIG alone cannot contain a provider-created new session.
         try:
             ctypes.CDLL(None).prctl(1, signal.SIGKILL)
         except Exception:
@@ -65,7 +98,13 @@ def main() -> int:
     with open(os.devnull, "w", encoding="utf-8") as sink:
         sys.stdout = sink
         sys.stderr = sink
-        raw = sys.__stdin__.buffer.read(MAX_FRAME_BYTES + 1)
+        stdin = sys.__stdin__
+        if stdin is None:
+            return 4
+        stdin_buffer = stdin.buffer
+        if not isinstance(stdin_buffer, io.BufferedReader):
+            return 4
+        raw = stdin_buffer.read(MAX_FRAME_BYTES + 1)
         if len(raw) > MAX_FRAME_BYTES:
             return 2
         try:

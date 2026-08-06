@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import os
 import subprocess
+import sys
 import threading
 import time
 import sqlite3
+import concurrent.futures
 from pathlib import Path
 from types import MappingProxyType
 
@@ -68,6 +71,22 @@ def _timeout_provider(_context):
 def _infinite_provider(_context):
     while True:
         time.sleep(0.01)
+
+
+def _detached_child_provider(context):
+    pid_file = Path(context.link["metadata"]["pid_file"])
+    child_code = (
+        "import time; "
+        "time.sleep(30)"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", child_code, str(pid_file)],
+        close_fds=True,
+        start_new_session=True,
+    )
+    pid_file.write_text(str(child.pid))
+    time.sleep(1.0)
+    return KanbanDependencyResult("satisfied", generation="detached")
 
 
 def _board_provider(context):
@@ -310,6 +329,44 @@ def test_provider_timeout_has_no_live_worker_thread_or_child(board_db):
 
 
 
+def test_provider_timeout_kills_detached_descendants(board_db):
+    if not kd._containment_available():
+        pytest.skip("no delegated process containment boundary on this host")
+    conn, tmp_path = board_db
+    parent = _new_parent(conn)
+    pid_file = tmp_path / "detached-child.pid"
+    register_kanban_dependency_provider(
+        "sample.gate",
+        "sample",
+        _detached_child_provider,
+        timeout_seconds=0.5,
+    )
+    child = _new_provider_child(
+        conn,
+        parent,
+        dependency_metadata={"pid_file": str(pid_file)},
+    )
+
+    evidence = kb.task_dependency_evidence(conn, child, board="alpha")[0]
+
+    assert evidence["status"] == "unknown"
+    assert evidence["diagnostics"]["reason"] == "provider_timeout"
+    deadline = time.monotonic() + 2.0
+    while not pid_file.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert pid_file.exists()
+    detached_pid = int(pid_file.read_text())
+    while time.monotonic() < deadline:
+        try:
+            os.kill(detached_pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail(f"detached provider PID {detached_pid} survived cleanup")
+
+
+
 def test_provider_unload_cancels_inflight_callback(board_db):
     conn, tmp_path = board_db
     parent = _new_parent(conn)
@@ -409,6 +466,78 @@ def test_readiness_and_claim_share_claim_time_provider_resolution(board_db):
     assert json.loads(
         conn.execute("SELECT dependency_binding FROM task_runs WHERE id = ?", (run.id,)).fetchone()[0]
     ) == claimed.dependency_binding
+
+    binding = claimed.dependency_binding
+    assert binding is not None
+    dependency = binding["dependencies"][0]
+    assert {
+        "metadata_digest",
+        "edge_identity",
+        "link_version",
+    } <= set(dependency)
+    link = kb.list_dependency_links(conn, child, board="alpha")[0]
+    assert dependency["metadata_digest"] == link["metadata_digest"]
+    assert dependency["edge_identity"] == link["edge_identity"]
+    assert dependency["link_version"] == link["link_version"]
+
+    tampered = json.loads(json.dumps(binding))
+    tampered["dependencies"][0]["edge_identity"] = "0" * 64
+    conn.execute(
+        "UPDATE task_runs SET dependency_binding = ? WHERE id = ?",
+        (json.dumps(tampered, sort_keys=True), run.id),
+    )
+    conn.commit()
+    tampered_task = kb.get_task(conn, child)
+    assert tampered_task is not None
+    with pytest.raises(RuntimeError, match="identity|binding"):
+        kb.resolve_workspace(tampered_task, board="alpha")
+
+
+def test_concurrent_idempotent_replays_are_canonical_or_conflicts(board_db):
+    conn, tmp_path = board_db
+    conn.close()
+
+    def create_one(key, title, barrier):
+        worker = kb.connect(db_path=tmp_path / "alpha.db", board="alpha")
+        try:
+            barrier.wait(timeout=10)
+            return kb.create_task(
+                worker,
+                title=title,
+                body="body",
+                assignee="worker",
+                priority=3,
+                idempotency_key=key,
+                board="alpha",
+            )
+        except Exception as exc:  # asserted by the caller below
+            return exc
+        finally:
+            worker.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        for round_number in range(20):
+            key = f"replay-{round_number}"
+            barrier = threading.Barrier(8)
+            exact = list(
+                pool.map(
+                    lambda _: create_one(key, "canonical", barrier),
+                    range(8),
+                )
+            )
+            assert all(not isinstance(item, Exception) for item in exact), repr(exact)
+            assert len(set(exact)) == 1
+
+            conflict_barrier = threading.Barrier(8)
+            conflicts = list(
+                pool.map(
+                    lambda _: create_one(key, "divergent", conflict_barrier),
+                    range(8),
+                )
+            )
+            assert all(isinstance(item, ValueError) for item in conflicts)
+            assert all("idempotency key conflict" in str(item) for item in conflicts)
+
 
 
 def _git(repo, *args):
