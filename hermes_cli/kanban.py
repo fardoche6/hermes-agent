@@ -2711,6 +2711,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "stale": res.stale,
             "auto_blocked": res.auto_blocked,
             "promoted": res.promoted,
+            "policy_sync_failed": res.policy_sync_failed,
+            "policy_sync_error_code": res.policy_sync_error_code,
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws}
                 for (tid, who, ws) in res.spawned
@@ -2738,6 +2740,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
     print(f"Promoted:     {res.promoted}")
+    if res.policy_sync_failed:
+        print(
+            "Policy sync:  skipped "
+            f"({res.policy_sync_error_code or 'snapshot_sync_failed'})"
+        )
     print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""

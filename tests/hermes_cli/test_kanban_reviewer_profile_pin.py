@@ -106,6 +106,11 @@ def _reviewer_candidates(
         return kb._reviewer_candidates(current, conn=conn)
 
 
+def _load_policy(conn: Any) -> Any:
+    loader = cast(Any, getattr(kb, "_load_reviewer_policy"))
+    return loader(conn)
+
+
 def test_reviewer_profile_is_registered_in_config_schema():
     from hermes_cli.config import DEFAULT_CONFIG, _validate_config_key
 
@@ -160,6 +165,178 @@ def test_unbound_explicit_db_keeps_dependency_admission_fail_closed(
                 title="unbound child",
                 parents=[parent_id],
             )
+
+
+def test_unbound_explicit_db_does_not_inherit_ambient_default_project(
+    reviewer_home, tmp_path,
+):
+    from hermes_cli import projects_db as pdb
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with pdb.connect_closing() as project_conn:
+        project_id = pdb.create_project(
+            project_conn,
+            name="Ambient Project",
+            slug="ambient-project",
+            primary_path=str(repo),
+        )
+
+    ambient_default = tmp_path / "ambient-default"
+    ambient_default.mkdir()
+    metadata_path = reviewer_home / "kanban" / "boards" / "default" / "board.json"
+    metadata_path.parent.mkdir(parents=True)
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "project_id": "ambient-project",
+                "default_workdir": str(ambient_default),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    db_path = tmp_path / "explicit" / "owners.db"
+    kb.init_db(db_path)
+    with kb.connect(db_path=db_path) as conn:
+        ordinary_id = kb.create_task(
+            conn,
+            title="ordinary explicit-db task",
+            workspace_kind="dir",
+        )
+        ordinary = kb.get_task(conn, ordinary_id)
+        assert ordinary is not None
+        assert ordinary.project_id is None
+        assert ordinary.workspace_path is None
+
+        with pytest.raises(ValueError, match="no bound board"):
+            kb.create_task(
+                conn,
+                title="explicit project must remain bound",
+                project_id=project_id,
+            )
+        with pytest.raises(ValueError, match="no bound board"):
+            kb.create_task(
+                conn,
+                title="typed dependency must remain bound",
+                dependency_kind="sample.gate",
+            )
+        with pytest.raises(ValueError, match="no bound board"):
+            kb.create_task(
+                conn,
+                title="provider dependency must remain bound",
+                provider_name="sample",
+            )
+        with pytest.raises(ValueError, match="no bound board"):
+            kb.create_task(
+                conn,
+                title="project-source fallback must remain bound",
+                project_source_task_id="t_source",
+            )
+
+
+def test_dispatch_stops_on_reviewer_policy_sync_failure_and_recovers(
+    reviewer_home, tmp_path,
+):
+    _write_profile(reviewer_home, "code-reviewer")
+    _write_reviewer_config(reviewer_home, "code-reviewer")
+    kb.init_db()
+
+    with kb.connect_closing() as conn:
+        kb.dispatch_once(conn, dry_run=False, max_spawn=0)
+        before_policy = _load_policy(conn)
+        assert before_policy.state.value == "pinned"
+        assert before_policy.profile == "code-reviewer"
+
+        task_id = kb.create_task(
+            conn,
+            title="sync failure must not admit stale reviewer",
+            assignee="programmer",
+        )
+        host = kb._claimer_id().split(":", 1)[0]
+        assert kb.claim_task(conn, task_id, claimer=f"{host}:implementation")
+        assert kb.submit_task_for_review(
+            conn,
+            task_id,
+            "code-reviewer",
+            trusted_operator=True,
+        )
+        before_task = kb.get_task(conn, task_id)
+        assert before_task is not None
+
+        (reviewer_home / "config.yaml").write_text(
+            "kanban:\n  reviewer_profile: [\n",
+            encoding="utf-8",
+        )
+        conn.execute(
+            "CREATE TRIGGER deny_policy_refresh "
+            "BEFORE UPDATE ON kanban_reviewer_policy "
+            "BEGIN SELECT RAISE(ABORT, 'policy refresh denied'); END"
+        )
+
+        spawned: list[tuple[str, str | None]] = []
+        failed = kb.dispatch_once(
+            conn,
+            dry_run=False,
+            spawn_fn=lambda task, workspace: spawned.append(
+                (task.id, task.assignee)
+            ),
+        )
+        after_failure_policy = _load_policy(conn)
+        after_failure_task = kb.get_task(conn, task_id)
+
+        assert getattr(failed, "policy_sync_failed") is True
+        assert getattr(failed, "policy_sync_error_code") == "snapshot_write_failed"
+        assert failed.spawned == []
+        assert failed.review_reconciled == []
+        assert spawned == []
+        assert after_failure_policy == before_policy
+        assert after_failure_task is not None
+        assert after_failure_task.status == before_task.status == "review"
+        assert after_failure_task.assignee == before_task.assignee == "code-reviewer"
+        assert after_failure_task.current_run_id == before_task.current_run_id
+        assert after_failure_task.claim_lock == before_task.claim_lock
+        assert conn.in_transaction is False
+
+        dry = kb.dispatch_once(
+            conn,
+            dry_run=True,
+            spawn_fn=lambda task, workspace: spawned.append(
+                (task.id, task.assignee)
+            ),
+        )
+        assert getattr(dry, "policy_sync_failed") is True
+        assert getattr(dry, "policy_sync_error_code") == "snapshot_stale"
+        assert dry.spawned == []
+        assert spawned == []
+        assert _load_policy(conn) == before_policy
+        dry_task = kb.get_task(conn, task_id)
+        assert dry_task is not None
+        assert dry_task.status == before_task.status
+        assert dry_task.assignee == before_task.assignee
+
+        conn.execute("DROP TRIGGER deny_policy_refresh")
+        (reviewer_home / "config.yaml").write_text(
+            "kanban:\n  reviewer_profile: code-reviewer\n# recovered\n",
+            encoding="utf-8",
+        )
+        recovered_spawned: list[tuple[str, str | None]] = []
+        recovered = kb.dispatch_once(
+            conn,
+            dry_run=False,
+            spawn_fn=lambda task, workspace: recovered_spawned.append(
+                (task.id, task.assignee)
+            ),
+        )
+        recovered_policy = _load_policy(conn)
+
+        assert getattr(recovered, "policy_sync_failed") is False
+        assert recovered_policy.state.value == "pinned"
+        assert recovered_policy.profile == "code-reviewer"
+        assert recovered_policy.policy_version > before_policy.policy_version
+        assert recovered_spawned == [(task_id, "code-reviewer")]
+        assert recovered.spawned
+        assert recovered.spawned[0][0] == task_id
 
 
 

@@ -4103,6 +4103,7 @@ def create_task(
     allow_unbound_simple_task = (
         not parents
         and not project_id
+        and not project_source_task_id
         and (dependency_kind is None or dependency_kind == "completion")
         and provider_name is None
         and not dependency_metadata
@@ -4112,6 +4113,7 @@ def create_task(
         board,
         allow_unbound=allow_unbound_simple_task,
     )
+    board_is_bound = _connection_has_board_binding(conn, board)
     idempotency_key = str(idempotency_key).strip() if idempotency_key else None
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
@@ -4135,7 +4137,7 @@ def create_task(
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
     # (deterministic worktree + branch) without each surface repeating it.
-    if project_id is None:
+    if project_id is None and board_is_bound:
         try:
             _bmeta = read_board_metadata(board_slug)
             _board_project = (_bmeta.get("project_id") or "").strip()
@@ -4300,6 +4302,7 @@ def create_task(
         workspace_path is None
         and project_repo is None
         and workspace_kind in {"dir", "worktree"}
+        and board_is_bound
     ):
         board_meta = read_board_metadata(board_slug)
         board_default = board_meta.get("default_workdir")
@@ -4884,6 +4887,25 @@ def _dependency_board(
         "kanban connection has no bound board; pass board= explicitly for "
         "custom or ambiguous db_path connections"
     )
+
+
+def _connection_has_board_binding(
+    conn: sqlite3.Connection,
+    board: Optional[str] = None,
+) -> bool:
+    """Return whether *conn* has a genuine board identity.
+
+    ``_dependency_board(..., allow_unbound=True)`` returns ``default`` as a
+    neutral compatibility label. That label is not an authority and must not
+    drive project or default-workdir inheritance for arbitrary explicit DBs.
+    """
+    if _normalize_board_slug(board):
+        return True
+    bound = getattr(conn, "_hermes_kanban_board", None)
+    if bound and _normalize_board_slug(str(bound)):
+        return True
+    path = _connection_board_path(conn)
+    return path is not None and _canonical_board_from_db_path(path) is not None
 
 
 def _connection_db_path(conn: sqlite3.Connection) -> Optional[Path]:
@@ -8448,6 +8470,14 @@ class _ReviewerPolicyResult:
     policy_version: int = 0
 
 
+@dataclass(frozen=True)
+class _ReviewerPolicySyncResult:
+    """Bounded outcome of a dispatcher-authoritative policy synchronization."""
+
+    synchronized: bool
+    error_code: Optional[str] = None
+
+
 def _invalid_reviewer_policy(
     error: str, *, profile: object = "", error_code: str = "invalid_value",
 ) -> _ReviewerPolicyResult:
@@ -8654,7 +8684,11 @@ def _parse_reviewer_policy_source(
     )
 
 
-def _synchronize_reviewer_policy(conn: sqlite3.Connection) -> None:
+def _synchronize_reviewer_policy(
+    conn: sqlite3.Connection,
+    *,
+    dry_run: bool = False,
+) -> _ReviewerPolicySyncResult:
     """Initialize/update the durable policy from the connection-bound source.
 
     The source is derived from the authoritative DB path, never from ambient
@@ -8662,7 +8696,8 @@ def _synchronize_reviewer_policy(conn: sqlite3.Connection) -> None:
     non-dry-run admission tick so startup, config changes, direct CLI dispatch,
     and process restart converge before reviewer routing. A missing config file
     becomes a persisted explicit ABSENT state for compatibility;
-    malformed/unreadable input becomes persisted INVALID state.
+    malformed/unreadable input becomes persisted INVALID state. Dry-run checks
+    for a missing or stale durable snapshot but never writes it.
     """
     source_path = _reviewer_policy_source_path(conn)
     parsed = _parse_reviewer_policy_source(source_path)
@@ -8686,8 +8721,12 @@ def _synchronize_reviewer_policy(conn: sqlite3.Connection) -> None:
         ).fetchone()
     except sqlite3.DatabaseError:
         # A caller holding an older connection or a read-only legacy DB cannot
-        # be upgraded here. Consumers will fail closed on the missing row.
-        return
+        # be upgraded here. The dispatcher must not consume a prior snapshot.
+        _log.warning(
+            "kanban dispatcher: reviewer policy synchronization failed "
+            "(snapshot_read_failed)"
+        )
+        return _ReviewerPolicySyncResult(False, "snapshot_read_failed")
 
     comparable = (
         parsed.state.value,
@@ -8702,7 +8741,22 @@ def _synchronize_reviewer_policy(conn: sqlite3.Connection) -> None:
         "state", "profile", "error_code", "error_detail",
         "authority_db_path", "source_path", "source_digest",
     )):
-        return
+        return _ReviewerPolicySyncResult(True)
+
+    if dry_run:
+        if current is None and parsed.state is _ReviewerPolicyState.ABSENT:
+            # Legacy dynamic discovery remains representable on a fresh board;
+            # there is no prior snapshot whose stale value could be admitted.
+            return _ReviewerPolicySyncResult(True)
+        error_code = (
+            "snapshot_uninitialized" if current is None else "snapshot_stale"
+        )
+        _log.warning(
+            "kanban dispatcher: reviewer policy synchronization skipped "
+            "dry-run (%s)",
+            error_code,
+        )
+        return _ReviewerPolicySyncResult(False, error_code)
 
     try:
         with write_txn(conn):
@@ -8742,8 +8796,15 @@ def _synchronize_reviewer_policy(conn: sqlite3.Connection) -> None:
             )
     except (sqlite3.DatabaseError, OSError):
         # Policy admission remains fail-closed if an external read-only or
-        # transient DB condition prevents the snapshot update.
-        _log.debug("unable to synchronize reviewer policy", exc_info=True)
+        # transient DB condition prevents the snapshot update. write_txn has
+        # already rolled back the failed write; the caller must not use the
+        # previous row in this tick.
+        _log.warning(
+            "kanban dispatcher: reviewer policy synchronization failed "
+            "(snapshot_write_failed)"
+        )
+        return _ReviewerPolicySyncResult(False, "snapshot_write_failed")
+    return _ReviewerPolicySyncResult(True)
 
 
 def _load_reviewer_policy(conn: sqlite3.Connection) -> _ReviewerPolicyResult:
@@ -12232,6 +12293,12 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    policy_sync_failed: bool = False
+    """True when reviewer policy synchronization failed and the tick stopped
+    before reconciliation, candidate selection, or spawn."""
+    policy_sync_error_code: Optional[str] = None
+    """Bounded reviewer-policy synchronization code; never raw config/parser
+    content."""
     review_reconciled: list[str] = field(default_factory=list)
     """Task ids moved from ``ready`` into the reviewer lane this tick because
     they carry an un-consumed documented ``review-required:`` handoff. Same
@@ -15202,12 +15269,19 @@ def dispatch_once(
     with _dispatch_tick_lock(db_path) as held:
         if not held:
             return DispatchResult(skipped_locked=True)
-        if not dry_run:
-            # Only the dispatcher-authoritative tick may initialize/update
-            # the durable reviewer snapshot. Workers and direct lifecycle
-            # callers consume the existing row and fail closed if it is
-            # missing or mismatched.
-            _synchronize_reviewer_policy(conn)
+        # Only the dispatcher-authoritative tick may initialize/update the
+        # durable reviewer snapshot. Workers and direct lifecycle callers
+        # consume the existing row and fail closed if it is missing or
+        # mismatched. Dry-run performs the same comparison read-only so it
+        # cannot report a stale reviewer as admissible.
+        policy_sync = _synchronize_reviewer_policy(conn, dry_run=dry_run)
+        if not policy_sync.synchronized:
+            return DispatchResult(
+                policy_sync_failed=True,
+                policy_sync_error_code=(
+                    policy_sync.error_code or "snapshot_sync_failed"
+                ),
+            )
         result = _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
