@@ -76,6 +76,7 @@ import json
 import os
 import re
 import random
+import signal
 import secrets
 import shutil
 import sqlite3
@@ -162,6 +163,46 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class _ProcessIdentity:
+    """Immutable birth identity for a host-local worker process."""
+
+    boot_id: str
+    starttime: str
+
+
+@dataclass
+class _ProcessHandle:
+    """A race-resistant handle paired with the identity it was opened for."""
+
+    pid: int
+    identity: _ProcessIdentity
+    pidfd: Optional[int] = None
+
+    def close(self) -> None:
+        if self.pidfd is None:
+            return
+        try:
+            os.close(self.pidfd)
+        except OSError:
+            pass
+        self.pidfd = None
+
+
+@dataclass(frozen=True)
+class _ProcessObservation:
+    """Result of probing a durable process binding without signalling it."""
+
+    status: str
+    identity: Optional[_ProcessIdentity] = None
+    handle: Optional[_ProcessHandle] = None
+    exit_code: Optional[int] = None
+    reason: str = ""
+
+
+_SPAWNED_PROCESS_HANDLES: dict[int, _ProcessHandle] = {}
 
 
 def _assert_not_delegated_child_mutation() -> None:
@@ -935,6 +976,8 @@ class Task:
     # (Pre-rename column: ``spawn_failures``.)
     consecutive_failures: int = 0
     worker_pid: Optional[int] = None
+    worker_boot_id: Optional[str] = None
+    worker_starttime: Optional[str] = None
     # Short excerpt of the last failure's error text (any outcome, not
     # just spawn). Pre-rename column: ``last_spawn_error``.
     last_failure_error: Optional[str] = None
@@ -1042,6 +1085,12 @@ class Task:
                 else (row["spawn_failures"] if "spawn_failures" in keys else 0)
             ),
             worker_pid=row["worker_pid"] if "worker_pid" in keys else None,
+            worker_boot_id=(
+                row["worker_boot_id"] if "worker_boot_id" in keys else None
+            ),
+            worker_starttime=(
+                row["worker_starttime"] if "worker_starttime" in keys else None
+            ),
             last_failure_error=(
                 row["last_failure_error"] if "last_failure_error" in keys
                 # Same belt-and-suspenders fallback as consecutive_failures above.
@@ -1124,6 +1173,8 @@ class Run:
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     worker_pid: Optional[int]
+    worker_boot_id: Optional[str]
+    worker_starttime: Optional[str]
     max_runtime_seconds: Optional[int]
     last_heartbeat_at: Optional[int]
     started_at: int
@@ -1150,6 +1201,12 @@ class Run:
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             worker_pid=row["worker_pid"],
+            worker_boot_id=(
+                row["worker_boot_id"] if "worker_boot_id" in row.keys() else None
+            ),
+            worker_starttime=(
+                row["worker_starttime"] if "worker_starttime" in row.keys() else None
+            ),
             max_runtime_seconds=row["max_runtime_seconds"],
             last_heartbeat_at=row["last_heartbeat_at"],
             started_at=int(row["started_at"]),
@@ -1237,6 +1294,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- exceeds DEFAULT_FAILURE_LIMIT consecutive non-successes.
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
     worker_pid           INTEGER,
+    -- Immutable birth identity paired with worker_pid.  NULL is retained for
+    -- legacy rows and is fail-closed for any physical retirement attempt.
+    worker_boot_id       TEXT,
+    worker_starttime     TEXT,
     -- Short excerpt of the most recent failure's error text.
     last_failure_error   TEXT,
     max_runtime_seconds  INTEGER,
@@ -1348,6 +1409,8 @@ CREATE TABLE IF NOT EXISTS task_runs (
     claim_lock          TEXT,
     claim_expires       INTEGER,
     worker_pid          INTEGER,
+    worker_boot_id      TEXT,
+    worker_starttime    TEXT,
     -- Physical retirement uncertainty is scoped to the exact run as well as
     -- the task.  A flagged run remains the owner of its claim/PID until a
     -- later wait/reap proves that owner is gone.
@@ -1378,6 +1441,8 @@ CREATE TABLE IF NOT EXISTS task_launch_gates (
     authority_id   INTEGER NOT NULL,
     gate_token     TEXT NOT NULL UNIQUE,
     gate_pid       INTEGER NOT NULL,
+    gate_boot_id   TEXT,
+    gate_starttime TEXT,
     state          TEXT NOT NULL,
     -- The gate carries the same fail-closed recovery marker as its task/run.
     -- A released/retired decision must not silently erase gate uncertainty.
@@ -2441,6 +2506,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             )
     if "worker_pid" not in cols:
         _add_column_if_missing(conn, "tasks", "worker_pid", "worker_pid INTEGER")
+    if "worker_boot_id" not in cols:
+        _add_column_if_missing(conn, "tasks", "worker_boot_id", "worker_boot_id TEXT")
+    if "worker_starttime" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "worker_starttime", "worker_starttime TEXT"
+        )
     if "last_failure_error" not in cols:
         added = _add_column_if_missing(
             conn, "tasks", "last_failure_error", "last_failure_error TEXT"
@@ -2573,6 +2644,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "task_runs", "recovery_reason", "recovery_reason TEXT",
             )
+        if "worker_boot_id" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "worker_boot_id", "worker_boot_id TEXT",
+            )
+        if "worker_starttime" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "worker_starttime", "worker_starttime TEXT",
+            )
     gate_cols = {
         row["name"] for row in conn.execute("PRAGMA table_info(task_launch_gates)")
     }
@@ -2590,6 +2669,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                 "task_launch_gates",
                 "recovery_reason",
                 "recovery_reason TEXT",
+            )
+        if "gate_boot_id" not in gate_cols:
+            _add_column_if_missing(
+                conn, "task_launch_gates", "gate_boot_id", "gate_boot_id TEXT",
+            )
+        if "gate_starttime" not in gate_cols:
+            _add_column_if_missing(
+                conn,
+                "task_launch_gates",
+                "gate_starttime",
+                "gate_starttime TEXT",
             )
 
     # Indexes over additive ``tasks`` columns must be created after the
@@ -2655,6 +2745,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         with write_txn(conn):
             inflight = conn.execute(
                 "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
+                "       worker_boot_id, worker_starttime, "
                 "       max_runtime_seconds, last_heartbeat_at, started_at "
                 "FROM tasks "
                 "WHERE status = 'running' AND current_run_id IS NULL"
@@ -2666,13 +2757,15 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
                     INSERT INTO task_runs (
                         task_id, profile, status,
                         claim_lock, claim_expires, worker_pid,
+                        worker_boot_id, worker_starttime,
                         max_runtime_seconds, last_heartbeat_at,
                         started_at
-                    ) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         row["id"], row["assignee"], row["claim_lock"],
                         row["claim_expires"], row["worker_pid"],
+                        row["worker_boot_id"], row["worker_starttime"],
                         row["max_runtime_seconds"], row["last_heartbeat_at"],
                         started,
                     ),
@@ -2982,6 +3075,312 @@ def _claimer_id() -> str:
     except Exception:
         host = "unknown"
     return f"{host}:{os.getpid()}"
+
+
+def _read_process_snapshot(
+    pid: int,
+) -> tuple[Optional[_ProcessIdentity], Optional[str], str]:
+    """Read Linux birth identity and process state for ``pid``.
+
+    The third return value distinguishes a process that is definitely absent
+    from an identity probe that was unavailable.  That distinction is a
+    safety boundary: absence retires the original binding, while an
+    unavailable probe must never authorize a signal.
+    """
+    if sys.platform != "linux" or pid <= 0:
+        return None, None, "unavailable"
+    try:
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(
+            encoding="ascii",
+        ).strip()
+    except FileNotFoundError:
+        return None, None, "unavailable"
+    except (OSError, UnicodeError):
+        return None, None, "unavailable"
+    if not boot_id:
+        return None, None, "unavailable"
+    proc_stat = Path(f"/proc/{int(pid)}/stat")
+    try:
+        raw = proc_stat.read_text(encoding="ascii")
+    except FileNotFoundError:
+        return None, None, "absent"
+    except (OSError, UnicodeError):
+        return None, None, "unavailable"
+    close_paren = raw.rfind(")")
+    if close_paren < 0:
+        return None, None, "unavailable"
+    fields = raw[close_paren + 2 :].split()
+    # After the comm field, fields[0] is proc stat field 3 (state), and
+    # fields[19] is field 22 (starttime).
+    if len(fields) <= 19 or not fields[19].isdigit():
+        return None, None, "unavailable"
+    return (
+        _ProcessIdentity(boot_id=boot_id, starttime=fields[19]),
+        fields[0],
+        "present",
+    )
+
+
+def _capture_process_handle(pid: int) -> Optional[_ProcessHandle]:
+    """Capture a birth identity and pidfd before persisting a worker PID."""
+    identity, _state, availability = _read_process_snapshot(int(pid))
+    if availability != "present" or identity is None:
+        return None
+    pidfd: Optional[int] = None
+    try:
+        opened_pidfd = _pidfd_open(int(pid))
+    except (OSError, ValueError, TypeError):
+        return None
+    if opened_pidfd is None:
+        return _ProcessHandle(pid=int(pid), identity=identity, pidfd=None)
+    # Open the race-free handle before taking the second identity snapshot.
+    # If the PID retires and is reused in between, the second snapshot cannot
+    # accidentally bless the reused process.
+    pidfd = int(opened_pidfd)
+    confirmed, _confirmed_state, confirmed_availability = _read_process_snapshot(
+        int(pid),
+    )
+    if confirmed_availability != "present" or confirmed != identity:
+        try:
+            os.close(pidfd)
+        except OSError:
+            pass
+        return None
+    return _ProcessHandle(pid=int(pid), identity=identity, pidfd=pidfd)
+
+
+def _pidfd_open(pid: int) -> Optional[int]:
+    """Open Linux's pidfd even on Python builds without ``os.pidfd_open``."""
+    native = getattr(os, "pidfd_open", None)
+    if callable(native):
+        return int(native(int(pid), 0))
+    if sys.platform != "linux":
+        return None
+    try:
+        import ctypes
+        import platform
+
+        syscall_no = {
+            "x86_64": 434,
+            "amd64": 434,
+            "aarch64": 434,
+            "arm64": 434,
+            "ppc64le": 434,
+            "s390x": 434,
+            "riscv64": 434,
+            "loongarch64": 434,
+        }.get(platform.machine().strip().lower())
+        if syscall_no is None:
+            return None
+        libc = ctypes.CDLL(None, use_errno=True)
+        result = int(libc.syscall(syscall_no, int(pid), 0))
+        if result < 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+        return result
+    except (ImportError, OSError, AttributeError):
+        return None
+
+
+def _pidfd_send_signal(pidfd: int, sig: int) -> None:
+    """Send a signal through a pidfd, using libc when ``signal`` lacks it."""
+    native = getattr(signal, "pidfd_send_signal", None)
+    if callable(native):
+        native(int(pidfd), int(sig))
+        return
+    if sys.platform != "linux":
+        raise OSError("pidfd signalling is unavailable")
+    import ctypes
+    import platform
+
+    syscall_no = {
+        "x86_64": 424,
+        "aarch64": 424,
+        "arm64": 424,
+        "ppc64le": 424,
+        "s390x": 424,
+        "riscv64": 424,
+        "loongarch64": 424,
+    }.get(platform.machine().strip().lower())
+    if syscall_no is None:
+        raise OSError("pidfd signalling is unavailable")
+    libc = ctypes.CDLL(None, use_errno=True)
+    result = int(libc.syscall(syscall_no, int(pidfd), int(sig), 0, 0))
+    if result < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def _identity_from_values(
+    boot_id: object,
+    starttime: object,
+) -> Optional[_ProcessIdentity]:
+    """Decode and validate a durable identity pair from SQLite values."""
+    if boot_id is None or starttime is None:
+        return None
+    boot = str(boot_id).strip()
+    start = str(starttime).strip()
+    if not boot or not start.isdigit():
+        return None
+    return _ProcessIdentity(boot_id=boot, starttime=start)
+
+
+def _identity_from_row(
+    row: sqlite3.Row,
+    prefix: str = "worker",
+) -> Optional[_ProcessIdentity]:
+    """Read ``<prefix>_boot_id`` and ``<prefix>_starttime`` if present."""
+    boot_key = f"{prefix}_boot_id"
+    start_key = f"{prefix}_starttime"
+    if boot_key not in row.keys() or start_key not in row.keys():
+        return None
+    return _identity_from_values(row[boot_key], row[start_key])
+
+
+def _identity_payload(identity: Optional[_ProcessIdentity]) -> Optional[dict[str, str]]:
+    if identity is None:
+        return None
+    return {"boot_id": identity.boot_id, "starttime": identity.starttime}
+
+
+def _pidfd_exit_status(pidfd: int) -> Optional[int]:
+    """Return an exit status when pidfd wait proves retirement, else None."""
+    waitid = getattr(os, "waitid", None)
+    p_pidfd = getattr(os, "P_PIDFD", 3)
+    w_exited = getattr(os, "WEXITED", None)
+    w_nohang = getattr(os, "WNOHANG", None)
+    w_nowait = getattr(os, "WNOWAIT", None)
+    if not callable(waitid) or p_pidfd is None or w_exited is None or w_nohang is None:
+        return None
+    flags = int(w_exited) | int(w_nohang)
+    if w_nowait is not None:
+        flags |= int(w_nowait)
+    try:
+        result = waitid(int(p_pidfd), int(pidfd), flags)
+    except (ChildProcessError, OSError, ValueError, TypeError):
+        return None
+    if result is None or int(getattr(result, "si_pid", 0) or 0) == 0:
+        return None
+    status = getattr(result, "si_status", None)
+    return int(status) if status is not None else 0
+
+
+def _probe_bound_process(
+    pid: int,
+    expected: Optional[_ProcessIdentity],
+    *,
+    process_handle: Optional[_ProcessHandle] = None,
+) -> _ProcessObservation:
+    """Probe a durable PID binding without ever signalling a numeric PID."""
+    if expected is None or int(pid) <= 0:
+        return _ProcessObservation(status="ambiguous", reason="identity unavailable")
+
+    owned_handle = False
+    handle = process_handle
+    if handle is not None and (
+        handle.pid != int(pid) or handle.identity != expected
+    ):
+        return _ProcessObservation(
+            status="retired",
+            identity=handle.identity,
+            reason="live handle identity mismatched durable binding",
+        )
+    if handle is None:
+        pidfd_open = _pidfd_open
+        if pidfd_open is None:
+            current, _state, availability = _read_process_snapshot(int(pid))
+            if availability == "absent" or (
+                availability == "present" and current != expected
+            ):
+                return _ProcessObservation(
+                    status="retired",
+                    identity=current,
+                    reason="PID identity retired without pidfd support",
+                )
+            return _ProcessObservation(
+                status="ambiguous", identity=current, reason="pidfd unavailable",
+            )
+        try:
+            opened_fd = pidfd_open(int(pid))
+            if opened_fd is None:
+                current, _state, availability = _read_process_snapshot(int(pid))
+                if availability == "absent" or (
+                    availability == "present" and current != expected
+                ):
+                    return _ProcessObservation(
+                        status="retired",
+                        identity=current,
+                        reason="PID identity mismatch or absence",
+                    )
+                return _ProcessObservation(
+                    status="ambiguous", identity=current, reason="pidfd open failed",
+                )
+            fd = int(opened_fd)
+        except (OSError, ValueError, TypeError):
+            current, _state, availability = _read_process_snapshot(int(pid))
+            if availability == "absent" or (
+                availability == "present" and current != expected
+            ):
+                return _ProcessObservation(
+                    status="retired",
+                    identity=current,
+                    reason="PID identity mismatch or absence",
+                )
+            return _ProcessObservation(
+                status="ambiguous", identity=current, reason="pidfd open failed",
+            )
+        handle = _ProcessHandle(pid=int(pid), identity=expected, pidfd=fd)
+        owned_handle = True
+
+    if handle.pidfd is None:
+        current, _state, availability = _read_process_snapshot(int(pid))
+        if availability == "absent" or (
+            availability == "present" and current != expected
+        ):
+            return _ProcessObservation(
+                status="retired", identity=current, reason="PID identity retired",
+            )
+        return _ProcessObservation(
+            status="ambiguous", identity=current, reason="race-free handle unavailable",
+        )
+
+    current, state, availability = _read_process_snapshot(int(pid))
+    if availability == "absent":
+        exit_code = _pidfd_exit_status(handle.pidfd)
+        return _ProcessObservation(
+            status="exited",
+            identity=expected,
+            handle=handle,
+            exit_code=exit_code,
+            reason="bound process disappeared",
+        )
+    if availability != "present" or current is None:
+        if owned_handle:
+            handle.close()
+        return _ProcessObservation(
+            status="ambiguous", identity=current, reason="identity probe unavailable",
+        )
+    if current != expected:
+        if owned_handle:
+            handle.close()
+        return _ProcessObservation(
+            status="retired", identity=current, reason="PID birth identity mismatch",
+        )
+    if state == "Z":
+        return _ProcessObservation(
+            status="exited",
+            identity=current,
+            handle=handle,
+            exit_code=_pidfd_exit_status(handle.pidfd),
+            reason="bound process is a zombie",
+        )
+    # The pidfd prevents the exact process from being replaced while the
+    # caller uses it.  A present, matching /proc identity is therefore a
+    # live binding even when waitid is not permitted across a dispatcher
+    # restart for a reparented child.
+    return _ProcessObservation(
+        status="live", identity=current, handle=handle, reason="identity matched",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -5170,10 +5569,14 @@ def _pending_review_decision(
     """
     task = conn.execute(
         "SELECT status, assignee, claim_lock, claim_expires, worker_pid, "
-        "       current_run_id, recovery_required FROM tasks WHERE id=?",
+        "       worker_boot_id, worker_starttime, current_run_id, "
+        "       recovery_required FROM tasks WHERE id=?",
         (task_id,),
     ).fetchone()
     if task is None:
+        return None
+    task_identity = _identity_from_row(task, "worker")
+    if (task["worker_boot_id"] is None) != (task["worker_starttime"] is None):
         return None
     if task["current_run_id"] is None or task["claim_lock"] is None:
         return None
@@ -5187,11 +5590,23 @@ def _pending_review_decision(
         return None
     payload = _event_payload(decision_row)
     generation = str(payload.get("decision_generation") or "")
+    raw_run_id = payload.get("run_id")
+    raw_authority_id = payload.get("authority_id")
+    raw_worker_pid = payload.get("worker_pid")
+    raw_claim_event_id = payload.get("claim_event_id")
+    if not isinstance(raw_run_id, (int, str)):
+        return None
+    if not isinstance(raw_authority_id, (int, str)):
+        return None
+    if not isinstance(raw_worker_pid, (int, str)):
+        return None
+    if not isinstance(raw_claim_event_id, (int, str)):
+        return None
     try:
-        run_id = int(payload.get("run_id"))
-        authority_id = int(payload.get("authority_id"))
-        worker_pid = int(payload.get("worker_pid"))
-        claim_event_id = int(payload.get("claim_event_id"))
+        run_id = int(raw_run_id)
+        authority_id = int(raw_authority_id)
+        worker_pid = int(raw_worker_pid)
+        claim_event_id = int(raw_claim_event_id)
     except (TypeError, ValueError):
         return None
     if (
@@ -5207,7 +5622,8 @@ def _pending_review_decision(
         return None
     run = conn.execute(
         "SELECT task_id, profile, status, claim_lock, claim_expires, worker_pid, "
-        "       ended_at, recovery_required FROM task_runs WHERE id=?",
+        "       worker_boot_id, worker_starttime, ended_at, recovery_required "
+        "FROM task_runs WHERE id=?",
         (run_id,),
     ).fetchone()
     if run is None or (
@@ -5220,6 +5636,16 @@ def _pending_review_decision(
         or _canonical_assignee(run["profile"]) != _canonical_assignee(task["assignee"])
     ):
         return None
+    run_identity = _identity_from_row(run, "worker")
+    if (run["worker_boot_id"] is None) != (run["worker_starttime"] is None):
+        return None
+    if (
+        task_identity is not None
+        and run_identity is not None
+        and task_identity != run_identity
+    ):
+        return None
+    process_identity = task_identity or run_identity
     authority = _latest_reviewer_authority(conn, task_id)
     if authority != (authority_id, _canonical_assignee(task["assignee"])):
         return None
@@ -5266,6 +5692,13 @@ def _pending_review_decision(
             or payload.get("gate_token") != gate["gate_token"]
         ):
             return None
+        gate_identity = _identity_from_row(gate, "gate")
+        if (gate["gate_boot_id"] is None) != (gate["gate_starttime"] is None):
+            return None
+        if gate_identity is not None:
+            if process_identity is not None and gate_identity != process_identity:
+                return None
+            process_identity = gate_identity
     return {
         "event": decision_row,
         "event_id": int(decision_row["id"]),
@@ -5277,6 +5710,7 @@ def _pending_review_decision(
         "worker_pid": worker_pid,
         "authority_id": authority_id,
         "claim_event_id": claim_event_id,
+        "process_identity": process_identity,
         "gate": gate,
     }
 
@@ -5387,8 +5821,16 @@ def _pending_decision_exit_proven(
     return False
 
 
-def _authoritative_worker_exit(pid: int) -> bool:
-    """Reap ``pid`` when this process owns it; liveness alone is not proof."""
+def _authoritative_worker_exit(
+    pid: int,
+    process_identity: Optional[_ProcessIdentity] = None,
+) -> bool:
+    """Prove retirement from a durable identity before using legacy waitpid."""
+    if process_identity is not None:
+        observation = _probe_bound_process(int(pid), process_identity)
+        if observation.handle is not None:
+            observation.handle.close()
+        return observation.status in ("retired", "exited")
     pid = int(pid)
     if pid in _recent_worker_exits:
         return True
@@ -5405,34 +5847,51 @@ def _authoritative_worker_exit(pid: int) -> bool:
 
 
 def _record_pending_decision_exit_proof(
-    conn: sqlite3.Connection, pending: dict[str, Any],
+    conn: sqlite3.Connection,
+    pending: dict[str, Any],
+    observation: Optional[_ProcessObservation] = None,
 ) -> None:
-    """Commit exit proof separately so a reaper crash can replay finalization."""
-    # Liveness/termination reporting is not authoritative.  This helper is
-    # called by several reclaim paths, so enforce the wait/reap boundary here
-    # instead of trusting each caller to do it first.
-    if not _authoritative_worker_exit(pending["worker_pid"]):
+    """Commit identity-bound exit proof so a reaper crash can replay finalization."""
+    current_observation = observation or _probe_bound_process(
+        pending["worker_pid"], pending.get("process_identity"),
+    )
+    if current_observation.status not in ("retired", "exited"):
+        if current_observation.handle is not None:
+            current_observation.handle.close()
         return
-    with write_txn(conn):
-        current = _pending_review_decision(conn, pending["event"]["task_id"])
-        if current is None or current["generation"] != pending["generation"]:
-            return
-        if _pending_decision_exit_proven(conn, current):
-            return
-        _append_event(
-            conn,
-            pending["event"]["task_id"],
-            "review_decision_exit_proven",
-            {
-                "decision_event_id": pending["event_id"],
-                "decision_generation": pending["generation"],
-                "run_id": pending["run_id"],
-                "claim_lock": pending["claim_lock"],
-                "worker_pid": pending["worker_pid"],
-                "authority_id": pending["authority_id"],
-            },
-            run_id=pending["run_id"],
-        )
+    try:
+        with write_txn(conn):
+            current = _pending_review_decision(conn, pending["event"]["task_id"])
+            if current is None or current["generation"] != pending["generation"]:
+                return
+            if _pending_decision_exit_proven(conn, current):
+                return
+            _append_event(
+                conn,
+                pending["event"]["task_id"],
+                "review_decision_exit_proven",
+                {
+                    "decision_event_id": pending["event_id"],
+                    "decision_generation": pending["generation"],
+                    "run_id": pending["run_id"],
+                    "claim_lock": pending["claim_lock"],
+                    "worker_pid": pending["worker_pid"],
+                    "authority_id": pending["authority_id"],
+                    "process_identity": _identity_payload(
+                        pending.get("process_identity")
+                    ),
+                    "exit_proof": {
+                        "method": "pidfd_identity",
+                        "status": current_observation.status,
+                        "reason": current_observation.reason,
+                        "exit_code": current_observation.exit_code,
+                    },
+                },
+                run_id=pending["run_id"],
+            )
+    finally:
+        if current_observation.handle is not None:
+            current_observation.handle.close()
 
 
 def _finalize_pending_review_decision(
@@ -5444,7 +5903,9 @@ def _finalize_pending_review_decision(
         if pending is None:
             return None
         if not _pending_decision_exit_proven(conn, pending):
-            if not _authoritative_worker_exit(pending["worker_pid"]):
+            if not _authoritative_worker_exit(
+                pending["worker_pid"], pending.get("process_identity")
+            ):
                 return None
             _append_event(
                 conn,
@@ -5457,6 +5918,10 @@ def _finalize_pending_review_decision(
                     "claim_lock": pending["claim_lock"],
                     "worker_pid": pending["worker_pid"],
                     "authority_id": pending["authority_id"],
+                    "process_identity": _identity_payload(
+                        pending.get("process_identity")
+                    ),
+                    "exit_proof": {"method": "pidfd_identity", "status": "exited"},
                 },
                 run_id=pending["run_id"],
             )
@@ -6685,7 +7150,8 @@ def failover_review_task(
     # before opening the lifecycle transaction; the helper itself records
     # recovery_required when termination cannot be proven.
     preflight = conn.execute(
-        "SELECT status, current_run_id, claim_lock, worker_pid, recovery_required "
+        "SELECT status, current_run_id, claim_lock, worker_pid, "
+        "worker_boot_id, worker_starttime, recovery_required "
         "FROM tasks WHERE id=?",
         (task_id,),
     ).fetchone()
@@ -6709,12 +7175,15 @@ def failover_review_task(
         # Legacy/custom reviewer hooks have no durable gate row.  They still
         # need the same authoritative termination rule before replacement.
         remaining_pid = conn.execute(
-            "SELECT worker_pid FROM tasks WHERE id=? AND claim_lock=?",
+            "SELECT worker_pid, worker_boot_id, worker_starttime "
+            "FROM tasks WHERE id=? AND claim_lock=?",
             (task_id, preflight["claim_lock"]),
         ).fetchone()
         if remaining_pid is not None and remaining_pid["worker_pid"]:
             termination = _terminate_reclaimed_worker(
-                int(remaining_pid["worker_pid"]), preflight["claim_lock"],
+                int(remaining_pid["worker_pid"]),
+                preflight["claim_lock"],
+                process_identity=_identity_from_row(remaining_pid, "worker"),
             )
             if _worker_survived_termination(termination):
                 _mark_recovery_required(
@@ -6913,7 +7382,8 @@ def release_stale_claims(
     review_reclaimed: dict[str, str] = {}
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, status, claim_lock, worker_pid, claim_expires, last_heartbeat_at, "
+        "SELECT id, status, claim_lock, worker_pid, worker_boot_id, "
+        "worker_starttime, claim_expires, last_heartbeat_at, "
         "recovery_required "
         "FROM tasks "
         "WHERE status IN ('running', 'review') AND ("
@@ -6934,10 +7404,22 @@ def release_stale_claims(
             hb is not None
             and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         )
+        worker_identity = _identity_from_row(row, "worker")
+        worker_observation = None
+        if host_local and row["worker_pid"] and worker_identity is not None:
+            worker_observation = _probe_bound_process(
+                int(row["worker_pid"]), worker_identity,
+            )
+            if worker_observation.handle is not None:
+                worker_observation.handle.close()
+        worker_live = (
+            worker_observation is not None
+            and worker_observation.status == "live"
+        )
         if (
             host_local
             and row["worker_pid"]
-            and _pid_alive(row["worker_pid"])
+            and worker_live
             and not heartbeat_stale
             and not bool(row["recovery_required"])
         ):
@@ -6983,6 +7465,7 @@ def release_stale_claims(
 
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+            process_identity=worker_identity,
         )
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -7001,7 +7484,8 @@ def release_stale_claims(
             continue
         if bool(row["recovery_required"]):
             if not row["worker_pid"] or not _authoritative_worker_exit(
-                int(row["worker_pid"])
+                int(row["worker_pid"]),
+                worker_identity,
             ):
                 _mark_recovery_required(
                     conn,
@@ -7131,7 +7615,8 @@ def reclaim_task(
     reclaimable state (not running, or doesn't exist).
     """
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid, recovery_required FROM tasks WHERE id = ?",
+        "SELECT status, claim_lock, worker_pid, worker_boot_id, "
+        "worker_starttime, recovery_required FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if not row:
@@ -7142,7 +7627,10 @@ def reclaim_task(
     prev_lock = row["claim_lock"]
     pending = _pending_review_decision(conn, task_id)
     termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn,
+        row["worker_pid"],
+        prev_lock,
+        signal_fn=signal_fn,
+        process_identity=_identity_from_row(row, "worker"),
     )
     if _worker_survived_termination(termination):
         _mark_recovery_required(
@@ -7176,7 +7664,8 @@ def reclaim_task(
         return False
     if bool(row["recovery_required"]):
         if not row["worker_pid"] or not _authoritative_worker_exit(
-            int(row["worker_pid"])
+            int(row["worker_pid"]),
+            _identity_from_row(row, "worker"),
         ):
             _mark_recovery_required(
                 conn,
@@ -9785,13 +10274,17 @@ def _terminate_reclaimed_worker(
     claim_lock: Optional[str],
     *,
     signal_fn=None,
+    process_identity: Optional[_ProcessIdentity] = None,
+    process_handle: Optional[_ProcessHandle] = None,
 ) -> dict[str, Any]:
-    """Best-effort host-local worker termination for reclaim paths."""
-    import signal
+    """Terminate only an identity-verified process through a race-free handle."""
 
     info: dict[str, Any] = {
         "prev_pid": int(pid) if pid else None,
         "host_local": False,
+        "identity_status": "ambiguous",
+        "identity_verified": False,
+        "identity_reason": "identity unavailable",
         "termination_attempted": False,
         "terminated": False,
         "sigkill": False,
@@ -9803,43 +10296,88 @@ def _terminate_reclaimed_worker(
     if not str(claim_lock).startswith(host_prefix):
         return info
     info["host_local"] = True
-
-    kill = signal_fn if signal_fn is not None else (
-        os.kill if hasattr(os, "kill") else None
+    owns_handle = process_handle is None
+    observation = _probe_bound_process(
+        int(pid), process_identity, process_handle=process_handle,
     )
-    if kill is None:
+    info["identity_status"] = observation.status
+    info["identity_reason"] = observation.reason
+    info["identity_verified"] = observation.status == "live"
+
+    def finish() -> dict[str, Any]:
+        if owns_handle and observation.handle is not None:
+            observation.handle.close()
         return info
 
-    info["termination_attempted"] = True
-    try:
-        kill(int(pid), signal.SIGTERM)
-    except ProcessLookupError:
-        # Process is already gone — that's a successful termination, not a
-        # survival. Leaving terminated=False here would make the reclaim guard
-        # misread a dead worker as still-alive and defer forever.
+    if observation.status in ("retired", "exited"):
+        # A mismatch/absence proves that the originally-bound process has
+        # retired.  It never authorizes a signal to the process now at PID.
         info["terminated"] = True
-        return info
-    except OSError:
-        return info
+        return finish()
+    if observation.status != "live" or observation.handle is None:
+        return finish()
 
-    for _ in range(10):
-        if not _pid_alive(pid):
-            info["terminated"] = True
-            return info
-        time.sleep(0.5)
+    handle = observation.handle
 
-    if _pid_alive(pid):
+    def send(sig: int) -> None:
+        if signal_fn is not None:
+            # Test hooks are called only after pidfd + identity verification.
+            signal_fn(int(pid), sig)
+            return
+        if handle.pidfd is None:
+            raise OSError("race-free pidfd signalling is unavailable")
+        _pidfd_send_signal(handle.pidfd, sig)
+
+    def refresh() -> _ProcessObservation:
+        current = _probe_bound_process(
+            int(pid), process_identity, process_handle=handle,
+        )
+        info["identity_status"] = current.status
+        info["identity_reason"] = current.reason
+        return current
+
+    try:
+        info["termination_attempted"] = True
         try:
-            # signal.SIGKILL doesn't exist on Windows; fall back to SIGTERM
-            # (which maps to TerminateProcess via the stdlib shim).
-            _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-            kill(int(pid), _sigkill)
+            send(signal.SIGTERM)
+        except ProcessLookupError:
+            current = refresh()
+            if current.status in ("retired", "exited"):
+                info["terminated"] = True
+            return finish()
+        except OSError:
+            current = refresh()
+            if current.status in ("retired", "exited"):
+                info["terminated"] = True
+            return finish()
+
+        for _ in range(10):
+            current = refresh()
+            if current.status in ("retired", "exited"):
+                info["terminated"] = True
+                return finish()
+            if current.status != "live":
+                return finish()
+            time.sleep(0.5)
+
+        current = refresh()
+        if current.status != "live":
+            if current.status in ("retired", "exited"):
+                info["terminated"] = True
+            return finish()
+        try:
+            send(getattr(signal, "SIGKILL", signal.SIGTERM))
             info["sigkill"] = True
         except (ProcessLookupError, OSError):
-            return info
-
-    info["terminated"] = not _pid_alive(pid)
-    return info
+            current = refresh()
+            if current.status in ("retired", "exited"):
+                info["terminated"] = True
+            return finish()
+        current = refresh()
+        info["terminated"] = current.status in ("retired", "exited")
+        return finish()
+    except Exception:
+        return finish()
 
 
 def _worker_survived_termination(termination: dict) -> bool:
@@ -10059,16 +10597,16 @@ def enforce_max_runtime(
 
     Runs host-local: only tasks claimed by this host are candidates
     (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a
-    test hook; defaults to ``os.kill`` on POSIX.
+    test hook; production signalling is allowed only through a verified
+    exact-identity pidfd.
     """
-    import signal
     timed_out: list[str] = []
     review_timeouts: dict[str, str] = {}
     now = int(time.time())
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, "
+        "SELECT t.id, t.worker_pid, t.worker_boot_id, t.worker_starttime, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock, t.status, "
         "       t.recovery_required "
@@ -10092,37 +10630,13 @@ def enforce_max_runtime(
 
         pid = int(row["worker_pid"])
         tid = row["id"]
-        # SIGTERM then SIGKILL. Keep it simple: 5 s grace. Workers that
-        # want a cleaner shutdown can install their own SIGTERM handler
-        # before the grace expires.
-        killed = False
-        kill = signal_fn if signal_fn is not None else (
-            os.kill if hasattr(os, "kill") else None
+        termination = _terminate_reclaimed_worker(
+            pid,
+            lock,
+            signal_fn=signal_fn,
+            process_identity=_identity_from_row(row, "worker"),
         )
-        if kill is not None:
-            try:
-                kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-            # Short polling wait — no time.sleep on the write txn.
-            for _ in range(10):
-                if not _pid_alive(pid):
-                    break
-                time.sleep(0.5)
-            if _pid_alive(pid):
-                try:
-                    # signal.SIGKILL doesn't exist on Windows.
-                    _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    kill(pid, _sigkill)
-                    killed = True
-                except (ProcessLookupError, OSError):
-                    pass
-        termination = {
-            "prev_pid": pid,
-            "termination_attempted": kill is not None,
-            "terminated": not _pid_alive(pid),
-            "sigkill": killed,
-        }
+        killed = bool(termination.get("sigkill"))
         if not termination["terminated"]:
             _mark_recovery_required(
                 conn,
@@ -10133,7 +10647,10 @@ def enforce_max_runtime(
             )
             continue
         if bool(row["recovery_required"]):
-            if not row["worker_pid"] or not _authoritative_worker_exit(pid):
+            if not row["worker_pid"] or not _authoritative_worker_exit(
+                pid,
+                _identity_from_row(row, "worker"),
+            ):
                 _mark_recovery_required(
                     conn,
                     tid,
@@ -10271,8 +10788,8 @@ def detect_stale_running(
     never candidates. Returns the list of reclaimed task IDs.
 
     ``stale_timeout_seconds=0`` disables the check entirely (returns ``[]``
-    immediately).  ``signal_fn`` is a test hook; defaults to ``os.kill``
-    on POSIX.
+    immediately).  ``signal_fn`` is a test hook; production signalling is
+    allowed only through a verified exact-identity pidfd.
     """
     if stale_timeout_seconds <= 0:
         return []
@@ -10283,7 +10800,8 @@ def detect_stale_running(
     review_stale: dict[str, str] = {}
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, t.status, "
+        "SELECT t.id, t.worker_pid, t.worker_boot_id, t.worker_starttime, "
+        "       t.last_heartbeat_at, t.claim_lock, t.status, "
         "       t.recovery_required, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
@@ -10309,10 +10827,12 @@ def detect_stale_running(
         pid = row["worker_pid"]
         tid = row["id"]
         lock = row["claim_lock"] or ""
+        worker_identity = _identity_from_row(row, "worker")
 
         # Terminate the worker if it's still host-local.
         termination = _terminate_reclaimed_worker(
             pid, lock, signal_fn=signal_fn,
+            process_identity=worker_identity,
         )
 
         # Never release a claim while our own worker is still alive: that would
@@ -10333,7 +10853,7 @@ def detect_stale_running(
 
         if bool(row["recovery_required"]):
             if not row["worker_pid"] or not _authoritative_worker_exit(
-                int(row["worker_pid"])
+                int(row["worker_pid"]), worker_identity,
             ):
                 _mark_recovery_required(
                     conn,
@@ -10533,7 +11053,7 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
 
 
 def _reap_pending_review_decisions(conn: sqlite3.Connection) -> None:
-    """Finalize decisions only after an authoritative child wait/reap proof."""
+    """Reconcile durable pending decisions after dispatcher restart."""
     rows = conn.execute(
         "SELECT id, worker_pid, claim_lock FROM tasks "
         "WHERE status IN ('review', 'running') AND worker_pid IS NOT NULL "
@@ -10550,18 +11070,28 @@ def _reap_pending_review_decisions(conn: sqlite3.Connection) -> None:
                     reason="review decision identity changed before authoritative retirement",
                 )
             continue
-        if _pid_alive(int(row["worker_pid"])):
-            continue
-        if not _pending_decision_exit_proven(conn, pending):
-            if not _authoritative_worker_exit(int(row["worker_pid"])):
+        if _pending_decision_exit_proven(conn, pending):
+            observation = None
+        else:
+            observation = _probe_bound_process(
+                int(row["worker_pid"]), pending.get("process_identity"),
+            )
+            if observation.status == "live":
+                if observation.handle is not None:
+                    observation.handle.close()
+                continue
+            if observation.status == "ambiguous":
+                if observation.handle is not None:
+                    observation.handle.close()
                 _mark_recovery_required(
                     conn,
                     row["id"],
                     row["claim_lock"],
-                    reason="review decision worker exit was not authoritatively reaped",
+                    reason="review decision process identity probe was ambiguous",
                 )
                 continue
-        _record_pending_decision_exit_proof(conn, pending)
+        if observation is not None:
+            _record_pending_decision_exit_proof(conn, pending, observation)
         if _finalize_pending_review_decision(conn, row["id"]) is None:
             _mark_recovery_required(
                 conn,
@@ -11092,6 +11622,14 @@ class _ReviewSpawnCASRejected(Exception):
     """Internal rollback sentinel for a stale reviewer child attachment."""
 
 
+class _ReviewLaunchIdentityUnavailable(RuntimeError):
+    """A dormant reviewer child could not be durably identified."""
+
+    def __init__(self, pid: int):
+        super().__init__("review launch gate process identity was unavailable")
+        self.pid = int(pid)
+
+
 @dataclass
 class _ReviewLaunchGateHandle:
     """Parent-side handle for a subprocess that is still physically dormant."""
@@ -11099,6 +11637,7 @@ class _ReviewLaunchGateHandle:
     pid: int
     token: str
     stdin: Any
+    process_handle: Optional[_ProcessHandle] = None
 
     def close(self) -> bool:
         try:
@@ -11107,6 +11646,9 @@ class _ReviewLaunchGateHandle:
             return True
         except (BrokenPipeError, OSError, ValueError):
             return False
+        finally:
+            if self.process_handle is not None:
+                self.process_handle.close()
 
     def release(self) -> bool:
         try:
@@ -11118,6 +11660,9 @@ class _ReviewLaunchGateHandle:
             return True
         except (BrokenPipeError, OSError, ValueError):
             return False
+        finally:
+            if self.process_handle is not None:
+                self.process_handle.close()
 
 
 _REVIEW_LAUNCH_HANDLES: dict[int, _ReviewLaunchGateHandle] = {}
@@ -11636,22 +12181,37 @@ def _spawn_review_gate_and_attach(
             handle = _review_launch_handle(pid)
             if handle is None:
                 raise RuntimeError("review launch gate PID was not locally attached")
+            spawned_handle = _SPAWNED_PROCESS_HANDLES.pop(int(pid), None)
+            process_handle = (
+                handle.process_handle
+                or spawned_handle
+                or _capture_process_handle(int(pid))
+            )
+            if process_handle is None:
+                raise RuntimeError("review launch gate process identity was unavailable")
+            identity = process_handle.identity
+            handle.process_handle = process_handle
             task_cur = conn.execute(
-                "UPDATE tasks SET worker_pid=? WHERE id=? AND status='review' "
+                "UPDATE tasks SET worker_pid=?, worker_boot_id=?, "
+                "worker_starttime=? WHERE id=? AND status='review' "
                 "AND current_run_id=? AND claim_lock=? AND assignee=? "
                 "AND worker_pid IS NULL AND recovery_required=0",
                 (
-                    int(pid), task.id, int(run_id), task.claim_lock,
-                    task.assignee,
+                    int(pid), identity.boot_id, identity.starttime,
+                    task.id, int(run_id), task.claim_lock, task.assignee,
                 ),
             )
             if task_cur.rowcount != 1:
                 raise _ReviewSpawnCASRejected
             run_cur = conn.execute(
-                "UPDATE task_runs SET worker_pid=? WHERE id=? AND task_id=? "
+                "UPDATE task_runs SET worker_pid=?, worker_boot_id=?, "
+                "worker_starttime=? WHERE id=? AND task_id=? "
                 "AND status='running' AND ended_at IS NULL AND claim_lock=? "
                 "AND worker_pid IS NULL",
-                (int(pid), int(run_id), task.id, task.claim_lock),
+                (
+                    int(pid), identity.boot_id, identity.starttime,
+                    int(run_id), task.id, task.claim_lock,
+                ),
             )
             if run_cur.rowcount != 1:
                 raise _ReviewSpawnCASRejected
@@ -11659,10 +12219,12 @@ def _spawn_review_gate_and_attach(
             conn.execute(
                 "INSERT INTO task_launch_gates "
                 "(task_id, run_id, claim_lock, assignee, authority_id, gate_token, "
-                "gate_pid, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'attached', ?)",
+                "gate_pid, gate_boot_id, gate_starttime, state, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'attached', ?)",
                 (
-                    task.id, int(run_id), task.claim_lock,
-                    task.assignee, int(authority[0]), token, int(pid), now,
+                    task.id, int(run_id), task.claim_lock, task.assignee,
+                    int(authority[0]), token, int(pid), identity.boot_id,
+                    identity.starttime, now,
                 ),
             )
             _append_event(
@@ -11671,6 +12233,7 @@ def _spawn_review_gate_and_attach(
                 "review_launch_gate_attached",
                 {
                     "pid": int(pid),
+                    "process_identity": _identity_payload(identity),
                     "gate_token": token,
                     "run_id": int(run_id),
                     "claim_lock": task.claim_lock,
@@ -11681,10 +12244,21 @@ def _spawn_review_gate_and_attach(
             )
         return int(pid), token
     except BaseException as exc:
-        if handle is not None:
-            handle.close()
+        if pid is None and isinstance(exc, _ReviewLaunchIdentityUnavailable):
+            pid = exc.pid
+        process_handle = handle.process_handle if handle is not None else None
+        if process_handle is None and pid is not None:
+            process_handle = _SPAWNED_PROCESS_HANDLES.pop(int(pid), None)
+        process_identity = (
+            process_handle.identity if process_handle is not None else None
+        )
         if pid is not None:
-            termination = _terminate_reclaimed_worker(int(pid), task.claim_lock)
+            termination = _terminate_reclaimed_worker(
+                int(pid),
+                task.claim_lock,
+                process_identity=process_identity,
+                process_handle=process_handle,
+            )
             if _worker_survived_termination(termination):
                 _mark_recovery_required(
                     conn,
@@ -11693,6 +12267,8 @@ def _spawn_review_gate_and_attach(
                     reason=f"review launch attach failed and child {pid} survived: {exc}",
                     termination=termination,
                 )
+        if handle is not None:
+            handle.close()
         raise
 
 
@@ -11786,6 +12362,12 @@ def _release_review_launch(
         return False
     handle = _review_launch_handle(pid)
     if handle is None:
+        _mark_recovery_required(
+            conn,
+            task.id,
+            task.claim_lock,
+            reason="review launch gate handle disappeared before release",
+        )
         return False
     with write_txn(conn):
         gate = conn.execute(
@@ -11838,6 +12420,12 @@ def _release_review_launch(
             run_id=int(run_id),
         )
     if not handle.release():
+        _mark_recovery_required(
+            conn,
+            task.id,
+            task.claim_lock,
+            reason="review launch gate release pipe failed after durable release",
+        )
         return False
     _REVIEW_LAUNCH_HANDLES.pop(int(pid), None)
     return True
@@ -11890,9 +12478,12 @@ def _retire_review_launch_gate(
     if gate["claim_lock"] != claim_lock:
         return False
     handle = _review_launch_handle(int(gate["gate_pid"]))
-    if handle is not None:
-        handle.close()
-    termination = _terminate_reclaimed_worker(int(gate["gate_pid"]), claim_lock)
+    termination = _terminate_reclaimed_worker(
+        int(gate["gate_pid"]),
+        claim_lock,
+        process_identity=_identity_from_row(gate, "gate"),
+        process_handle=(handle.process_handle if handle is not None else None),
+    )
     if _worker_survived_termination(termination):
         _mark_recovery_required(
             conn,
@@ -11902,6 +12493,8 @@ def _retire_review_launch_gate(
             termination=termination,
         )
         return False
+    if handle is not None:
+        handle.close()
     with write_txn(conn):
         current = conn.execute(
             "SELECT claim_lock, worker_pid, current_run_id FROM tasks WHERE id=?",
@@ -11913,6 +12506,11 @@ def _retire_review_launch_gate(
             "UPDATE task_launch_gates SET state='retired', closed_at=?, reason=? "
             "WHERE id=? AND state IN ('attached', 'authorized', 'prepared', 'released', 'revalidation_failed')",
             (int(time.time()), _bounded_review_error(reason), gate["id"]),
+        )
+        conn.execute(
+            "UPDATE tasks SET worker_pid=NULL, worker_boot_id=NULL, "
+            "worker_starttime=NULL WHERE id=? AND claim_lock=? AND worker_pid=?",
+            (task_id, claim_lock, int(gate["gate_pid"])),
         )
     if gate["state"] in ("attached", "authorized", "prepared", "revalidation_failed"):
         _cleanup_review_launch_workspace(gate)
@@ -11967,22 +12565,52 @@ def _set_worker_pid(
                     expected_assignee=review_row["assignee"],
                     expected_authority=review_authority,
                 )
+        process_handle = _SPAWNED_PROCESS_HANDLES.pop(pid, None)
+        if process_handle is None:
+            process_handle = _capture_process_handle(pid)
+        process_identity = (
+            process_handle.identity if process_handle is not None else None
+        )
         with write_txn(conn):
             conn.execute(
-                "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-                (pid, task_id),
+                "UPDATE tasks SET worker_pid = ?, worker_boot_id=?, "
+                "worker_starttime=? WHERE id = ?",
+                (
+                    pid,
+                    process_identity.boot_id if process_identity is not None else None,
+                    process_identity.starttime if process_identity is not None else None,
+                    task_id,
+                ),
             )
             run_id = _current_run_id(conn, task_id)
             if run_id is not None:
                 conn.execute(
-                    "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-                    (pid, run_id),
+                    "UPDATE task_runs SET worker_pid = ?, worker_boot_id=?, "
+                    "worker_starttime=? WHERE id = ?",
+                    (
+                        pid,
+                        process_identity.boot_id if process_identity is not None else None,
+                        process_identity.starttime if process_identity is not None else None,
+                        run_id,
+                    ),
                 )
-            _append_event(conn, task_id, "spawned", {"pid": pid}, run_id=run_id)
+            _append_event(
+                conn,
+                task_id,
+                "spawned",
+                {"pid": pid, "process_identity": _identity_payload(process_identity)},
+                run_id=run_id,
+            )
+        if process_handle is not None:
+            process_handle.close()
         return True
     if expected_run_id is None:
         return False
     expected_run_id_value = int(expected_run_id)
+    process_handle = _SPAWNED_PROCESS_HANDLES.pop(pid, None)
+    if process_handle is None:
+        process_handle = _capture_process_handle(pid)
+    process_identity = process_handle.identity if process_handle is not None else None
 
     try:
         with write_txn(conn):
@@ -11996,11 +12624,14 @@ def _set_worker_pid(
             ):
                 return False
             cur = conn.execute(
-                "UPDATE tasks SET worker_pid=? WHERE id=? AND status='review' "
+                "UPDATE tasks SET worker_pid=?, worker_boot_id=?, "
+                "worker_starttime=? WHERE id=? AND status='review' "
                 "AND current_run_id=? AND claim_lock=? AND assignee=? "
                 "AND worker_pid IS NULL",
                 (
                     pid,
+                    process_identity.boot_id if process_identity is not None else None,
+                    process_identity.starttime if process_identity is not None else None,
                     task_id,
                     expected_run_id_value,
                     expected_claim,
@@ -12010,10 +12641,18 @@ def _set_worker_pid(
             if cur.rowcount != 1:
                 raise _ReviewSpawnCASRejected
             run_cur = conn.execute(
-                "UPDATE task_runs SET worker_pid=? WHERE id=? AND task_id=? "
+                "UPDATE task_runs SET worker_pid=?, worker_boot_id=?, "
+                "worker_starttime=? WHERE id=? AND task_id=? "
                 "AND status='running' AND ended_at IS NULL "
                 "AND claim_lock=? AND worker_pid IS NULL",
-                (pid, expected_run_id_value, task_id, expected_claim),
+                (
+                    pid,
+                    process_identity.boot_id if process_identity is not None else None,
+                    process_identity.starttime if process_identity is not None else None,
+                    expected_run_id_value,
+                    task_id,
+                    expected_claim,
+                ),
             )
             if run_cur.rowcount != 1:
                 raise _ReviewSpawnCASRejected
@@ -12024,6 +12663,7 @@ def _set_worker_pid(
                 "spawned",
                 {
                     "pid": pid,
+                    "process_identity": _identity_payload(process_identity),
                     "run_id": expected_run_id_value,
                     "claim_lock": expected_claim,
                     "assignee": expected_assignee,
@@ -12034,6 +12674,9 @@ def _set_worker_pid(
             return True
     except _ReviewSpawnCASRejected:
         return False
+    finally:
+        if process_handle is not None:
+            process_handle.close()
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -13632,15 +14275,29 @@ def _default_spawn(
             start_new_session=True,
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
         )
+        process_handle = _capture_process_handle(proc.pid)
+        if process_handle is None:
+            if proc.stdin is not None:
+                proc.stdin.close()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            raise _ReviewLaunchIdentityUnavailable(proc.pid)
         if proc.stdin is None:
-            proc.kill()
-            proc.wait(timeout=5)
+            process_handle.close()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
             raise RuntimeError("review launch gate did not expose an attach pipe")
         _REVIEW_LAUNCH_HANDLES[proc.pid] = _ReviewLaunchGateHandle(
             pid=proc.pid,
             token=str(launch_token),
             stdin=proc.stdin,
+            process_handle=process_handle,
         )
+        _SPAWNED_PROCESS_HANDLES[proc.pid] = process_handle
         return proc.pid
 
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -13670,7 +14327,10 @@ def _default_spawn(
     # child process to keep writing after this function returns.  The
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
-    # open in the child until the child exits.
+    # child until the child exits.
+    process_handle = _capture_process_handle(proc.pid)
+    if process_handle is not None:
+        _SPAWNED_PROCESS_HANDLES[proc.pid] = process_handle
     return proc.pid
 
 

@@ -198,9 +198,7 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
 
 
 
-def test_stale_claim_reclaim_event_records_diagnostic_payload(
-    kanban_home, monkeypatch,
-):
+def test_stale_claim_reclaim_event_records_diagnostic_payload(kanban_home):
     """``reclaimed`` events should carry claim_expires, last_heartbeat_at,
     and worker_pid so operators can diagnose why a claim went stale
     (#23025: previous payload only had ``stale_lock`` which gives no
@@ -208,32 +206,58 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
     import json
     import hermes_cli.kanban_db as _kb
 
-    with kb.connect() as conn:
-        t = kb.create_task(conn, title="x", assignee="a")
-        host = _kb._claimer_id().split(":", 1)[0]
-        kb.claim_task(conn, t, claimer=f"{host}:worker")
-        kb._set_worker_pid(conn, t, 12345)
-        old_expires = int(time.time()) - 3600
-        hb_at = int(time.time()) - 1800
-        conn.execute(
-            "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? "
-            "WHERE id = ?",
-            (old_expires, hb_at, t),
-        )
+    process = subprocess.Popen(["sleep", "30"])
+    try:
+        with kb.connect() as conn:
+            t = kb.create_task(conn, title="x", assignee="a")
+            host = _kb._claimer_id().split(":", 1)[0]
+            kb.claim_task(conn, t, claimer=f"{host}:worker")
+            captured = kb._capture_process_handle(process.pid)
+            assert captured is not None
+            identity = captured.identity
+            captured.close()
+            assert kb._set_worker_pid(conn, t, process.pid)
+            bound = conn.execute(
+                "SELECT worker_pid, worker_boot_id, worker_starttime FROM tasks "
+                "WHERE id=?",
+                (t,),
+            ).fetchone()
+            assert bound is not None
+            assert (
+                bound["worker_pid"], bound["worker_boot_id"], bound["worker_starttime"]
+            ) == (process.pid, identity.boot_id, identity.starttime)
 
-        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
-        kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
-        row = conn.execute(
-            "SELECT payload FROM task_events "
-            "WHERE task_id = ? AND kind = 'reclaimed'",
-            (t,),
-        ).fetchone()
-        assert row is not None
-        payload = json.loads(row["payload"])
-        assert payload["claim_expires"] == old_expires
-        assert payload["last_heartbeat_at"] == hb_at
-        assert payload["worker_pid"] == 12345
-        assert payload["host_local"] is True
+            process.terminate()
+            returncode = process.wait(timeout=5)
+            raw_status = -returncode if returncode < 0 else returncode << 8
+            kb._record_worker_exit(process.pid, raw_status)
+            old_expires = int(time.time()) - 3600
+            hb_at = int(time.time()) - 1800
+            conn.execute(
+                "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? "
+                "WHERE id = ?",
+                (old_expires, hb_at, t),
+            )
+            conn.commit()
+
+            # The identity-aware observation proves the bound process retired;
+            # no numeric-PID liveness fake is accepted by this regression.
+            kb.release_stale_claims(conn)
+            row = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'reclaimed'",
+                (t,),
+            ).fetchone()
+            assert row is not None
+            payload = json.loads(row["payload"])
+            assert payload["claim_expires"] == old_expires
+            assert payload["last_heartbeat_at"] == hb_at
+            assert payload["worker_pid"] == process.pid
+            assert payload["host_local"] is True
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        process.wait(timeout=5)
 
 
 

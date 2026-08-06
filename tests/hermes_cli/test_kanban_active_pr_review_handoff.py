@@ -19,6 +19,7 @@ Production sequence reproduced here (SubsidySmart coding card):
 
 from __future__ import annotations
 
+import subprocess
 import time
 from types import SimpleNamespace
 from pathlib import Path
@@ -303,40 +304,141 @@ def test_completed_review_cycle_does_not_re_enter_review_lane(
     monkeypatch.setattr(
         kb, "_reviewer_candidates", lambda current: (["code-reviewer"], []),
     )
-    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
     host = kb._claimer_id().split(":", 1)[0]
-    with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="coding card", assignee="programmer")
-        assert kb.claim_task(conn, task_id, claimer=f"{host}:impl") is not None
-        assert kb.block_task(
-            conn, task_id, kind="dependency",
-            reason="review-required: needs sign-off",
-        ) is True
-        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
-        conn.commit()
-        kb.dispatch_once(conn, spawn_fn=lambda task, workspace: 99)
-        assert kb.get_task(conn, task_id).status == "review"
+    reviewer_process = subprocess.Popen(["sleep", "30"])
+    processes = [reviewer_process]
 
-        # The dispatcher already claimed + spawned the reviewer above.
-        # Reviewer requests changes -> programmer correction -> crash.
-        assert kb.request_changes(
-            conn, task_id, "programmer", reason="fix tests",
-            trusted_operator=True,
-        ) is not None
-        # The reviewer verdict is durable but remains fenced until its
-        # deciding worker has an authoritative reap record.
-        kb._record_worker_exit(99, 0)
-        spawned = []
-        kb.dispatch_once(conn, spawn_fn=_spawn_recorder(spawned, pid=4243))
-        assert spawned == [(task_id, "programmer")]
-        _crash_current_worker(conn, task_id, pid=4243)
-        assert task_id in kb.detect_crashed_workers(conn)
+    def record_reaped(process):
+        returncode = process.wait(timeout=5)
+        raw_status = -returncode if returncode < 0 else returncode << 8
+        kb._record_worker_exit(process.pid, raw_status)
 
-        spawned.clear()
-        kb.dispatch_once(conn, spawn_fn=_spawn_recorder(spawned))
-        task = kb.get_task(conn, task_id)
-        assert task is not None and task.assignee == "programmer"
-        assert spawned == [(task_id, "programmer")]
+    try:
+        with kb.connect() as conn:
+            task_id = kb.create_task(conn, title="coding card", assignee="programmer")
+            assert kb.claim_task(conn, task_id, claimer=f"{host}:impl") is not None
+            assert kb.block_task(
+                conn, task_id, kind="dependency",
+                reason="review-required: needs sign-off",
+            ) is True
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+            conn.commit()
+
+            def spawn_reviewer(task, workspace):
+                assert task.assignee == "code-reviewer"
+                return reviewer_process.pid
+
+            kb.dispatch_once(conn, spawn_fn=spawn_reviewer)
+            review = kb.get_task(conn, task_id)
+            assert review is not None
+            assert review.status == "review"
+            assert review.worker_pid == reviewer_process.pid
+            assert review.worker_boot_id
+            assert review.worker_starttime and review.worker_starttime.isdigit()
+
+            run = conn.execute(
+                "SELECT worker_pid, worker_boot_id, worker_starttime "
+                "FROM task_runs WHERE id=?",
+                (review.current_run_id,),
+            ).fetchone()
+            assert run is not None
+            assert (
+                run["worker_pid"], run["worker_boot_id"], run["worker_starttime"]
+            ) == (
+                review.worker_pid, review.worker_boot_id, review.worker_starttime,
+            )
+            authority = kb._latest_reviewer_authority(conn, task_id)
+            assert authority is not None
+            with kb.write_txn(conn):
+                conn.execute(
+                    "INSERT INTO task_launch_gates "
+                    "(task_id, run_id, claim_lock, assignee, authority_id, gate_token, "
+                    "gate_pid, gate_boot_id, gate_starttime, state, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'released', ?)",
+                    (
+                        task_id, review.current_run_id, review.claim_lock,
+                        review.assignee, authority[0],
+                        f"review-cycle-{review.worker_pid}", review.worker_pid,
+                        review.worker_boot_id, review.worker_starttime, int(time.time()),
+                    ),
+                )
+            gate = conn.execute(
+                "SELECT gate_pid, gate_boot_id, gate_starttime FROM task_launch_gates "
+                "WHERE task_id=? AND run_id=?",
+                (task_id, review.current_run_id),
+            ).fetchone()
+            assert gate is not None
+            assert (
+                gate["gate_pid"], gate["gate_boot_id"], gate["gate_starttime"]
+            ) == (
+                review.worker_pid, review.worker_boot_id, review.worker_starttime,
+            )
+
+            # Reviewer requests changes, but its process still owns the run.
+            assert kb.request_changes(
+                conn, task_id, "programmer", reason="fix tests",
+                trusted_operator=True,
+            ) is not None
+            reviewer_process.terminate()
+            record_reaped(reviewer_process)
+            # Reconcile only after the real child has been terminated, reaped,
+            # and its exact wait status has been recorded.
+            kb._reap_pending_review_decisions(conn)
+            reconciled = kb.get_task(conn, task_id)
+            assert reconciled is not None
+            assert reconciled.status == "ready"
+            assert reconciled.assignee == "programmer"
+            assert reconciled.current_run_id is None
+            assert conn.execute(
+                "SELECT state FROM task_launch_gates WHERE task_id=? "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()["state"] == "retired"
+
+            spawned = []
+
+            def spawn_programmer(task, workspace):
+                process = subprocess.Popen(["sleep", "30"])
+                processes.append(process)
+                spawned.append((task.id, task.assignee))
+                return process.pid
+
+            # Only after retirement/reconciliation may the programmer
+            # successor be spawned.
+            kb.dispatch_once(conn, spawn_fn=spawn_programmer)
+            programmer = kb.get_task(conn, task_id)
+            assert programmer is not None
+            assert programmer.current_run_id is not None
+            assert spawned == [(task_id, "programmer")]
+            programmer_process = processes[-1]
+            programmer_process.terminate()
+            record_reaped(programmer_process)
+            old = int(time.time()) - 600
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET started_at=? WHERE id=?",
+                    (old, task_id),
+                )
+                conn.execute(
+                    "UPDATE task_runs SET started_at=? WHERE id=?",
+                    (old, programmer.current_run_id),
+                )
+            assert task_id in kb.detect_crashed_workers(conn)
+
+            spawned.clear()
+            kb.dispatch_once(conn, spawn_fn=spawn_programmer)
+            task = kb.get_task(conn, task_id)
+            assert task is not None and task.assignee == "programmer"
+            assert spawned == [(task_id, "programmer")]
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
 
 
 # ---------------------------------------------------------------------------

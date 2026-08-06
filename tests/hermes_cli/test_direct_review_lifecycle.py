@@ -197,26 +197,40 @@ def _start_real_review_decision_child(conn, task_id, review, tmp_path, decision)
     while not ready.exists() and time.time() < deadline:
         time.sleep(0.01)
     assert ready.exists()
+    process_handle = kb._capture_process_handle(child.pid)
+    assert process_handle is not None
+    identity = process_handle.identity
+    process_handle.close()
     authority = kb._latest_reviewer_authority(conn, task_id)
     assert authority is not None
     with kb.write_txn(conn):
         conn.execute(
-            "UPDATE tasks SET worker_pid=? WHERE id=? AND current_run_id=? "
+            "UPDATE tasks SET worker_pid=?, worker_boot_id=?, worker_starttime=? "
+            "WHERE id=? AND current_run_id=? "
             "AND claim_lock=?",
-            (child.pid, task_id, review.current_run_id, review.claim_lock),
+            (
+                child.pid, identity.boot_id, identity.starttime,
+                task_id, review.current_run_id, review.claim_lock,
+            ),
         )
         conn.execute(
-            "UPDATE task_runs SET worker_pid=? WHERE id=? AND task_id=? "
+            "UPDATE task_runs SET worker_pid=?, worker_boot_id=?, "
+            "worker_starttime=? WHERE id=? AND task_id=? "
             "AND claim_lock=?",
-            (child.pid, review.current_run_id, task_id, review.claim_lock),
+            (
+                child.pid, identity.boot_id, identity.starttime,
+                review.current_run_id, task_id, review.claim_lock,
+            ),
         )
         conn.execute(
             "INSERT INTO task_launch_gates "
             "(task_id, run_id, claim_lock, assignee, authority_id, gate_token, "
-            "gate_pid, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'released', ?)",
+            "gate_pid, gate_boot_id, gate_starttime, state, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'released', ?)",
             (
                 task_id, review.current_run_id, review.claim_lock, review.assignee,
-                authority[0], f"test-token-{child.pid}", child.pid, int(time.time()),
+                authority[0], f"test-token-{child.pid}", child.pid,
+                identity.boot_id, identity.starttime, int(time.time()),
             ),
         )
     attached = conn.execute(
@@ -315,7 +329,7 @@ def test_pending_review_decision_stays_fenced_across_reclaimers(
     kanban_home, reclaimer, monkeypatch,
 ):
     """Timeout/stale paths must not bypass the terminal-decision retirement fence."""
-    monkeypatch.setattr(kb, "_authoritative_worker_exit", lambda _pid: False)
+    monkeypatch.setattr(kb, "_authoritative_worker_exit", lambda _pid, _identity=None: False)
     with kb.connect() as conn:
         task_id, review, _host = _review_card(conn)
         reviewer_pid = 987654
@@ -2874,35 +2888,53 @@ def test_review_max_runtime_fails_over_to_alternate_reviewer(
         kb, "_reviewer_candidates",
         lambda current: ([current, "reviewer-b"], []),
     )
-    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    process = subprocess.Popen(["sleep", "30"])
+    process_handle = None
     with kb.connect() as conn:
-        task_id, review, _ = _review_card(conn)
-        started_at = int(time.time()) - 120
-        conn.execute(
-            "UPDATE tasks SET worker_pid=?, max_runtime_seconds=?, started_at=? WHERE id=?",
-            (551001, 1, started_at, task_id),
-        )
-        conn.execute(
-            "UPDATE task_runs SET started_at=? WHERE id=?",
-            (started_at, review.current_run_id),
-        )
-        conn.commit()
-        assert task_id in kb.enforce_max_runtime(
-            conn, signal_fn=lambda _pid, _sig: None,
-        )
-        current = kb.get_task(conn, task_id)
-        assert current is not None
-        assert current.status == "review"
-        assert current.assignee == "reviewer-b"
-        assert current.current_run_id is None
-        assert "review_failover" in _events(conn, task_id)
-        closed = [r for r in kb.list_runs(conn, task_id) if r.outcome == "timed_out"]
-        assert len(closed) == 1
-        attempted = _payload(conn, task_id, "review_failover")["attempted"]
-        assert any(
-            item["profile"] == "code-reviewer" and item["error"] == closed[0].error
-            for item in attempted
-        )
+        try:
+            task_id, review, _ = _review_card(conn)
+            process_handle = kb._capture_process_handle(process.pid)
+            assert process_handle is not None
+            identity = process_handle.identity
+            started_at = int(time.time()) - 120
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET worker_pid=?, worker_boot_id=?, "
+                    "worker_starttime=?, max_runtime_seconds=?, started_at=? WHERE id=?",
+                    (
+                        process.pid, identity.boot_id, identity.starttime,
+                        1, started_at, task_id,
+                    ),
+                )
+                conn.execute(
+                    "UPDATE task_runs SET worker_pid=?, worker_boot_id=?, "
+                    "worker_starttime=?, started_at=? WHERE id=?",
+                    (
+                        process.pid, identity.boot_id, identity.starttime,
+                        started_at, review.current_run_id,
+                    ),
+                )
+            process_handle.close()
+            assert task_id in kb.enforce_max_runtime(conn)
+            current = kb.get_task(conn, task_id)
+            assert current is not None
+            assert current.status == "review"
+            assert current.assignee == "reviewer-b"
+            assert current.current_run_id is None
+            assert "review_failover" in _events(conn, task_id)
+            closed = [r for r in kb.list_runs(conn, task_id) if r.outcome == "timed_out"]
+            assert len(closed) == 1
+            attempted = _payload(conn, task_id, "review_failover")["attempted"]
+            assert any(
+                item["profile"] == "code-reviewer" and item["error"] == closed[0].error
+                for item in attempted
+            )
+        finally:
+            if process_handle is not None:
+                process_handle.close()
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=5)
 
 
 def test_review_crash_fails_over_with_closed_run_evidence(
@@ -2943,32 +2975,52 @@ def test_review_max_runtime_blocks_after_same_reviewer_exhaustion(
     monkeypatch.setattr(
         kb, "_reviewer_candidates", lambda current: ([current], []),
     )
-    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    process = subprocess.Popen(["sleep", "30"])
+    process_handle = None
     with kb.connect() as conn:
-        task_id, review, _ = _review_card(conn)
-        started_at = int(time.time()) - 120
-        conn.execute(
-            "UPDATE tasks SET worker_pid=?, max_runtime_seconds=?, started_at=? WHERE id=?",
-            (551002, 1, started_at, task_id),
-        )
-        conn.execute(
-            "UPDATE task_runs SET started_at=? WHERE id=?",
-            (started_at, review.current_run_id),
-        )
-        conn.commit()
-        kb.enforce_max_runtime(conn, signal_fn=lambda _pid, _sig: None)
-        current = kb.get_task(conn, task_id)
-        assert current is not None
-        assert current.status == "blocked"
-        assert current.block_kind == "capability"
-        assert current.assignee is None
-        closed = [r for r in kb.list_runs(conn, task_id) if r.outcome == "timed_out"]
-        assert len(closed) == 1
-        attempted = _payload(conn, task_id, "review_lanes_failed")["attempted"]
-        assert any(
-            item["profile"] == "code-reviewer" and item["error"] == closed[0].error
-            for item in attempted
-        )
+        try:
+            task_id, review, _ = _review_card(conn)
+            process_handle = kb._capture_process_handle(process.pid)
+            assert process_handle is not None
+            identity = process_handle.identity
+            started_at = int(time.time()) - 120
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET worker_pid=?, worker_boot_id=?, "
+                    "worker_starttime=?, max_runtime_seconds=?, started_at=? WHERE id=?",
+                    (
+                        process.pid, identity.boot_id, identity.starttime,
+                        1, started_at, task_id,
+                    ),
+                )
+                conn.execute(
+                    "UPDATE task_runs SET worker_pid=?, worker_boot_id=?, "
+                    "worker_starttime=?, started_at=? WHERE id=?",
+                    (
+                        process.pid, identity.boot_id, identity.starttime,
+                        started_at, review.current_run_id,
+                    ),
+                )
+            process_handle.close()
+            kb.enforce_max_runtime(conn)
+            current = kb.get_task(conn, task_id)
+            assert current is not None
+            assert current.status == "blocked"
+            assert current.block_kind == "capability"
+            assert current.assignee is None
+            closed = [r for r in kb.list_runs(conn, task_id) if r.outcome == "timed_out"]
+            assert len(closed) == 1
+            attempted = _payload(conn, task_id, "review_lanes_failed")["attempted"]
+            assert any(
+                item["profile"] == "code-reviewer" and item["error"] == closed[0].error
+                for item in attempted
+            )
+        finally:
+            if process_handle is not None:
+                process_handle.close()
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=5)
 
 
 def test_review_heartbeat_stale_fails_over_to_alternate_reviewer(
@@ -2978,34 +3030,74 @@ def test_review_heartbeat_stale_fails_over_to_alternate_reviewer(
         kb, "_reviewer_candidates",
         lambda current: ([current, "reviewer-b"], []),
     )
-    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    process = subprocess.Popen(["sleep", "30"])
+    process_handle = None
     with kb.connect() as conn:
-        task_id, review, _ = _review_card(conn)
-        old = int(time.time()) - 7200
-        conn.execute(
-            "UPDATE tasks SET worker_pid=?, started_at=?, last_heartbeat_at=? WHERE id=?",
-            (551003, old, old, task_id),
-        )
-        conn.execute(
-            "UPDATE task_runs SET started_at=? WHERE id=?",
-            (old, review.current_run_id),
-        )
-        conn.commit()
-        assert task_id in kb.detect_stale_running(
-            conn, stale_timeout_seconds=1,
-        )
-        current = kb.get_task(conn, task_id)
-        assert current is not None
-        assert current.status == "review"
-        assert current.assignee == "reviewer-b"
-        assert "review_failover" in _events(conn, task_id)
-        closed = [r for r in kb.list_runs(conn, task_id) if r.outcome == "stale"]
-        assert len(closed) == 1
-        attempted = _payload(conn, task_id, "review_failover")["attempted"]
-        assert any(
-            item["profile"] == "code-reviewer" and item["error"] == closed[0].error
-            for item in attempted
-        )
+        try:
+            task_id, review, _ = _review_card(conn)
+            process_handle = kb._capture_process_handle(process.pid)
+            assert process_handle is not None
+            process_identity = process_handle.identity
+            authority = kb._latest_reviewer_authority(conn, task_id)
+            assert authority is not None
+            # Match production ordering: capture the live process identity and
+            # durably attach it before the child exits/reaps. Stale detection
+            # must rely on the database binding, not process-local state.
+            old = int(time.time()) - 7200
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET worker_pid=?, worker_boot_id=?, "
+                    "worker_starttime=?, started_at=?, last_heartbeat_at=? WHERE id=?",
+                    (
+                        process.pid, process_identity.boot_id, process_identity.starttime,
+                        old, old, task_id,
+                    ),
+                )
+                conn.execute(
+                    "UPDATE task_runs SET worker_pid=?, worker_boot_id=?, "
+                    "worker_starttime=?, started_at=? WHERE id=?",
+                    (
+                        process.pid, process_identity.boot_id, process_identity.starttime,
+                        old, review.current_run_id,
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO task_launch_gates "
+                    "(task_id, run_id, claim_lock, assignee, authority_id, gate_token, "
+                    "gate_pid, gate_boot_id, gate_starttime, state, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'released', ?)",
+                    (
+                        task_id, review.current_run_id, review.claim_lock,
+                        review.assignee, authority[0], f"stale-test-{process.pid}",
+                        process.pid, process_identity.boot_id, process_identity.starttime,
+                        int(time.time()),
+                    ),
+                )
+            process_handle.close()
+            process.terminate()
+            process.wait(timeout=5)
+
+            assert task_id in kb.detect_stale_running(
+                conn, stale_timeout_seconds=1,
+            )
+            current = kb.get_task(conn, task_id)
+            assert current is not None
+            assert current.status == "review"
+            assert current.assignee == "reviewer-b"
+            assert "review_failover" in _events(conn, task_id)
+            closed = [r for r in kb.list_runs(conn, task_id) if r.outcome == "stale"]
+            assert len(closed) == 1
+            attempted = _payload(conn, task_id, "review_failover")["attempted"]
+            assert any(
+                item["profile"] == "code-reviewer" and item["error"] == closed[0].error
+                for item in attempted
+            )
+        finally:
+            if process_handle is not None:
+                process_handle.close()
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=5)
 
 
 # ---------------------------------------------------------------------------
