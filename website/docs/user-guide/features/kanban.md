@@ -173,7 +173,10 @@ body and hoping it finds them.
 - **Storage** — files land under
   `<hermes-home>/kanban/attachments/<task_id>/` for the default board, or
   `<hermes-home>/kanban/boards/<slug>/attachments/<task_id>/` for a named
-  board. Set `HERMES_KANBAN_ATTACHMENTS_ROOT` to pin a custom location.
+  board. `HERMES_KANBAN_ATTACHMENTS_ROOT` pins a custom location for
+  connectionless/setup-only resolution; normal connection-bound uploads and
+  completion artifacts stay under the immutable board authority captured when
+  the Kanban connection opens.
 - **What the worker sees** — when the dispatcher hands a task to a worker,
   the worker's context includes an **Attachments** section listing each
   file's name and its **absolute path**. The worker has full file/terminal

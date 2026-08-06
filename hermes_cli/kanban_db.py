@@ -38,11 +38,15 @@ Board resolution order (highest precedence first, all optional):
 
 In standard installs ``<root>`` is ``~/.hermes``. In Docker / custom
 deployments where ``HERMES_HOME`` points outside ``~/.hermes`` (e.g.
-``/opt/hermes``), ``<root>`` is ``HERMES_HOME``. Legacy env-var
-overrides still work:
+``/opt/hermes``), ``<root>`` is ``HERMES_HOME``. Legacy env-var overrides
+still work for connectionless/setup-only path resolution. Once a SQLite
+connection is open, its immutable authority packet owns the board paths for
+the whole lifecycle; later ambient env changes cannot redirect workspace,
+attachment, log, project, or reviewer-policy operations:
 
 * ``HERMES_KANBAN_DB`` — pin the database file path directly.
-* ``HERMES_KANBAN_WORKSPACES_ROOT`` — pin the workspaces root directly.
+* ``HERMES_KANBAN_WORKSPACES_ROOT`` — pin the workspaces root directly for
+  connectionless/setup-only resolution.
 * ``HERMES_KANBAN_HOME`` — pin the umbrella root that anchors kanban
   paths. Useful for tests and unusual deployments.
 
@@ -453,8 +457,56 @@ class _KanbanAuthorityContext:
     kanban_home: Optional[Path]
     board_metadata_root: Optional[Path]
     project_db_path: Optional[Path] = None
-    project_db_fallback: Optional[Path] = None
     operational_board_slug: Optional[str] = None
+    workspaces_root: Optional[Path] = None
+    attachments_root: Optional[Path] = None
+    worker_logs_root: Optional[Path] = None
+    policy_source_path: Optional[Path] = None
+
+
+def _make_authority_context(
+    *,
+    db_path: Path,
+    board_slug: Optional[str],
+    kanban_home: Optional[Path],
+    board_metadata_root: Optional[Path],
+    project_db_path: Optional[Path] = None,
+    operational_board_slug: Optional[str] = None,
+) -> _KanbanAuthorityContext:
+    """Build one immutable packet containing every board-owned path.
+
+    This helper is deliberately pure: it derives paths only from the
+    connection's canonical DB path and board identity.  In particular, it
+    never consults the active profile, current-board file, or environment.
+    """
+    if project_db_path is None and kanban_home is not None:
+        project_db_path = kanban_home / "projects.db"
+    workspaces: Optional[Path] = None
+    attachments: Optional[Path] = None
+    logs: Optional[Path] = None
+    if kanban_home is not None and board_slug is not None:
+        if board_slug == DEFAULT_BOARD:
+            board_root = kanban_home / "kanban"
+        else:
+            board_root = kanban_home / "kanban" / "boards" / board_slug
+        workspaces = board_root / "workspaces"
+        attachments = board_root / "attachments"
+        logs = board_root / "logs"
+    policy_source = (
+        kanban_home / "config.yaml" if kanban_home is not None else None
+    )
+    return _KanbanAuthorityContext(
+        db_path=db_path,
+        board_slug=board_slug,
+        kanban_home=kanban_home,
+        board_metadata_root=board_metadata_root,
+        project_db_path=project_db_path,
+        operational_board_slug=operational_board_slug,
+        workspaces_root=workspaces,
+        attachments_root=attachments,
+        worker_logs_root=logs,
+        policy_source_path=policy_source,
+    )
 
 
 @contextlib.contextmanager
@@ -693,13 +745,13 @@ def _authority_context_from_db_path(
             except ValueError:
                 normalized = None
             if normalized is None or raw_slug != normalized:
-                return _KanbanAuthorityContext(
+                return _make_authority_context(
                     db_path=resolved,
                     board_slug=None,
                     kanban_home=root,
                     board_metadata_root=None,
                 )
-            return _KanbanAuthorityContext(
+            return _make_authority_context(
                 db_path=resolved,
                 board_slug=normalized,
                 kanban_home=root,
@@ -711,7 +763,7 @@ def _authority_context_from_db_path(
         # malformed. It must not fall through to the legacy default layout.
         if resolved.parent.parent.name == "boards":
             root = resolved.parent.parent.parent.parent
-            return _KanbanAuthorityContext(
+            return _make_authority_context(
                 db_path=resolved,
                 board_slug=None,
                 kanban_home=root,
@@ -722,7 +774,7 @@ def _authority_context_from_db_path(
         # the DB's parent as its immutable Kanban root. This also makes a
         # fixed legacy DB independent of a later HERMES_KANBAN_HOME change.
         root = resolved.parent
-        return _KanbanAuthorityContext(
+        return _make_authority_context(
             db_path=resolved,
             board_slug=DEFAULT_BOARD,
             kanban_home=root,
@@ -747,25 +799,6 @@ def _authority_context_for_connection(
     explicit = _normalize_board_slug(board)
     derived = _authority_context_from_db_path(resolved)
     if derived is not None:
-        # ``connect(db_path=..., board="default")`` is the legacy API for a
-        # caller-owned default DB. Preserve its explicit board-root contract;
-        # an omitted board remains path-bound so a fixed legacy DB cannot
-        # inherit a later ambient root.
-        if derived.board_slug == DEFAULT_BOARD and explicit == DEFAULT_BOARD:
-            from hermes_constants import get_hermes_home
-
-            return _KanbanAuthorityContext(
-                db_path=resolved,
-                board_slug=DEFAULT_BOARD,
-                kanban_home=derived.kanban_home,
-                board_metadata_root=derived.board_metadata_root,
-                project_db_path=(derived.kanban_home / "projects.db")
-                if derived.kanban_home is not None
-                else None,
-                project_db_fallback=(get_hermes_home() / "projects.db").resolve(
-                    strict=False
-                ),
-            )
         if derived.board_slug is not None:
             if explicit is not None and explicit != derived.board_slug:
                 raise ValueError(
@@ -777,7 +810,7 @@ def _authority_context_for_connection(
         # unbound. Never let ``board=`` turn it into ambient authority.
         return derived
     if explicit is None:
-        return _KanbanAuthorityContext(
+        return _make_authority_context(
             db_path=resolved,
             board_slug=None,
             kanban_home=None,
@@ -790,12 +823,11 @@ def _authority_context_for_connection(
     root = resolved.parent
     metadata_root = root / "kanban" / "boards" / explicit
 
-    return _KanbanAuthorityContext(
+    return _make_authority_context(
         db_path=resolved,
         board_slug=explicit,
         kanban_home=root,
         board_metadata_root=metadata_root,
-        project_db_path=root / "projects.db",
     )
 
 
@@ -826,9 +858,11 @@ def _connection_authority(
 def _connection_board_metadata(
     conn: sqlite3.Connection,
     board: str,
+    *,
+    authority: Optional[_KanbanAuthorityContext] = None,
 ) -> Optional[dict]:
     """Read board metadata only from the connection's bound board root."""
-    authority = _connection_authority(conn)
+    authority = authority or _connection_authority(conn)
     if (
         authority is None
         or authority.board_slug != board
@@ -844,53 +878,50 @@ def _connection_board_metadata(
 
 def _connection_projects_db_path(
     conn: sqlite3.Connection,
+    *,
+    authority: Optional[_KanbanAuthorityContext] = None,
 ) -> Optional[Path]:
     """Return the primary project store anchored to the connection."""
-    authority = _connection_authority(conn)
+    authority = authority or _connection_authority(conn)
     if authority is None:
         return None
     if authority.project_db_path is not None:
         return authority.project_db_path
-    if authority.kanban_home is None:
-        return None
-    return authority.kanban_home / "projects.db"
+    return authority.project_db_path
 
 
-def _connection_project_db_fallback(
-    conn: sqlite3.Connection,
-) -> Optional[Path]:
-    """Return a captured legacy project-store fallback, if one is allowed."""
-    authority = _connection_authority(conn)
-    if authority is None:
-        return None
-    fallback = authority.project_db_fallback
-    primary = _connection_projects_db_path(conn)
-    if fallback is None or fallback == primary:
-        return None
-    # Only an explicit legacy default DB without board metadata may use this
-    # compatibility fallback; a fixed canonical board never falls through to
-    # ambient project state.
-    if (
-        primary is None
-        or primary.exists()
-        or authority.board_metadata_root is None
-        or (authority.board_metadata_root / "board.json").exists()
-    ):
-        return None
-    return fallback
+def _authority_path(
+    authority: _KanbanAuthorityContext,
+    field_name: str,
+    description: str,
+) -> Path:
+    path = getattr(authority, field_name)
+    if path is None:
+        raise ValueError(
+            f"connection authority has no {description}; board identity is unavailable"
+        )
+    return path
 
 
-def workspaces_root(board: Optional[str] = None) -> Path:
+def workspaces_root(
+    board: Optional[str] = None,
+    *,
+    authority: Optional[_KanbanAuthorityContext] = None,
+) -> Path:
     """Return the directory under which ``scratch`` workspaces are created.
 
     Anchored per-board so workspaces don't leak between projects.
-    ``HERMES_KANBAN_WORKSPACES_ROOT`` pins the path directly (highest
-    precedence) — the dispatcher injects this into worker env.
+    ``HERMES_KANBAN_WORKSPACES_ROOT`` pins the path directly for
+    connectionless/setup-only calls. When an authority packet is supplied,
+    its captured root wins; the dispatcher injects that derived root into the
+    worker env.
 
     ``default`` keeps the legacy path ``<root>/kanban/workspaces/`` so
     that existing scratch workspaces from before the boards feature are
     preserved. Other boards use ``<root>/kanban/boards/<slug>/workspaces/``.
     """
+    if authority is not None:
+        return _authority_path(authority, "workspaces_root", "workspace root")
     override = os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT", "").strip()
     if override:
         return Path(override).expanduser()
@@ -902,15 +933,20 @@ def workspaces_root(board: Optional[str] = None) -> Path:
     return board_dir(slug) / "workspaces"
 
 
-def attachments_root(board: Optional[str] = None) -> Path:
+def attachments_root(
+    board: Optional[str] = None,
+    *,
+    authority: Optional[_KanbanAuthorityContext] = None,
+) -> Path:
     """Return the directory under which task file attachments are stored.
 
     Mirrors :func:`worker_logs_dir` / :func:`workspaces_root`: anchored
     per-board so attachments don't leak between projects. Each task gets
     its own ``<root>/.../attachments/<task_id>/`` subdirectory.
 
-    ``HERMES_KANBAN_ATTACHMENTS_ROOT`` pins the path directly (highest
-    precedence) for tests and unusual deployments.
+    ``HERMES_KANBAN_ATTACHMENTS_ROOT`` pins the path directly for
+    connectionless/setup-only calls. When an authority packet is supplied,
+    its captured root wins.
 
     ``default`` uses ``<root>/kanban/attachments/``; other boards use
     ``<root>/kanban/boards/<slug>/attachments/``.
@@ -921,6 +957,8 @@ def attachments_root(board: Optional[str] = None) -> Path:
     directly. Remote backends (Docker/Modal) need this directory mounted;
     see the kanban docs.
     """
+    if authority is not None:
+        return _authority_path(authority, "attachments_root", "attachment root")
     override = os.environ.get("HERMES_KANBAN_ATTACHMENTS_ROOT", "").strip()
     if override:
         return Path(override).expanduser()
@@ -932,12 +970,45 @@ def attachments_root(board: Optional[str] = None) -> Path:
     return board_dir(slug) / "attachments"
 
 
-def task_attachments_dir(task_id: str, board: Optional[str] = None) -> Path:
+def task_attachments_dir(
+    task_id: str,
+    board: Optional[str] = None,
+    *,
+    authority: Optional[_KanbanAuthorityContext] = None,
+) -> Path:
     """Return the per-task attachment directory ``<root>/<task_id>/``."""
-    return attachments_root(board=board) / task_id
+    return attachments_root(board=board, authority=authority) / task_id
 
 
-def worker_logs_dir(board: Optional[str] = None) -> Path:
+def authoritative_attachment_path(
+    conn: sqlite3.Connection,
+    task_id: str,
+    stored_path: str,
+) -> Path:
+    """Resolve an attachment path and require it under its task root."""
+    authority = _connection_authority(conn)
+    try:
+        candidate = Path(stored_path).expanduser().resolve(strict=False)
+        task_root = task_attachments_dir(
+            task_id, authority=authority,
+        ).resolve()
+        candidate.relative_to(task_root)
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f"attachment path for task {task_id} is outside its authoritative task root"
+        ) from exc
+    if candidate == task_root:
+        raise ValueError(
+            f"attachment path for task {task_id} must name a file under its task root"
+        )
+    return candidate
+
+
+def worker_logs_dir(
+    board: Optional[str] = None,
+    *,
+    authority: Optional[_KanbanAuthorityContext] = None,
+) -> Path:
     """Return the directory under which per-task worker logs are written.
 
     ``default`` keeps the legacy path ``<root>/kanban/logs/``. Other
@@ -945,6 +1016,8 @@ def worker_logs_dir(board: Optional[str] = None) -> Path:
     board — makes ``hermes kanban log`` unambiguous even when multiple
     boards have tasks with the same id.
     """
+    if authority is not None:
+        return _authority_path(authority, "worker_logs_root", "worker log root")
     slug = _normalize_board_slug(board)
     if slug is None:
         slug = get_current_board()
@@ -1897,13 +1970,19 @@ def _bind_kanban_connection_board(
     ``HERMES_KANBAN_DB`` points somewhere else.
     """
     if authority is None:
-        authority = _KanbanAuthorityContext(
-            db_path=Path(db_path).expanduser().resolve(strict=False)
-            if db_path else Path("").resolve(),
-            board_slug=_normalize_board_slug(board),
-            kanban_home=None,
-            board_metadata_root=None,
-        )
+        if db_path:
+            try:
+                authority = _authority_context_for_connection(Path(db_path), board)
+            except (OSError, RuntimeError, ValueError):
+                authority = None
+        if authority is None:
+            authority = _KanbanAuthorityContext(
+                db_path=Path(db_path).expanduser().resolve(strict=False)
+                if db_path else Path("").resolve(),
+                board_slug=_normalize_board_slug(board),
+                kanban_home=None,
+                board_metadata_root=None,
+            )
     try:
         setattr(conn, "_hermes_kanban_authority", authority)
         setattr(conn, "_hermes_kanban_board", authority.board_slug)
@@ -4355,6 +4434,7 @@ def create_task(
         allow_unbound=allow_unbound_simple_task,
         require_bound=not allow_unbound_simple_task,
     )
+    authority = _connection_authority(conn)
     board_is_bound = _connection_has_board_binding(conn, board)
     idempotency_key = str(idempotency_key).strip() if idempotency_key else None
     if provider_override and not model_override:
@@ -4381,7 +4461,9 @@ def create_task(
     # (deterministic worktree + branch) without each surface repeating it.
     if project_id is None and board_is_bound:
         try:
-            _bmeta = _connection_board_metadata(conn, board_slug)
+            _bmeta = _connection_board_metadata(
+                conn, board_slug, authority=authority,
+            )
             if _bmeta is None:
                 raise ValueError("connection board metadata is unavailable")
             _board_project = (_bmeta.get("project_id") or "").strip()
@@ -4405,14 +4487,14 @@ def create_task(
     project_repo: Optional[str] = None
     if project_id is not None:
         project_id = str(project_id).strip() or None
+    requested_project_id = project_id
     if project_id:
-        project_db_path = _connection_projects_db_path(conn)
+        project_db_path = _connection_projects_db_path(
+            conn, authority=authority,
+        )
         project_db_paths = (
             [project_db_path] if project_db_path is not None else []
         )
-        fallback_project_db = _connection_project_db_fallback(conn)
-        if fallback_project_db is not None:
-            project_db_paths.append(fallback_project_db)
         for candidate_project_db in project_db_paths:
             try:
                 with _pdb.connect_closing(db_path=candidate_project_db) as _pconn:
@@ -4470,9 +4552,15 @@ def create_task(
                             workspace_kind = "worktree"
 
         if project_obj is None:
-            # A project id/slug that doesn't resolve must not crash task
-            # creation or persist a dangling reference — drop the link and
-            # create the task as an ordinary (scratch) task.
+            if requested_project_id:
+                raise ValueError(
+                    "project is not available in the connection-authorized "
+                    "project store: "
+                    f"{requested_project_id!r}"
+                )
+            # Board metadata may have supplied a stale project id. Do not
+            # persist a dangling reference; an ordinary task remains
+            # projectless and uses the board's scratch workspace.
             project_id = None
         else:
             # Canonicalise (a slug may have been passed) and anchor the
@@ -4555,7 +4643,9 @@ def create_task(
         and workspace_kind in {"dir", "worktree"}
         and board_is_bound
     ):
-        board_meta = _connection_board_metadata(conn, board_slug)
+        board_meta = _connection_board_metadata(
+            conn, board_slug, authority=authority,
+        )
         board_default = board_meta.get("default_workdir") if board_meta else None
         if board_default:
             workspace_path = str(board_default)
@@ -5959,7 +6049,10 @@ def store_attachment_bytes(
             f"attachment exceeds {max_bytes // (1024 * 1024)} MB limit"
         )
     safe_name = _safe_attachment_name(filename)
-    dest_dir = task_attachments_dir(task_id, board=board)
+    authority = _connection_authority(conn)
+    dest_dir = task_attachments_dir(
+        task_id, board=board, authority=authority,
+    )
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = _collision_free_path(dest_dir, safe_name)
     dest_path.write_bytes(data)
@@ -6003,6 +6096,7 @@ def add_attachment(
         raise ValueError("attachment filename is required")
     if not stored_path or not stored_path.strip():
         raise ValueError("attachment stored_path is required")
+    stored = authoritative_attachment_path(conn, task_id, stored_path)
     now = int(time.time())
     with write_txn(conn):
         if not conn.execute(
@@ -6016,7 +6110,7 @@ def add_attachment(
             (
                 task_id,
                 filename.strip(),
-                stored_path,
+                str(stored),
                 content_type,
                 int(size),
                 uploaded_by,
@@ -6075,20 +6169,24 @@ def delete_attachment(conn: sqlite3.Connection, attachment_id: int) -> Optional[
 
     Returns ``None`` when no row matched. The blob is removed best-effort
     (a missing file is not an error); the metadata row is the source of
-    truth for whether an attachment "exists".
+    truth for whether an attachment "exists". A connection-bound authority
+    must own the stored path; tampered rows are rejected without deleting
+    either the metadata or an out-of-root file.
     """
     with write_txn(conn):
         att = get_attachment(conn, attachment_id)
         if att is None:
             return None
+        stored = authoritative_attachment_path(
+            conn, att.task_id, att.stored_path,
+        )
         conn.execute("DELETE FROM task_attachments WHERE id = ?", (attachment_id,))
         _append_event(
             conn, att.task_id, "attachment_removed", {"filename": att.filename}
         )
     try:
-        p = Path(att.stored_path)
-        if p.is_file():
-            p.unlink()
+        if stored.is_file():
+            stored.unlink()
     except OSError:
         pass
     return att
@@ -8801,18 +8899,21 @@ def _invalid_reviewer_policy(
 
 def _reviewer_policy_source_path(
     conn: sqlite3.Connection,
+    *,
+    authority: Optional[_KanbanAuthorityContext] = None,
 ) -> Optional[Path]:
     """Return the policy source from the connection's immutable root.
 
     This is intentionally not ``kanban_home() / config.yaml``.  A worker is
     allowed to inherit or override ambient path variables, but the database
-    connection already identifies the board authority. Unbound arbitrary DBs
-    have no reviewer-policy source rather than guessing from ambient state.
+    connection already identifies the board authority. A fixed DB path may use
+    the config captured beside that DB; truly unbound connections have no
+    reviewer-policy source rather than guessing from ambient state.
     """
-    authority = _connection_authority(conn)
+    authority = authority or _connection_authority(conn)
     if authority is None or authority.kanban_home is None:
         return None
-    return authority.kanban_home / "config.yaml"
+    return authority.policy_source_path
 
 
 def _with_policy_source(
@@ -8983,6 +9084,7 @@ def _synchronize_reviewer_policy(
     conn: sqlite3.Connection,
     *,
     dry_run: bool = False,
+    authority: Optional[_KanbanAuthorityContext] = None,
 ) -> _ReviewerPolicySyncResult:
     """Initialize/update the durable policy from the connection-bound source.
 
@@ -8994,9 +9096,10 @@ def _synchronize_reviewer_policy(
     malformed/unreadable input becomes persisted INVALID state. Dry-run checks
     for a missing or stale durable snapshot but never writes it.
     """
-    source_path = _reviewer_policy_source_path(conn)
+    authority = authority or _connection_authority(conn)
+    source_path = _reviewer_policy_source_path(conn, authority=authority)
     parsed = _parse_reviewer_policy_source(source_path)
-    authority_db_path = _connection_db_path(conn)
+    authority_db_path = authority.db_path if authority is not None else _connection_db_path(conn)
     authority_db_value = str(authority_db_path) if authority_db_path else ""
     source_path_value = parsed.source_path
     profile_value = parsed.profile
@@ -9140,7 +9243,11 @@ def _synchronize_reviewer_policy(
     return _ReviewerPolicySyncResult(True)
 
 
-def _load_reviewer_policy(conn: sqlite3.Connection) -> _ReviewerPolicyResult:
+def _load_reviewer_policy(
+    conn: sqlite3.Connection,
+    *,
+    authority: Optional[_KanbanAuthorityContext] = None,
+) -> _ReviewerPolicyResult:
     """Read only the durable policy snapshot bound to *conn*.
 
     There is deliberately no ambient-path fallback.  Missing rows, authority
@@ -9150,8 +9257,9 @@ def _load_reviewer_policy(conn: sqlite3.Connection) -> _ReviewerPolicyResult:
     initialization/update path. Workers and lifecycle helpers only consume
     this DB-bound snapshot; they never re-resolve policy from ambient paths.
     """
-    source_path = _reviewer_policy_source_path(conn)
-    authority_db_path = _connection_db_path(conn)
+    authority = authority or _connection_authority(conn)
+    source_path = _reviewer_policy_source_path(conn, authority=authority)
+    authority_db_path = authority.db_path if authority is not None else _connection_db_path(conn)
     expected_db = str(authority_db_path) if authority_db_path else ""
     expected_source = str(source_path) if source_path is not None else None
     try:
@@ -9233,6 +9341,8 @@ def _load_reviewer_policy(conn: sqlite3.Connection) -> _ReviewerPolicyResult:
 
 def _configured_reviewer_profile(
     conn: sqlite3.Connection,
+    *,
+    authority: Optional[_KanbanAuthorityContext] = None,
 ) -> tuple[Optional[str], Optional[dict[str, str]]]:
     """Return the canonical pinned reviewer, or one bounded config failure.
 
@@ -9240,7 +9350,7 @@ def _configured_reviewer_profile(
     unchanged. Any explicit non-null value is a closed-world policy, so an
     invalid setting must not fall through to discovered reviewer profiles.
     """
-    policy = _load_reviewer_policy(conn)
+    policy = _load_reviewer_policy(conn, authority=authority)
     if policy.state is _ReviewerPolicyState.INVALID:
         return None, policy.failure or {
             "profile": "",
@@ -9419,11 +9529,13 @@ def failover_review_task(
     if _task_retirement_fenced(conn, task_id):
         return None
     if preflight["claim_lock"] is not None:
+        authority_context = _connection_authority(conn)
         if not _retire_review_launch_gate(
             conn,
             task_id,
             preflight["claim_lock"],
             reason="review failover",
+            authority=authority_context,
         ):
             return None
         # Legacy/custom reviewer hooks have no durable gate row.  They still
@@ -9636,6 +9748,7 @@ def release_stale_claims(
     extensions don't count). Safe to call often.
     """
     board_slug = _dependency_board(conn, board)
+    authority_context = _connection_authority(conn)
     now = int(time.time())
     reclaimed = 0
     review_reclaimed: dict[str, str] = {}
@@ -9864,7 +9977,9 @@ def release_stale_claims(
             )
             if gate_to_retire is not None:
                 if gate_to_retire["state"] in ("attached", "authorized", "prepared", "revalidation_failed"):
-                    _cleanup_review_launch_workspace(gate_to_retire)
+                    _cleanup_review_launch_workspace(
+                        gate_to_retire, authority=authority_context,
+                    )
                 _REVIEW_LAUNCH_HANDLES.pop(int(gate_to_retire["gate_pid"]), None)
             reclaimed += 1
             if row["status"] == "review":
@@ -9899,6 +10014,7 @@ def reclaim_task(
     reclaimable state (not running, or doesn't exist).
     """
     _dependency_board(conn, board)
+    authority_context = _connection_authority(conn)
     row = conn.execute(
         "SELECT status, claim_lock, worker_pid, worker_boot_id, "
         "worker_starttime, recovery_required FROM tasks WHERE id = ?",
@@ -10011,7 +10127,9 @@ def reclaim_task(
     _clear_failure_counter(conn, task_id)
     if gate_to_retire is not None:
         if gate_to_retire["state"] in ("attached", "authorized", "prepared", "revalidation_failed"):
-            _cleanup_review_launch_workspace(gate_to_retire)
+            _cleanup_review_launch_workspace(
+                gate_to_retire, authority=authority_context,
+            )
         _REVIEW_LAUNCH_HANDLES.pop(int(gate_to_retire["gate_pid"]), None)
     return True
 
@@ -10235,6 +10353,7 @@ def complete_task(
     """
     now = int(time.time())
     board_slug = _dependency_board(conn, board)
+    authority = _connection_authority(conn)
 
     # Reviewers must decide through approve/request-changes. This guard is the
     # first operation in the write transaction so even a hallucinated
@@ -10290,7 +10409,12 @@ def complete_task(
         verified_cards = []
 
     metadata = _merge_completion_prose_artifacts(
-        conn, task_id, metadata, summary=summary, result=result,
+        conn,
+        task_id,
+        metadata,
+        summary=summary,
+        result=result,
+        authority=authority,
     )
     with write_txn(conn):
         if _task_retirement_fenced(conn, task_id):
@@ -10335,7 +10459,9 @@ def complete_task(
         if cur.rowcount != 1:
             return False
         if isinstance(metadata, dict):
-            _persist_scratch_completion_artifacts(conn, task_id, metadata)
+            _persist_scratch_completion_artifacts(
+                conn, task_id, metadata, authority=authority,
+            )
             for stored_path in metadata.pop("_staged_artifacts", []):
                 path = Path(stored_path)
                 _insert_completion_attachment(
@@ -10423,7 +10549,7 @@ def complete_task(
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn, board=board_slug)
     # Clean up the scratch workspace and any stale tmux session for the worker.
-    _cleanup_workspace(conn, task_id)
+    _cleanup_workspace(conn, task_id, authority=authority)
     _done_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_completed",
@@ -10448,6 +10574,7 @@ def _merge_completion_prose_artifacts(
     *,
     summary: Optional[str],
     result: Optional[str],
+    authority: Optional[_KanbanAuthorityContext] = None,
 ) -> Optional[dict]:
     """Promote existing scratch files named in legacy completion prose.
 
@@ -10462,7 +10589,8 @@ def _merge_completion_prose_artifacts(
     if not row or row["workspace_kind"] != "scratch" or not row["workspace_path"]:
         return metadata
     workspace = Path(row["workspace_path"]).expanduser()
-    if not _is_managed_scratch_path(workspace):
+    authority = authority or _connection_authority(conn)
+    if not _is_managed_scratch_path(workspace, authority=authority):
         return metadata
     text = "\n".join(part for part in (summary, result) if part)
     if not text:
@@ -10492,6 +10620,8 @@ def _persist_scratch_completion_artifacts(
     conn: sqlite3.Connection,
     task_id: str,
     metadata: dict,
+    *,
+    authority: Optional[_KanbanAuthorityContext] = None,
 ) -> None:
     """Copy scratch-workspace completion artifacts before cleanup removes them."""
     raw_artifacts = metadata.get("artifacts")
@@ -10506,7 +10636,9 @@ def _persist_scratch_completion_artifacts(
         return
 
     workspace = Path(row["workspace_path"]).expanduser()
-    is_managed, board = _managed_scratch_path_info(workspace)
+    is_managed, board = _managed_scratch_path_info(
+        workspace, authority=authority,
+    )
     if not is_managed:
         return
 
@@ -10515,7 +10647,9 @@ def _persist_scratch_completion_artifacts(
     except OSError:
         return
 
-    attachment_dir = task_attachments_dir(task_id, board=board)
+    attachment_dir = task_attachments_dir(
+        task_id, board=board, authority=authority,
+    )
     persisted: list[str] = []
     used_destinations: set[Path] = set()
     changed = False
@@ -10607,11 +10741,12 @@ def _insert_completion_attachment(
     created_at: int,
 ) -> None:
     """Record a worker-produced artifact in the existing attachment table."""
+    stored = authoritative_attachment_path(conn, task_id, stored_path)
     conn.execute(
         "INSERT INTO task_attachments "
         "(task_id, filename, stored_path, content_type, size, uploaded_by, created_at) "
         "VALUES (?, ?, ?, NULL, ?, 'kanban_complete', ?)",
-        (task_id, filename, stored_path, size, created_at),
+        (task_id, filename, str(stored), size, created_at),
     )
     _append_event(
         conn,
@@ -10638,47 +10773,59 @@ def _unique_attachment_path(directory: Path, filename: str, used: set[Path]) -> 
         idx += 1
 
 
-def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
+def _managed_scratch_path_info(
+    p: Path,
+    *,
+    authority: Optional[_KanbanAuthorityContext] = None,
+) -> tuple[bool, Optional[str]]:
     """Return whether *p* is managed scratch storage and the matching board."""
     try:
         p_abs = p.resolve(strict=False)
     except OSError:
         return False, None
     roots: list[tuple[Path, Optional[str]]] = []
-    override = os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT", "").strip()
-    if override:
+    if authority is not None:
+        if authority.workspaces_root is None:
+            return False, None
         try:
-            roots.append((Path(override).expanduser().resolve(strict=False), None))
+            roots.append((authority.workspaces_root.resolve(strict=False), authority.board_slug))
         except OSError:
-            pass
-    try:
-        home = kanban_home()
-    except OSError:
-        home = None
-    if home is not None:
-        try:
-            roots.append(((home / "kanban" / "workspaces").resolve(strict=False), DEFAULT_BOARD))
-        except OSError:
-            pass
-        try:
-            boards_parent = (home / "kanban" / "boards").resolve(strict=False)
-        except OSError:
-            boards_parent = None
-        if boards_parent is not None:
+            return False, None
+    else:
+        override = os.environ.get("HERMES_KANBAN_WORKSPACES_ROOT", "").strip()
+        if override:
             try:
-                entries = list(boards_parent.iterdir())
+                roots.append((Path(override).expanduser().resolve(strict=False), None))
             except OSError:
-                entries = []
-            for entry in entries:
+                pass
+        try:
+            home = kanban_home()
+        except OSError:
+            home = None
+        if home is not None:
+            try:
+                roots.append(((home / "kanban" / "workspaces").resolve(strict=False), DEFAULT_BOARD))
+            except OSError:
+                pass
+            try:
+                boards_parent = (home / "kanban" / "boards").resolve(strict=False)
+            except OSError:
+                boards_parent = None
+            if boards_parent is not None:
                 try:
-                    if not entry.is_dir():
+                    entries = list(boards_parent.iterdir())
+                except OSError:
+                    entries = []
+                for entry in entries:
+                    try:
+                        if not entry.is_dir():
+                            continue
+                    except OSError:
                         continue
-                except OSError:
-                    continue
-                try:
-                    roots.append(((entry / "workspaces").resolve(strict=False), entry.name))
-                except OSError:
-                    continue
+                    try:
+                        roots.append(((entry / "workspaces").resolve(strict=False), entry.name))
+                    except OSError:
+                        continue
     for root, board in roots:
         if p_abs == root:
             continue
@@ -10690,7 +10837,11 @@ def _managed_scratch_path_info(p: Path) -> tuple[bool, Optional[str]]:
     return False, None
 
 
-def _is_managed_scratch_path(p: Path) -> bool:
+def _is_managed_scratch_path(
+    p: Path,
+    *,
+    authority: Optional[_KanbanAuthorityContext] = None,
+) -> bool:
     """Return True iff *p* is a strict descendant of a kanban-managed scratch root.
 
     A managed root is exclusively a ``workspaces/`` directory — never the
@@ -10715,11 +10866,16 @@ def _is_managed_scratch_path(p: Path) -> bool:
     real source tree can otherwise pair with ``workspace_kind='scratch'`` and
     cause task completion to delete user data (#28818).
     """
-    is_managed, _board = _managed_scratch_path_info(p)
+    is_managed, _board = _managed_scratch_path_info(p, authority=authority)
     return is_managed
 
 
-def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
+def _cleanup_workspace(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    authority: Optional[_KanbanAuthorityContext] = None,
+) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
 
     Called from :func:`complete_task` after the DB transaction commits.
@@ -10740,7 +10896,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # This task's own workspace isn't a removable scratch dir, but its
             # completion may still unblock a deferred parent scratch cleanup
             # (e.g. a 'dir' child whose scratch parent was waiting on it). #33774
-            _try_cleanup_parent_workspaces(conn, task_id)
+            _try_cleanup_parent_workspaces(conn, task_id, authority=authority)
             return
         # Check if this task has children that still need the workspace.
         # If any child is not yet done/archived, defer cleanup so the
@@ -10767,7 +10923,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # pointing at a real source tree. Without this check, task
             # completion would unconditionally ``shutil.rmtree`` that path
             # and silently delete the user's source data.
-            if _is_managed_scratch_path(wp):
+            if _is_managed_scratch_path(wp, authority=authority):
                 shutil.rmtree(wp, ignore_errors=True)
                 _log.debug("Removed scratch workspace: %s", wp)
             else:
@@ -10783,12 +10939,17 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         # After cleaning up this task's workspace, check if any parent
         # tasks now have all children done — their deferred cleanup can
         # proceed (#33774).
-        _try_cleanup_parent_workspaces(conn, task_id)
+        _try_cleanup_parent_workspaces(conn, task_id, authority=authority)
     except Exception:
         pass  # best-effort — never block completion
 
 
-def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> None:
+def _try_cleanup_parent_workspaces(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    authority: Optional[_KanbanAuthorityContext] = None,
+) -> None:
     """Clean up parent scratch workspaces now that *task_id* completed.
 
     When a parent task's cleanup was deferred because it had active children,
@@ -10821,7 +10982,7 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             # All children done — safe to clean up parent workspace
             import shutil
             wp = Path(row["workspace_path"])
-            if wp.is_dir() and _is_managed_scratch_path(wp):
+            if wp.is_dir() and _is_managed_scratch_path(wp, authority=authority):
                 shutil.rmtree(wp, ignore_errors=True)
                 _log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
     except Exception:
@@ -10883,32 +11044,42 @@ _SCRATCH_TIP_MESSAGE = (
 )
 
 
-def _scratch_tip_sentinel_path() -> Path:
+def _scratch_tip_sentinel_path(
+    authority: Optional[_KanbanAuthorityContext] = None,
+) -> Path:
     """Path to the per-install scratch-workspace-tip sentinel file."""
+    if authority is not None:
+        if authority.kanban_home is None:
+            raise ValueError("connection authority has no Kanban home")
+        return authority.kanban_home / _SCRATCH_TIP_SENTINEL_NAME
     return kanban_home() / _SCRATCH_TIP_SENTINEL_NAME
 
 
-def _scratch_tip_shown() -> bool:
+def _scratch_tip_shown(
+    authority: Optional[_KanbanAuthorityContext] = None,
+) -> bool:
     """True iff the scratch-workspace tip has already been emitted on this
     install. Best-effort — any error means we re-emit, which is the safer
     failure mode for a help message."""
     try:
-        return _scratch_tip_sentinel_path().exists()
-    except OSError:
+        return _scratch_tip_sentinel_path(authority).exists()
+    except (OSError, ValueError):
         return False
 
 
-def _mark_scratch_tip_shown() -> None:
+def _mark_scratch_tip_shown(
+    authority: Optional[_KanbanAuthorityContext] = None,
+) -> None:
     """Touch the sentinel so future scratch workspaces stay silent.
 
     Best-effort: a failure here just means the tip might appear once more,
     which is preferable to crashing dispatch over a help message.
     """
     try:
-        path = _scratch_tip_sentinel_path()
+        path = _scratch_tip_sentinel_path(authority)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch(exist_ok=True)
-    except OSError:
+    except (OSError, ValueError):
         pass
 
 
@@ -10916,6 +11087,8 @@ def _maybe_emit_scratch_tip(
     conn: sqlite3.Connection,
     task_id: str,
     workspace_kind: Optional[str],
+    *,
+    authority: Optional[_KanbanAuthorityContext] = None,
 ) -> None:
     """Emit the first-use scratch-workspace tip exactly once per install.
 
@@ -10925,7 +11098,7 @@ def _maybe_emit_scratch_tip(
     """
     if (workspace_kind or "scratch") != "scratch":
         return
-    if _scratch_tip_shown():
+    if _scratch_tip_shown(authority):
         return
     try:
         _log.warning("kanban: %s (task %s)", _SCRATCH_TIP_MESSAGE, task_id)
@@ -10938,7 +11111,7 @@ def _maybe_emit_scratch_tip(
         # Best-effort — never block the spawn loop over a help message.
         pass
     finally:
-        _mark_scratch_tip_shown()
+        _mark_scratch_tip_shown(authority)
 
 
 def _try_direct_review_required_handoff(
@@ -12153,6 +12326,7 @@ def _workspace_base_pin_for_task(
     *,
     board: Optional[str] = None,
     conn: Optional[sqlite3.Connection] = None,
+    authority: Optional[_KanbanAuthorityContext] = None,
 ) -> Optional[KanbanWorkspaceBasePin]:
     binding = task.dependency_binding
     if binding is None:
@@ -12164,7 +12338,9 @@ def _workspace_base_pin_for_task(
         )
     if not isinstance(binding, dict):
         raise RuntimeError(f"task {task.id} has a malformed dependency binding")
-    expected_board = _dependency_board_for_workspace(board, conn=conn)
+    expected_board = _dependency_board_for_workspace(
+        board, conn=conn, authority=authority,
+    )
     _validate_dependency_binding(
         task,
         binding,
@@ -12191,10 +12367,25 @@ def _workspace_base_pin_for_task(
 
 
 def _dependency_board_for_workspace(
-    board: Optional[str], *, conn: Optional[sqlite3.Connection] = None
+    board: Optional[str],
+    *,
+    conn: Optional[sqlite3.Connection] = None,
+    authority: Optional[_KanbanAuthorityContext] = None,
 ) -> str:
     if conn is not None:
         return _dependency_board(conn, board)
+    if authority is not None:
+        if authority.board_slug is None:
+            raise ValueError(
+                "connection authority has no bound board for workspace resolution"
+            )
+        explicit = _normalize_board_slug(board)
+        if explicit is not None and explicit != authority.board_slug:
+            raise ValueError(
+                f"workspace board {explicit!r} does not match connection "
+                f"board {authority.board_slug!r}"
+            )
+        return authority.board_slug
     explicit = _normalize_board_slug(board)
     return explicit or get_current_board()
 
@@ -12263,6 +12454,7 @@ def _resolve_worktree_workspace(
     board: Optional[str] = None,
     materialize: bool = True,
     conn: Optional[sqlite3.Connection] = None,
+    authority: Optional[_KanbanAuthorityContext] = None,
 ) -> tuple[Path, str]:
     """Resolve a linked git worktree for ``task``.
 
@@ -12280,14 +12472,20 @@ def _resolve_worktree_workspace(
     anywhere, we fail loudly rather than guess.
     """
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
-    base_pin = _workspace_base_pin_for_task(task, board=board, conn=conn)
+    base_pin = _workspace_base_pin_for_task(
+        task, board=board, conn=conn, authority=authority,
+    )
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
         # The dispatcher's CWD is incidental (gateway launch dir) and using it
         # scatters worktrees under whatever repo the gateway started in.
-        board_slug = _dependency_board_for_workspace(board, conn=conn)
+        board_slug = _dependency_board_for_workspace(
+            board, conn=conn, authority=authority,
+        )
         board_metadata = (
-            _connection_board_metadata(conn, board_slug)
+            _connection_board_metadata(
+                conn, board_slug, authority=authority,
+            )
             if conn is not None
             else read_board_metadata(board_slug)
         )
@@ -12407,6 +12605,7 @@ def resolve_workspace(
     board: Optional[str] = None,
     materialize: bool = True,
     conn: Optional[sqlite3.Connection] = None,
+    authority: Optional[_KanbanAuthorityContext] = None,
 ) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
@@ -12435,11 +12634,16 @@ def resolve_workspace(
     dependency binding must be resolved with the board-bound ``conn`` used by
     the CLI/dispatcher; the public no-connection form fails closed.
     """
-    board_slug = _dependency_board_for_workspace(board, conn=conn)
+    authority = authority or (_connection_authority(conn) if conn is not None else None)
+    board_slug = _dependency_board_for_workspace(
+        board, conn=conn, authority=authority,
+    )
     kind = task.workspace_kind or "scratch"
     # Validate any admitted provider binding even for non-worktree workspace
     # kinds. A provider cannot smuggle an unused pin through admission.
-    _workspace_base_pin_for_task(task, board=board_slug, conn=conn)
+    _workspace_base_pin_for_task(
+        task, board=board_slug, conn=conn, authority=authority,
+    )
     if kind == "scratch":
         if task.workspace_path:
             # Legacy scratch tasks that were set to an explicit path get the
@@ -12452,7 +12656,9 @@ def resolve_workspace(
                     f"{task.workspace_path!r}; workspace paths must be absolute"
                 )
         else:
-            p = workspaces_root(board=board_slug) / task.id
+            p = workspaces_root(
+                board=board_slug, authority=authority,
+            ) / task.id
         if materialize:
             p.mkdir(parents=True, exist_ok=True)
         return p
@@ -12473,7 +12679,11 @@ def resolve_workspace(
         return p
     if kind == "worktree":
         p, _branch_name = _resolve_worktree_workspace(
-            task, board=board_slug, materialize=materialize, conn=conn,
+            task,
+            board=board_slug,
+            materialize=materialize,
+            conn=conn,
+            authority=authority,
         )
         return p
     raise ValueError(f"unknown workspace_kind: {kind}")
@@ -13172,6 +13382,7 @@ def enforce_max_runtime(
     exact-identity pidfd.
     """
     board_slug = _dependency_board(conn, board)
+    authority_context = _connection_authority(conn)
     timed_out: list[str] = []
     review_timeouts: dict[str, str] = {}
     now = int(time.time())
@@ -13296,7 +13507,9 @@ def enforce_max_runtime(
                 )
                 if gate_to_retire is not None:
                     if gate_to_retire["state"] in ("attached", "authorized", "prepared", "revalidation_failed"):
-                        _cleanup_review_launch_workspace(gate_to_retire)
+                        _cleanup_review_launch_workspace(
+                            gate_to_retire, authority=authority_context,
+                        )
                     _REVIEW_LAUNCH_HANDLES.pop(int(gate_to_retire["gate_pid"]), None)
                 timed_out.append(tid)
                 if row["status"] == "review":
@@ -13366,6 +13579,7 @@ def detect_stale_running(
     allowed only through a verified exact-identity pidfd.
     """
     board_slug = _dependency_board(conn, board)
+    authority_context = _connection_authority(conn)
     if stale_timeout_seconds <= 0:
         return []
 
@@ -13520,7 +13734,9 @@ def detect_stale_running(
             )
             if gate_to_retire is not None:
                 if gate_to_retire["state"] in ("attached", "authorized", "prepared", "revalidation_failed"):
-                    _cleanup_review_launch_workspace(gate_to_retire)
+                    _cleanup_review_launch_workspace(
+                        gate_to_retire, authority=authority_context,
+                    )
                 _REVIEW_LAUNCH_HANDLES.pop(int(gate_to_retire["gate_pid"]), None)
             reclaimed.append(tid)
             if row["status"] == "review":
@@ -13710,6 +13926,7 @@ def detect_crashed_workers(
     (the public return stays the crashed-only ``list[str]``).
     """
     board_slug = _dependency_board(conn, board)
+    authority_context = _connection_authority(conn)
     crashed: list[str] = []
     rate_limited: list[str] = []
     # Per-crash details collected inside the main txn, used after it
@@ -13880,7 +14097,9 @@ def detect_crashed_workers(
                 )
                 if gate_row is not None:
                     if gate_row["state"] in ("attached", "authorized", "prepared", "revalidation_failed"):
-                        _cleanup_review_launch_workspace(gate_row)
+                        _cleanup_review_launch_workspace(
+                            gate_row, authority=authority_context,
+                        )
                     _REVIEW_LAUNCH_HANDLES.pop(int(gate_row["gate_pid"]), None)
                 if rate_limited_exit:
                     # Stamp the failure-error column so ``check_respawn_guard``
@@ -14725,6 +14944,7 @@ def _spawn_review_gate_and_attach(
     *,
     board: Optional[str],
     authority: tuple[int, str],
+    authority_context: Optional[_KanbanAuthorityContext] = None,
 ) -> Optional[tuple[int, str]]:
     """Spawn a dormant child and attach it while the claim CAS is locked.
 
@@ -14754,6 +14974,7 @@ def _spawn_review_gate_and_attach(
                 task,
                 str(workspace),
                 board=board,
+                authority_context=authority_context,
                 launch_gate=True,
                 launch_token=token,
                 launch_authority_id=int(authority[0]),
@@ -14863,6 +15084,7 @@ def _materialize_review_launch_workspace(
     pid: int,
     gate_token: str,
     authority: tuple[int, str],
+    authority_context: Optional[_KanbanAuthorityContext] = None,
 ) -> bool:
     """Materialize only an authorized generation, under the DB writer lock."""
     run_id = task.current_run_id
@@ -14892,10 +15114,20 @@ def _materialize_review_launch_workspace(
         before_exists = planned_workspace.exists()
         if current.workspace_kind == "worktree":
             actual, branch_name = _resolve_worktree_workspace(
-                current, board=board, materialize=True, conn=conn,
+                current,
+                board=board,
+                materialize=True,
+                conn=conn,
+                authority=authority_context,
             )
         else:
-            actual = resolve_workspace(current, board=board, materialize=True, conn=conn)
+            actual = resolve_workspace(
+                current,
+                board=board,
+                materialize=True,
+                conn=conn,
+                authority=authority_context,
+            )
             branch_name = current.branch_name
         if actual.resolve(strict=False) != planned_workspace.resolve(strict=False):
             raise RuntimeError(
@@ -15013,12 +15245,23 @@ def _release_review_launch(
     return True
 
 
-def _cleanup_review_launch_workspace(gate: sqlite3.Row) -> None:
+def _cleanup_review_launch_workspace(
+    gate: sqlite3.Row,
+    *,
+    authority: Optional[_KanbanAuthorityContext] = None,
+) -> None:
     """Remove only a workspace created by a gate that never reached release."""
     if not bool(gate["workspace_created"]) or not gate["workspace_path"]:
         return
     path = Path(str(gate["workspace_path"]))
     kind = str(gate["workspace_kind"] or "scratch")
+    if kind == "scratch" and not _is_managed_scratch_path(path, authority=authority):
+        _log.warning(
+            "kanban: refusing to clean review scratch workspace outside "
+            "the connection-authorized root: %s",
+            path,
+        )
+        return
     if kind == "worktree":
         repo_root = _repo_root_for_worktree_target(path.parent)
         if repo_root is not None:
@@ -15047,6 +15290,7 @@ def _retire_review_launch_gate(
     claim_lock: Optional[str],
     *,
     reason: str,
+    authority: Optional[_KanbanAuthorityContext] = None,
 ) -> bool:
     """Close/reap one gate before any lifecycle transition may proceed."""
     gate = conn.execute(
@@ -15095,7 +15339,7 @@ def _retire_review_launch_gate(
             (task_id, claim_lock, int(gate["gate_pid"])),
         )
     if gate["state"] in ("attached", "authorized", "prepared", "revalidation_failed"):
-        _cleanup_review_launch_workspace(gate)
+        _cleanup_review_launch_workspace(gate, authority=authority)
     _REVIEW_LAUNCH_HANDLES.pop(int(gate["gate_pid"]), None)
     return True
 
@@ -15627,7 +15871,16 @@ def dispatch_once(
     cross-process / cross-platform mechanics.
     """
     board_slug = _dependency_board(conn, board)
-    db_path = _connection_db_path(conn) or kanban_db_path(board=board_slug)
+    authority_context = _connection_authority(conn)
+    db_path = (
+        authority_context.db_path
+        if authority_context is not None
+        else _connection_db_path(conn)
+    )
+    if db_path is None:
+        raise ValueError(
+            "connection-bound dispatch requires an authoritative database path"
+        )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
             return DispatchResult(skipped_locked=True)
@@ -15636,7 +15889,9 @@ def dispatch_once(
         # consume the existing row and fail closed if it is missing or
         # mismatched. Dry-run performs the same comparison read-only so it
         # cannot report a stale reviewer as admissible.
-        policy_sync = _synchronize_reviewer_policy(conn, dry_run=dry_run)
+        policy_sync = _synchronize_reviewer_policy(
+            conn, dry_run=dry_run, authority=authority_context,
+        )
         if not policy_sync.synchronized:
             result = DispatchResult(
                 policy_sync_failed=True,
@@ -15668,6 +15923,7 @@ def dispatch_once(
             board=board_slug,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            authority_context=authority_context,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
         # at a coarse interval so it cannot grow unbounded between restarts.
@@ -15688,6 +15944,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    authority_context: Optional[_KanbanAuthorityContext] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -15719,6 +15976,7 @@ def _dispatch_once_locked(
     """
     board_slug = _dependency_board(conn, board)
     board = board_slug
+    authority_context = authority_context or _connection_authority(conn)
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
@@ -16032,9 +16290,13 @@ def _dispatch_once_locked(
             if claimed.workspace_kind == "worktree":
                 workspace, resolved_branch_name = _resolve_worktree_workspace(
                     claimed, board=board, conn=conn,
+                    authority=authority_context,
                 )
             else:
-                workspace = resolve_workspace(claimed, board=board, conn=conn)
+                workspace = resolve_workspace(
+                    claimed, board=board, conn=conn,
+                    authority=authority_context,
+                )
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
@@ -16047,7 +16309,10 @@ def _dispatch_once_locked(
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
-        _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        _maybe_emit_scratch_tip(
+            conn, claimed.id, claimed.workspace_kind,
+            authority=authority_context,
+        )
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
@@ -16057,10 +16322,21 @@ def _dispatch_once_locked(
             try:
                 sig = inspect.signature(_spawn)
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
+                    spawn_kwargs: dict[str, Any] = {"board": board}
+                    if "authority_context" in sig.parameters:
+                        spawn_kwargs["authority_context"] = authority_context
+                    pid = _spawn(claimed, str(workspace), **spawn_kwargs)
+                elif "authority_context" in sig.parameters:
+                    pid = _spawn(
+                        claimed,
+                        str(workspace),
+                        authority_context=authority_context,
+                    )
                 else:
                     pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
+                if _spawn is _default_spawn:
+                    raise
                 pid = _spawn(claimed, str(workspace))
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
@@ -16216,18 +16492,34 @@ def _dispatch_once_locked(
                 if spawn_fn is None:
                     if claimed.workspace_kind == "worktree":
                         workspace, resolved_branch_name = _resolve_worktree_workspace(
-                            claimed, board=board, materialize=False, conn=conn,
+                            claimed,
+                            board=board,
+                            materialize=False,
+                            conn=conn,
+                            authority=authority_context,
                         )
                     else:
                         workspace = resolve_workspace(
-                            claimed, board=board, materialize=False, conn=conn,
+                            claimed,
+                            board=board,
+                            materialize=False,
+                            conn=conn,
+                            authority=authority_context,
                         )
                 elif claimed.workspace_kind == "worktree":
                     workspace, resolved_branch_name = _resolve_worktree_workspace(
-                        claimed, board=board, conn=conn,
+                        claimed,
+                        board=board,
+                        conn=conn,
+                        authority=authority_context,
                     )
                 else:
-                    workspace = resolve_workspace(claimed, board=board, conn=conn)
+                    workspace = resolve_workspace(
+                        claimed,
+                        board=board,
+                        conn=conn,
+                        authority=authority_context,
+                    )
 
                 claimed.skills = ["sdlc-review"]
                 if not _authorize_review_spawn(
@@ -16255,6 +16547,7 @@ def _dispatch_once_locked(
                         workspace,
                         board=board,
                         authority=expected_authority,
+                        authority_context=authority_context,
                     )
                     if gate_binding is None:
                         attempted.append({
@@ -16282,6 +16575,7 @@ def _dispatch_once_locked(
                             claimed.id,
                             claimed.claim_lock,
                             reason="review launch authorization changed before release",
+                            authority=authority_context,
                         )
                         attempted.append({
                             "profile": reviewer,
@@ -16300,6 +16594,7 @@ def _dispatch_once_locked(
                         pid=pid,
                         gate_token=gate_token,
                         authority=expected_authority,
+                        authority_context=authority_context,
                     ):
                         raise RuntimeError("review launch workspace preparation CAS refused")
                     if not _release_review_launch(
@@ -16322,16 +16617,30 @@ def _dispatch_once_locked(
                             or (claimed.branch_name or "").strip()
                             or f"wt/{claimed.id}",
                         )
-                    _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+                    _maybe_emit_scratch_tip(
+                        conn, claimed.id, claimed.workspace_kind,
+                        authority=authority_context,
+                    )
                     _spawn = spawn_fn
                     import inspect
                     try:
                         sig = inspect.signature(_spawn)
                         if "board" in sig.parameters:
-                            pid = _spawn(claimed, str(workspace), board=board)
+                            spawn_kwargs: dict[str, Any] = {"board": board}
+                            if "authority_context" in sig.parameters:
+                                spawn_kwargs["authority_context"] = authority_context
+                            pid = _spawn(claimed, str(workspace), **spawn_kwargs)
+                        elif "authority_context" in sig.parameters:
+                            pid = _spawn(
+                                claimed,
+                                str(workspace),
+                                authority_context=authority_context,
+                            )
                         else:
                             pid = _spawn(claimed, str(workspace))
                     except (TypeError, ValueError):
+                        if _spawn is _default_spawn:
+                            raise
                         pid = _spawn(claimed, str(workspace))
                     if pid:
                         pid = int(pid)
@@ -16711,6 +17020,7 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
+    authority_context: Optional[_KanbanAuthorityContext] = None,
     launch_gate: bool = False,
     launch_token: Optional[str] = None,
     launch_authority_id: Optional[int] = None,
@@ -16827,18 +17137,34 @@ def _default_spawn(
     # dispatcher's. Belt-and-braces with the `get_default_hermes_root()`
     # resolution in `kanban_home()` — symmetric resolution is the norm,
     # but unusual symlink / Docker layouts are caught here too.
-    resolved_kanban_home = kanban_home()
+    if authority_context is not None:
+        resolved_kanban_home = _authority_path(
+            authority_context, "kanban_home", "Kanban home",
+        )
+        resolved_db_path = authority_context.db_path
+        resolved_workspaces_root = workspaces_root(authority=authority_context)
+        resolved_board = authority_context.board_slug
+        if resolved_board is None:
+            raise ValueError(
+                "connection authority has no bound board for worker spawn"
+            )
+        resolved_log_dir = worker_logs_dir(authority=authority_context)
+    else:
+        resolved_kanban_home = kanban_home()
+        resolved_db_path = kanban_db_path(board=board)
+        resolved_workspaces_root = workspaces_root(board=board)
+        resolved_board = _normalize_board_slug(board) or get_current_board()
+        resolved_log_dir = worker_logs_dir(board=board)
     # Reviewer policy is dispatcher-owned control-plane state. Propagate the
     # existing board-root authority instead of copying config into the worker
     # profile or adding a second policy environment variable.
     env["HERMES_KANBAN_HOME"] = str(resolved_kanban_home)
-    env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
-    env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
+    env["HERMES_KANBAN_DB"] = str(resolved_db_path)
+    env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(resolved_workspaces_root)
     _retag_legacy_worker_sessions(env["HERMES_KANBAN_WORKSPACES_ROOT"])
     # Board slug — the final defense-in-depth pin. If the worker ever
     # resolves kanban paths without the DB / workspaces env vars, the
     # board slug still forces it to the right directory.
-    resolved_board = _normalize_board_slug(board) or get_current_board()
     env["HERMES_KANBAN_BOARD"] = resolved_board
     # HERMES_PROFILE is the author the kanban_comment tool defaults to.
     # `hermes -p <assignee>` activates the profile, but the env var is
@@ -16903,7 +17229,7 @@ def _default_spawn(
     # Redirect output to a per-task log under <board-root>/logs/.  A dormant
     # gate must not create the log directory or open the file yet; the gate
     # child performs that work only after startup revalidation and release.
-    log_dir = worker_logs_dir(board=board)
+    log_dir = resolved_log_dir
     log_path = log_dir / f"{task.id}.log"
 
     if launch_gate:
@@ -16912,7 +17238,7 @@ def _default_spawn(
         gate_env = {
             "HERMES_LAUNCH_GATE_PARENT_PID": str(os.getpid()),
             "HERMES_LAUNCH_GATE_TOKEN": str(launch_token),
-            "HERMES_LAUNCH_GATE_DB": str(kanban_db_path(board=board)),
+            "HERMES_LAUNCH_GATE_DB": str(resolved_db_path),
             "HERMES_LAUNCH_GATE_TASK_ID": task.id,
             "HERMES_LAUNCH_GATE_RUN_ID": str(task.current_run_id),
             "HERMES_LAUNCH_GATE_CLAIM": str(task.claim_lock),
@@ -17150,7 +17476,20 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             size_kb = max(1, (att.size + 1023) // 1024) if att.size else 0
             size_str = f", {size_kb} KB" if size_kb else ""
             ctype = f", {att.content_type}" if att.content_type else ""
-            lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
+            try:
+                authoritative_path = authoritative_attachment_path(
+                    conn, att.task_id, att.stored_path,
+                )
+            except ValueError:
+                lines.append(
+                    f"- `{att.filename}`{ctype}{size_str} → "
+                    "(attachment path unavailable)"
+                )
+                continue
+            lines.append(
+                f"- `{att.filename}`{ctype}{size_str} → "
+                f"`{authoritative_path}`"
+            )
         lines.append("")
 
     # Prior attempts — show closed runs so a retrying worker sees the

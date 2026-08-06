@@ -20,14 +20,16 @@ def kanban_conn(tmp_path):
         c.close()
 
 
-def _make_project(name="Web App", repo="/tmp/webapp"):
-    with pdb.connect_closing() as pc:
+def _make_project(projects_db_path, name="Web App", repo="/tmp/webapp"):
+    with pdb.connect_closing(db_path=projects_db_path) as pc:
         pid = pdb.create_project(pc, name=name, folders=[repo])
         return pdb.get_project(pc, pid)
 
 
-def test_project_linked_task_gets_deterministic_worktree_and_branch(kanban_conn):
-    proj = _make_project()
+def test_project_linked_task_gets_deterministic_worktree_and_branch(
+    kanban_conn, tmp_path
+):
+    proj = _make_project(tmp_path / "projects.db")
     tid = kb.create_task(kanban_conn, title="Add login", project_id=proj.slug)
     task = kb.get_task(kanban_conn, tid)
 
@@ -40,8 +42,8 @@ def test_project_linked_task_gets_deterministic_worktree_and_branch(kanban_conn)
     assert not task.branch_name.startswith("wt/")
 
 
-def test_explicit_branch_overrides_project_default(kanban_conn):
-    proj = _make_project()
+def test_explicit_branch_overrides_project_default(kanban_conn, tmp_path):
+    proj = _make_project(tmp_path / "projects.db")
     tid = kb.create_task(
         kanban_conn,
         title="x",

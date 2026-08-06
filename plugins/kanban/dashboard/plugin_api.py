@@ -718,12 +718,14 @@ async def upload_task_attachment(
 ):
     """Store an uploaded file for a task and record its metadata.
 
-    The blob lands under ``attachments_root(board)/<task_id>/`` with a
-    sanitised, collision-resolved name. The worker reads it via the
-    absolute path surfaced in ``build_worker_context``.
+    The blob lands under the connection's authoritative
+    ``attachments_root(board)/<task_id>/`` with a sanitised,
+    collision-resolved name. The worker reads it via the absolute path
+    surfaced in ``build_worker_context``.
     """
     board = _resolve_board(board)
     conn = _conn(board=board)
+    authority = kanban_db._connection_authority(conn)
     try:
         if kanban_db.get_task(conn, task_id) is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
@@ -732,7 +734,9 @@ async def upload_task_attachment(
 
         # Stream to disk with a hard size cap so a huge upload can't fill
         # the disk. Read in chunks; abort + clean up if the cap is hit.
-        dest_dir = kanban_db.task_attachments_dir(task_id, board=board)
+        dest_dir = kanban_db.task_attachments_dir(
+            task_id, board=board, authority=authority,
+        )
         dest_dir.mkdir(parents=True, exist_ok=True)
 
         # Resolve name collisions: foo.pdf → foo (1).pdf, foo (2).pdf, …
@@ -787,13 +791,14 @@ def download_attachment(attachment_id: int, board: Optional[str] = Query(None)):
         att = kanban_db.get_attachment(conn, attachment_id)
         if att is None:
             raise HTTPException(status_code=404, detail="attachment not found")
-        # Confirm the blob still lives under the board's attachments root
-        # before serving — defense in depth against a tampered DB row.
-        root = kanban_db.attachments_root(board=board).resolve()
+        # Confirm the blob still lives under the connection's authoritative
+        # task attachments root before serving — defense in depth against a
+        # tampered DB row.
         try:
-            stored = Path(att.stored_path).resolve()
-            stored.relative_to(root)
-        except (ValueError, OSError):
+            stored = getattr(kanban_db, "authoritative_attachment_path")(
+                conn, att.task_id, att.stored_path,
+            )
+        except ValueError:
             raise HTTPException(status_code=404, detail="attachment file unavailable")
         if not stored.is_file():
             raise HTTPException(status_code=404, detail="attachment file missing on disk")
@@ -811,7 +816,10 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        att = kanban_db.delete_attachment(conn, attachment_id)
+        try:
+            att = kanban_db.delete_attachment(conn, attachment_id)
+        except ValueError:
+            raise HTTPException(status_code=404, detail="attachment file unavailable")
         if att is None:
             raise HTTPException(status_code=404, detail="attachment not found")
         return {"ok": True, "id": attachment_id}
