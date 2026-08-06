@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -264,12 +265,12 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
     killed = []
     def _signal_fn(pid, sig):
         killed.append((pid, sig))
+        os.kill(pid, sig)
 
-    # We bypass _pid_alive by stubbing it so the grace-poll exits fast.
     import hermes_cli.kanban_db as _kb
-    original_alive = _kb._pid_alive
-    _kb._pid_alive = lambda pid: False  # pretend SIGTERM worked immediately
-
+    worker = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+    )
     try:
         conn = kb.connect()
         try:
@@ -277,9 +278,10 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
                 conn, title="long job", assignee="worker",
                 max_runtime_seconds=1,  # one second cap
             )
-            # Spawn by hand: claim + set pid + set active run start to the past.
-            kb.claim_task(conn, tid)
-            kb._set_worker_pid(conn, tid, os.getpid())   # any live pid works
+            # Spawn by hand with a real identity-bound worker, then set the
+            # active run start in the past.
+            assert kb.claim_task(conn, tid)
+            assert kb._set_worker_pid(conn, tid, worker.pid)
             # Backdate both the task-level first-start timestamp and the active
             # run timestamp so elapsed > limit under the per-run runtime model.
             old_started = int(time.time()) - 30
@@ -296,7 +298,7 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
 
             timed_out = kb.enforce_max_runtime(conn, signal_fn=_signal_fn)
             assert tid in timed_out
-            assert killed and killed[0][0] == os.getpid()
+            assert killed and killed[0][0] == worker.pid
 
             task = kb.get_task(conn, tid)
             assert task.status == "ready",                 f"timed-out task should reset to ready, got {task.status}"
@@ -311,7 +313,9 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
         finally:
             conn.close()
     finally:
-        _kb._pid_alive = original_alive
+        if worker.poll() is None:
+            worker.kill()
+        worker.wait()
 
 
 
@@ -1198,41 +1202,25 @@ def test_complete_can_retry_after_phantom_rejection(kanban_home):
 # Recovery helpers (reclaim + reassign)
 # ---------------------------------------------------------------------------
 
-def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
+def test_reclaim_task_resets_running_to_ready(kanban_home):
     """Manual reclaim releases the claim, resets status, and emits a
     ``reclaimed`` event even when claim_expires has not passed."""
     import signal
-    import time
-    import secrets
-    import hermes_cli.kanban_db as _kb
+    worker = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+    )
     conn = kb.connect()
     try:
         t = kb.create_task(conn, title="stuck", assignee="broken")
-        # Simulate a live claim (not expired).
-        lock = f"{_kb._claimer_id().split(':', 1)[0]}:{secrets.token_hex(8)}"
-        future = int(time.time()) + 3600
+        # Use the production claim path and bind a real worker identity; the
+        # reclaim contract must not accept fabricated PID metadata.
+        assert kb.claim_task(conn, t)
+        assert kb._set_worker_pid(conn, t, worker.pid)
         killed: list[int] = []
-        state = {"alive": True}
 
         def _signal(pid, sig):
             killed.append(sig)
-            if sig == signal.SIGTERM:
-                state["alive"] = False
-
-        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: state["alive"])
-        conn.execute(
-            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
-            "worker_pid=? WHERE id=?",
-            (lock, future, 12345, t),
-        )
-        conn.execute(
-            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
-            "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
-            (t, lock, future, 12345, int(time.time())),
-        )
-        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, t))
-        conn.commit()
+            os.kill(pid, sig)
 
         # release_stale_claims should NOT reclaim (not expired).
         assert kb.release_stale_claims(conn) == 0
@@ -1264,6 +1252,9 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
         assert killed == [signal.SIGTERM]
     finally:
         conn.close()
+        if worker.poll() is None:
+            worker.kill()
+        worker.wait()
 
 
 

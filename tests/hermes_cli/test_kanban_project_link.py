@@ -13,7 +13,7 @@ from hermes_cli import projects_db as pdb
 
 @pytest.fixture
 def kanban_conn(tmp_path):
-    c = kb.connect(db_path=tmp_path / "kanban.db")
+    c = kb.connect(db_path=tmp_path / "kanban.db", board="default")
     try:
         yield c
     finally:

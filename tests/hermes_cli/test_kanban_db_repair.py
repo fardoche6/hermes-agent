@@ -20,7 +20,7 @@ def _build_board_db(db_path: Path, tasks: int = 12) -> None:
     """Create a real board DB with data so indexes have entries."""
     kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
     kb.init_db(db_path=db_path)
-    with kb.connect(db_path=db_path) as conn:
+    with kb.connect(db_path=db_path, board="default") as conn:
         for i in range(tasks):
             kb.create_task(conn, title=f"task-{i}")
     conn.close()
@@ -210,14 +210,19 @@ def test_dispatch_tick_runs_wal_checkpoint_at_interval(tmp_path, monkeypatch):
     monkeypatch.setattr(kb, "_LAST_WAL_CHECKPOINT", {})
 
     executed: list[str] = []
-    conn = kb.connect(db_path=db_path)
+    conn = kb.connect(db_path=db_path, board="default")
     proxy = _ConnProxy(conn, executed)
     try:
-        kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None, dry_run=True)
+        kb.dispatch_once(
+            proxy,
+            spawn_fn=lambda *a, **k: None,
+            dry_run=True,
+            board="default",
+        )
         assert len(executed) == 1, "first tick should checkpoint"
 
-        kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None, dry_run=True)
-        kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None, dry_run=True)
+        kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None, dry_run=True, board="default")
+        kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None, dry_run=True, board="default")
         assert len(executed) == 1, "ticks inside the interval must not checkpoint"
 
         # Age the per-path timestamp past the interval → next tick fires.
@@ -225,7 +230,7 @@ def test_dispatch_tick_runs_wal_checkpoint_at_interval(tmp_path, monkeypatch):
         kb._LAST_WAL_CHECKPOINT[key] -= (
             kb._WAL_CHECKPOINT_INTERVAL_SECONDS + 1.0
         )
-        kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None, dry_run=True)
+        kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None, dry_run=True, board="default")
         assert len(executed) == 2, "tick after the interval should checkpoint"
         assert all("TRUNCATE" in sql.upper() for sql in executed)
     finally:
