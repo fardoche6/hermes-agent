@@ -8717,6 +8717,21 @@ def release_stale_claims(
         (now, now - DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS),
     ).fetchall()
     for row in stale:
+        pending = _pending_review_decision(conn, row["id"])
+        if pending is not None or _review_decision_needs_retirement(
+            conn, row["id"],
+        ):
+            _log.debug(
+                "kanban: stale-claim skip for pending review retirement task=%s",
+                row["id"],
+            )
+            continue
+        if row["claim_expires"] is None:
+            _log.debug(
+                "kanban: stale-claim skip with NULL claim_expires task=%s status=%s",
+                row["id"], row["status"],
+            )
+            continue
         lock = row["claim_lock"] or ""
         host_local = lock.startswith(host_prefix)
         hb = row["last_heartbeat_at"]
@@ -14692,11 +14707,12 @@ def _dispatch_once_locked(
     """Run one dispatcher tick.
 
     Steps:
-      1. Reclaim stale running tasks (TTL expired).
-      2. Reclaim stale running tasks (no recent heartbeat).
-      3. Reclaim crashed running tasks (host-local PID no longer alive).
-      3. Promote todo -> ready where all parents are done.
-      4. For each ready task with an assignee, atomically claim and call
+      1. Reconcile identity-bound pending review decisions.
+      2. Reclaim stale running tasks (TTL expired).
+      3. Reclaim stale running tasks (no recent heartbeat).
+      4. Reclaim crashed running tasks (host-local PID no longer alive).
+      5. Promote todo -> ready where all parents are done.
+      6. For each ready task with an assignee, atomically claim and call
          ``spawn_fn(task, workspace_path, board) -> Optional[int]``. The
          return value (if any) is recorded as ``worker_pid`` so subsequent
          ticks can detect crashes before the TTL expires.
@@ -14725,6 +14741,11 @@ def _dispatch_once_locked(
 
     result = DispatchResult()
     if not dry_run:
+        # Pending reviewer decisions own their current claim until the
+        # identity-bound retirement path proves physical exit and finalizes
+        # the successor. Reconcile them before generic stale-claim release so
+        # a lost/null expiry cannot enter the generic reclaim payload path.
+        _reap_pending_review_decisions(conn)
         result.reclaimed = release_stale_claims(conn, board=board)
         result.stale = detect_stale_running(
             conn, stale_timeout_seconds=stale_timeout_seconds,

@@ -288,6 +288,214 @@ def test_real_terminal_decision_waits_for_physical_reviewer_retirement(
         assert successor is not None and successor.status == "running"
 
 
+def test_dispatch_retires_null_expiry_request_changes_before_stale_reclaim(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    """A retired REQUEST_CHANGES run is finalized before stale-claim release."""
+    monkeypatch.setattr(
+        kb, "_reviewer_candidates", lambda _current: (["code-reviewer"], []),
+    )
+    # Keep the programmer successor out of this dispatch tick so the test
+    # isolates reviewer-capacity release and admission of the queued review.
+    monkeypatch.setattr(
+        kb, "_profile_is_configured", lambda name: name == "code-reviewer",
+    )
+    spawned: list[tuple[str, str]] = []
+
+    def spawn(task, _workspace):
+        spawned.append((task.id, task.assignee or ""))
+
+    lifecycle_order: list[str] = []
+    original_reconcile = kb._reap_pending_review_decisions
+    original_release = kb.release_stale_claims
+
+    def reconcile(*args, **kwargs):
+        lifecycle_order.append("reconcile")
+        return original_reconcile(*args, **kwargs)
+
+    def release(*args, **kwargs):
+        lifecycle_order.append("release")
+        return original_release(*args, **kwargs)
+
+    monkeypatch.setattr(kb, "_reap_pending_review_decisions", reconcile)
+    monkeypatch.setattr(kb, "release_stale_claims", release)
+
+    with kb.connect() as conn:
+        task_id, review, _host = _review_card(conn)
+        child, finish = _start_real_review_decision_child(
+            conn, task_id, review, tmp_path, "request_changes",
+        )
+        queued_id, _queued_host = _unclaimed_review_card(
+            conn, reviewer="code-reviewer",
+        )
+
+        finish.write_text("finish")
+        deadline = time.time() + 5
+        while kb._pid_alive(child.pid) and time.time() < deadline:
+            time.sleep(0.01)
+        assert not kb._pid_alive(child.pid)
+        kb.reap_worker_zombies()
+
+        decision = _payload(conn, task_id, "changes_requested")
+        decision_row = conn.execute(
+            "SELECT id FROM task_events WHERE task_id=? "
+            "AND kind='changes_requested' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert decision_row is not None
+        assert decision["pending_retirement"] is True
+        assert decision["programmer"] == "programmer"
+        assert decision["reviewer"] == "code-reviewer"
+        assert decision["reason"] == "subprocess correction"
+        assert kb._pending_review_decision(conn, task_id) is not None
+
+        # This is the production shape: the task still owns the exact review
+        # generation, but its expiry was lost during the pending retirement.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET claim_expires=NULL, last_heartbeat_at=0 "
+                "WHERE id=?",
+                (task_id,),
+            )
+            conn.execute(
+                "UPDATE task_runs SET claim_expires=NULL WHERE id=?",
+                (review.current_run_id,),
+            )
+
+        first = kb.dispatch_once(
+            conn,
+            spawn_fn=spawn,
+            max_in_progress_per_profile=1,
+        )
+        assert lifecycle_order[:2] == ["reconcile", "release"]
+        assert first.spawned == [
+            (queued_id, "code-reviewer", str(kb.workspaces_root() / queued_id)),
+        ]
+        assert spawned == [(queued_id, "code-reviewer")]
+
+        finalized = kb.get_task(conn, task_id)
+        assert finalized is not None
+        assert finalized.status == "ready"
+        assert finalized.assignee == "programmer"
+        assert finalized.claim_lock is None
+        assert finalized.current_run_id is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind='changes_requested'",
+            (task_id,),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind='review_decision_finalized'",
+            (task_id,),
+        ).fetchone()[0] == 1
+        finalized_packet = _payload(conn, task_id, "review_decision_finalized")
+        assert finalized_packet["decision_event_id"] == decision_row["id"]
+        assert finalized_packet["decision_generation"] == decision["decision_generation"]
+        assert finalized_packet["run_id"] == decision["run_id"]
+        assert finalized_packet["claim_lock"] == decision["claim_lock"]
+        assert finalized_packet["worker_pid"] == decision["worker_pid"]
+        assert finalized_packet["authority_id"] == decision["authority_id"]
+        assert finalized_packet["outcome"] == "changes_requested"
+        assert finalized_packet["successor"] == "programmer"
+        assert decision.get("gate_id") is not None
+        gate = conn.execute(
+            "SELECT state, task_id, run_id, claim_lock, gate_pid, authority_id "
+            "FROM task_launch_gates WHERE id=?",
+            (decision["gate_id"],),
+        ).fetchone()
+        assert gate is not None
+        assert tuple(gate) == (
+            "retired", task_id, decision["run_id"], decision["claim_lock"],
+            decision["worker_pid"], decision["authority_id"],
+        )
+
+        admitted = kb.get_task(conn, queued_id)
+        assert admitted is not None
+        assert admitted.status == "review"
+        assert admitted.assignee == "code-reviewer"
+        assert admitted.claim_lock is not None
+        assert admitted.current_run_id is not None
+
+        second = kb.dispatch_once(
+            conn,
+            spawn_fn=spawn,
+            max_in_progress_per_profile=1,
+        )
+        assert second.spawned == []
+        assert spawned == [(queued_id, "code-reviewer")]
+
+    with kb.connect() as reopened:
+        assert reopened.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind='changes_requested'",
+            (task_id,),
+        ).fetchone()[0] == 1
+        assert reopened.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? "
+            "AND kind='review_decision_finalized'",
+            (task_id,),
+        ).fetchone()[0] == 1
+        current = kb.get_task(reopened, task_id)
+        assert current is not None
+        assert current.status == "ready"
+        queued = kb.get_task(reopened, queued_id)
+        assert queued is not None and queued.claim_lock is not None
+
+
+def test_release_stale_claims_skips_unowned_null_expiry_and_reclaims_expired(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        null_task = kb.create_task(
+            conn, title="unowned null expiry", assignee="programmer",
+        )
+        null_claim = kb.claim_task(conn, null_task, claimer="null-expiry")
+        assert null_claim is not None
+        expired_task = kb.create_task(
+            conn, title="ordinary expired claim", assignee="programmer",
+        )
+        expired_claim = kb.claim_task(
+            conn, expired_task, ttl_seconds=1, claimer="expired-claim",
+        )
+        assert expired_claim is not None
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET claim_expires=NULL, last_heartbeat_at=0 "
+                "WHERE id=?",
+                (null_task,),
+            )
+            conn.execute(
+                "UPDATE task_runs SET claim_expires=NULL WHERE id=?",
+                (null_claim.current_run_id,),
+            )
+            conn.execute(
+                "UPDATE tasks SET claim_expires=0, last_heartbeat_at=NULL "
+                "WHERE id=?",
+                (expired_task,),
+            )
+            conn.execute(
+                "UPDATE task_runs SET claim_expires=0 WHERE id=?",
+                (expired_claim.current_run_id,),
+            )
+
+        assert kb.release_stale_claims(conn) == 1
+        unchanged = kb.get_task(conn, null_task)
+        assert unchanged is not None
+        assert unchanged.status == "running"
+        assert unchanged.claim_lock == "null-expiry"
+        assert unchanged.current_run_id == null_claim.current_run_id
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='reclaimed'",
+            (null_task,),
+        ).fetchone()[0] == 0
+        reclaimed = kb.get_task(conn, expired_task)
+        assert reclaimed is not None
+        assert reclaimed.status == "ready"
+        assert reclaimed.claim_lock is None
+
+
 def test_pending_review_decision_replays_after_reaper_crash(kanban_home, tmp_path, monkeypatch):
     """A durable exit proof lets a later reaper finish an interrupted finalization."""
     with kb.connect() as conn:
