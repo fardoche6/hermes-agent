@@ -1375,7 +1375,9 @@ def test_locked_healthy_db_does_not_classify_as_corrupt(tmp_path, monkeypatch):
     # And once the lock clears, normal access still works.
     monkeypatch.setattr(kb.sqlite3, "connect", real_connect)
     with kb.connect(db_path=db_path) as conn:
-        kb.create_task(conn, title="still here")
+        # Arbitrary db_path connections have no inferable board identity;
+        # callers must bind one explicitly rather than consulting ambient state.
+        kb.create_task(conn, title="still here", board="default")
         titles = [t.title for t in kb.list_tasks(conn)]
     assert "still here" in titles
 

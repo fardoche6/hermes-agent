@@ -11,7 +11,6 @@ import importlib.util
 import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -561,25 +560,11 @@ def test_home_channels_lists_only_platforms_with_home(client, with_home_channels
 def test_reclaim_endpoint_releases_running_claim(client):
     """POST /tasks/<id>/reclaim drops the claim, returns ok, and emits
     a manual reclaimed event."""
-    import secrets
     conn = kb.connect()
     try:
         t = kb.create_task(conn, title="running", assignee="x")
-        lock = secrets.token_hex(8)
-        future = int(time.time()) + 3600
-        conn.execute(
-            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
-            "worker_pid=? WHERE id=?",
-            (lock, future, 99999, t),
-        )
-        conn.execute(
-            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
-            "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
-            (t, lock, future, 99999, int(time.time())),
-        )
-        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, t))
-        conn.commit()
+        host = kb._claimer_id().split(":", 1)[0]
+        assert kb.claim_task(conn, t, claimer=f"{host}:dashboard-reclaim-test") is not None
     finally:
         conn.close()
 

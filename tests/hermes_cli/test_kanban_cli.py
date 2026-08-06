@@ -118,8 +118,6 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
 
 def test_run_slash_reclaim_running_task(kanban_home):
     import re
-    import time
-    import secrets
     from hermes_cli import kanban_db as kb
 
     out1 = kc.run_slash("create 'stuck worker task' --assignee broken-model")
@@ -127,23 +125,13 @@ def test_run_slash_reclaim_running_task(kanban_home):
     assert m
     tid = m.group(1)
 
-    # Simulate a running claim outside TTL.
+    # Use the production claim path so the test has a valid claim/run binding.
+    # Process-identity termination is covered by test_process_identity_failover;
+    # this CLI test only exercises immediate logical reclaim.
     conn = kb.connect()
     try:
-        lock = secrets.token_hex(4)
-        conn.execute(
-            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
-            "worker_pid=? WHERE id=?",
-            (lock, int(time.time()) + 3600, 4242, tid),
-        )
-        conn.execute(
-            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
-            "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
-            (tid, lock, int(time.time()) + 3600, 4242, int(time.time())),
-        )
-        rid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (rid, tid))
-        conn.commit()
+        host = kb._claimer_id().split(":", 1)[0]
+        assert kb.claim_task(conn, tid, claimer=f"{host}:cli-reclaim-test") is not None
     finally:
         conn.close()
 
