@@ -4440,10 +4440,14 @@ def create_task(
                 )
                 if not dependency_resolution.satisfied:
                     with write_txn(conn):
-                        conn.execute(
-                            "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
-                            (task_id,),
-                        )
+                        if (
+                            _dependency_snapshot_digest(conn, task_id)
+                            == dependency_resolution.snapshot_digest
+                        ):
+                            conn.execute(
+                                "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+                                (task_id,),
+                            )
             return task_id
         except sqlite3.IntegrityError as exc:
             if idempotency_key and "idempotency_key" in str(exc).lower():
@@ -4917,6 +4921,30 @@ def _dependency_link_identity_error(
     return None
 
 
+def _dependency_snapshot_digest_from_rows(rows: Iterable[Mapping[str, Any]]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            [dict(row) for row in rows],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _dependency_snapshot_digest(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> str:
+    """Hash the canonical typed-link/provider snapshot for ``task_id``."""
+    rows = conn.execute(
+        "SELECT parent_id, child_id, dependency_kind, provider_name, metadata, "
+        "metadata_digest, edge_identity, link_version FROM task_links "
+        "WHERE child_id = ? ORDER BY parent_id",
+        (task_id,),
+    ).fetchall()
+    return _dependency_snapshot_digest_from_rows(rows)
+
+
 def resolve_task_dependencies(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4925,10 +4953,11 @@ def resolve_task_dependencies(
 ) -> DependencyResolution:
     """Resolve every edge for ``task_id`` using the one canonical algorithm.
 
-    Callers must invoke this while holding their own ``write_txn`` when the
-    result will authorize a mutation (notably ``claim_task``).  Providers
-    receive no connection and every fault is fail-closed by the provider
-    registry.
+    Providers are resolved before a mutation enters SQLite ``write_txn``.
+    Mutation callers must re-read the canonical typed-link snapshot and
+    compare this result's digest immediately before their lifecycle CAS.
+    Providers receive no connection and every fault is fail-closed by the
+    provider registry.
     """
     board_slug = _dependency_board(conn, board)
     task = get_task(conn, task_id)
@@ -4945,10 +4974,7 @@ def resolve_task_dependencies(
         "ORDER BY parent_id",
         (task_id,),
     ).fetchall()
-    snapshot_payload = [dict(row) for row in rows]
-    snapshot_digest = hashlib.sha256(
-        json.dumps(snapshot_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+    snapshot_digest = _dependency_snapshot_digest_from_rows(rows)
     snapshot_version = max((int(row["link_version"] or 1) for row in rows), default=0)
     if not rows:
         return DependencyResolution(
@@ -5306,10 +5332,14 @@ def link_tasks(
     dependency_resolution = resolve_task_dependencies(conn, child_id, board=board_slug)
     if not dependency_resolution.satisfied:
         with write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
-                (child_id,),
-            )
+            if (
+                _dependency_snapshot_digest(conn, child_id)
+                == dependency_resolution.snapshot_digest
+            ):
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+                    (child_id,),
+                )
 
 
 def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
@@ -5970,6 +6000,13 @@ def recompute_ready(
             ).fetchone()
             if not current or bool(current["recovery_required"]):
                 continue
+            current_digest = _dependency_snapshot_digest(conn, task_id)
+            if current_digest != resolution.snapshot_digest:
+                resolution = DependencyResolution(
+                    satisfied=False,
+                    diagnostics=({"reason": "dependency_snapshot_drift"},),
+                    snapshot_digest=current_digest,
+                )
             if not resolution.satisfied:
                 conn.execute(
                     "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
@@ -6045,16 +6082,7 @@ def claim_task(
         # 'todo' here — recompute_ready will re-promote when the parents
         # actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        snapshot_rows = conn.execute(
-            "SELECT parent_id, child_id, dependency_kind, provider_name, metadata, "
-            "metadata_digest, edge_identity, link_version FROM task_links WHERE child_id = ? "
-            "ORDER BY parent_id",
-            (task_id,),
-        ).fetchall()
-        current_digest = hashlib.sha256(
-            json.dumps([dict(row) for row in snapshot_rows], sort_keys=True,
-                       separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
+        current_digest = _dependency_snapshot_digest(conn, task_id)
         if current_digest != dependency_resolution.snapshot_digest:
             dependency_resolution = DependencyResolution(
                 satisfied=False,
@@ -7377,7 +7405,7 @@ def submit_task_for_review(
     closed before the reviewer assignment is installed, so no claim or run is
     orphaned.
     """
-    _dependency_board(conn, board)
+    board_slug = _dependency_board(conn, board)
     reviewer = _canonical_assignee(reviewer)
     if not reviewer:
         raise ValueError("reviewer is required")
@@ -7390,6 +7418,19 @@ def submit_task_for_review(
             raise ValueError("expected_run_id must be a positive integer") from exc
         if expected_run_id <= 0:
             raise ValueError("expected_run_id must be a positive integer")
+    preflight = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if preflight is None:
+        return None
+    if expected_status is not None and preflight["status"] != expected_status:
+        return None
+    # Provider execution is deliberately outside the lifecycle write
+    # transaction. The transaction below only re-reads the canonical
+    # typed-link snapshot and performs the CAS.
+    dependency_resolution = resolve_task_dependencies(
+        conn, task_id, board=board_slug,
+    )
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, current_run_id, assignee "
@@ -7457,14 +7498,17 @@ def submit_task_for_review(
             # running: a parked handoff must not carry the card out of
             # ``ready`` while a parent is still open. Without this the
             # review handoff is a hole straight through the dependency
-            # graph. Demote back to 'todo' (recompute_ready re-promotes
-            # once the parents actually finish) and refuse the transition.
-            if _has_unfinished_parents(conn, task_id):
-                return None
-        if _has_unfinished_parents(conn, task_id):
-            # Recheck every source state inside the same write transaction,
-            # immediately before ending the implementation run or mutating
-            # the card. A late parent link must cause a true no-op.
+            # graph. The canonical resolution and snapshot CAS below
+            # reject the transition and leave the card parked.
+        current_digest = _dependency_snapshot_digest(conn, task_id)
+        if (
+            current_digest != dependency_resolution.snapshot_digest
+            or not dependency_resolution.satisfied
+        ):
+            # Recheck the complete canonical source snapshot inside the same
+            # write transaction, immediately before ending the implementation
+            # run or mutating the card. A late link/provider identity change
+            # must cause a true no-op.
             return None
         if row["status"] == "running" and row["claim_lock"] is None:
             raise RuntimeError(f"cannot submit {task_id}: running task is unclaimed")
@@ -11131,12 +11175,7 @@ def _validate_dependency_binding(
             "FROM task_links WHERE child_id = ? ORDER BY parent_id",
             (task.id,),
         ).fetchall()
-        snapshot_payload = [dict(row) for row in rows]
-        current_digest = hashlib.sha256(
-            json.dumps(
-                snapshot_payload, sort_keys=True, separators=(",", ":")
-            ).encode("utf-8")
-        ).hexdigest()
+        current_digest = _dependency_snapshot_digest_from_rows(rows)
         if current_digest != snapshot_digest:
             raise RuntimeError(
                 f"task {task.id} dependency binding snapshot is stale"
@@ -11158,8 +11197,13 @@ def _workspace_base_pin_for_task(
     conn: Optional[sqlite3.Connection] = None,
 ) -> Optional[KanbanWorkspaceBasePin]:
     binding = task.dependency_binding
-    if not binding:
+    if binding is None:
         return None
+    if conn is None or not getattr(conn, "_hermes_kanban_board", None):
+        raise RuntimeError(
+            "durable dependency-bound workspace resolution requires "
+            "a board-bound connection"
+        )
     if not isinstance(binding, dict):
         raise RuntimeError(f"task {task.id} has a malformed dependency binding")
     expected_board = _dependency_board_for_workspace(board, conn=conn)
@@ -11420,7 +11464,9 @@ def resolve_workspace(
       ``wt/<task-id>``.
 
     Persist the resolved path back to the task row via ``set_workspace_path``
-    so subsequent runs reuse the same directory.
+    so subsequent runs reuse the same directory. A task carrying a durable
+    dependency binding must be resolved with the board-bound ``conn`` used by
+    the CLI/dispatcher; the public no-connection form fails closed.
     """
     board_slug = _dependency_board_for_workspace(board, conn=conn)
     kind = task.workspace_kind or "scratch"
@@ -14275,7 +14321,7 @@ def _plan_review_handoffs(
     routing decision as a real tick without mutating the board. The applier
     (:func:`reconcile_review_handoffs`) executes this plan verbatim.
     """
-    _dependency_board(conn, board)
+    board_slug = _dependency_board(conn, board)
     plan: list[tuple[str, str, int, str, str]] = []
     try:
         rows = conn.execute(
@@ -14293,7 +14339,10 @@ def _plan_review_handoffs(
                 continue
             # Dependency invariant (mirrors submit_task_for_review and
             # claim_task): never plan a card whose parents are still open.
-            if _has_unfinished_parents(conn, task_id):
+            dependency_resolution = resolve_task_dependencies(
+                conn, task_id, board=board_slug,
+            )
+            if not dependency_resolution.satisfied:
                 continue
             candidates, _preflight = _reviewer_candidates(row["assignee"])
             reviewer = next(
@@ -14715,17 +14764,38 @@ def _dispatch_once_locked(
     # still open. Restore the virtual todo state before planning; dry-run must
     # only observe this condition, never repair it.
     if not dry_run:
+        parked_review_resolutions: list[tuple[str, DependencyResolution]] = []
+        for parked in conn.execute(
+            "SELECT id FROM tasks WHERE status='ready' AND claim_lock IS NULL "
+            "AND recovery_required=0"
+        ).fetchall():
+            parked_id = parked["id"]
+            if not pending_review_handoff(conn, parked_id):
+                continue
+            # Resolve provider/dependency state before taking the lifecycle
+            # write transaction. The transaction below only performs the
+            # canonical snapshot CAS and optional demotion.
+            parked_review_resolutions.append(
+                (
+                    parked_id,
+                    resolve_task_dependencies(conn, parked_id, board=board),
+                )
+            )
         with write_txn(conn):
-            for parked in conn.execute(
-                "SELECT id FROM tasks WHERE status='ready' AND claim_lock IS NULL "
-                "AND recovery_required=0"
-            ).fetchall():
-                parked_id = parked["id"]
-                if pending_review_handoff(conn, parked_id) and _has_unfinished_parents(conn, parked_id):
-                    conn.execute(
-                        "UPDATE tasks SET status='todo' WHERE id=? AND status='ready'",
-                        (parked_id,),
-                    )
+            for parked_id, resolution in parked_review_resolutions:
+                if (
+                    _dependency_snapshot_digest(conn, parked_id)
+                    != resolution.snapshot_digest
+                    or resolution.satisfied
+                    or not pending_review_handoff(conn, parked_id)
+                ):
+                    continue
+                cur = conn.execute(
+                    "UPDATE tasks SET status='todo' WHERE id=? AND status='ready' "
+                    "AND claim_lock IS NULL AND recovery_required=0",
+                    (parked_id,),
+                )
+                if cur.rowcount:
                     _append_event(
                         conn, parked_id, "review_submit_rejected",
                         {"reason": "parents_not_done"},

@@ -98,10 +98,18 @@ KanbanDependencyResult(
 ```
 
 The host persists the generation and pin on the admitted `task_runs` row. A
-later readiness sweep is not an admission record: claim reevaluates the
-provider inside the same SQLite write transaction as the claim CAS. The exact
-successful binding is then used by worktree creation, which verifies both the
-commit and tree object before returning a workspace.
+later readiness sweep is not an admission record: every lifecycle mutation
+pre-resolves dependency/provider state outside SQLite `write_txn`, then
+re-reads the canonical typed-link/provider snapshot inside the transaction and
+compares its digest immediately before the lifecycle CAS. This is the same
+snapshot-CAS rule used by claim, and keeps slow provider callbacks from holding
+the board write lock.
+
+The exact successful binding is then used by worktree creation, which verifies
+both the commit and tree object before returning a workspace. A public
+`resolve_workspace()` call for a task with a durable dependency binding must
+pass the board-bound connection returned by the official CLI/dispatcher path;
+without that connection the host fails closed rather than guessing the board.
 
 A base pin is valid only for a `worktree` task. A satisfied provider result
 that carries a pin for a scratch or shared-directory task is rejected during
@@ -154,7 +162,13 @@ The host treats all of these as `unknown` and blocks readiness/claim:
 - malformed result, generation, pin, or diagnostic metadata;
 - missing parent/task identity or malformed stored metadata;
 - conflicting workspace pins;
-- missing Git objects or a worktree whose `HEAD`/tree does not match the pin.
+- missing Git objects or a worktree whose `HEAD`/tree does not match the pin;
+- no real process-containment boundary for a provider helper.
+
+A provider helper is never spawned when the host cannot establish a real
+containment boundary. Process-group cleanup is not treated as a substitute for
+containing detached descendants; the stable diagnostic in that case is
+`provider_containment_unavailable`.
 
 Do not make a provider callback perform unbounded I/O. Hermes bounds the
 callback wall-clock wait and terminates/reaps its helper process on timeout or

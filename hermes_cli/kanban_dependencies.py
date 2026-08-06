@@ -20,7 +20,6 @@ import pathlib
 import re
 import selectors
 import secrets
-import signal
 import subprocess
 import sys
 import threading
@@ -510,28 +509,20 @@ def _stop_process(
     boundary: Optional[_ProcessContainment] = None,
 ) -> bool:
     """Terminate and reap a provider boundary, failing closed if unproven."""
-    boundary_ok = boundary is None or boundary.terminate()
     if process is None:
-        return boundary_ok
+        return boundary is None or boundary.terminate()
+    boundary_ok = boundary is not None and boundary.terminate()
     try:
         if process.poll() is None:
-            if os.name == "posix":
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-            else:
-                process.terminate()
+            # The process is already admitted to a real boundary in normal
+            # operation. Directly reap the worker if needed, but never use a
+            # process-group kill as a substitute for missing/unproven
+            # descendant containment.
+            process.terminate()
             try:
                 process.wait(timeout=0.5)
             except subprocess.TimeoutExpired:
-                if os.name == "posix":
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                else:
-                    process.kill()
+                process.kill()
                 process.wait(timeout=1.0)
         else:
             process.wait(timeout=0)
@@ -676,13 +667,14 @@ def _run_provider_process(
         return _unknown("provider_busy")
     try:
         boundary = _new_process_containment(invocation_id)
+        if boundary is None:
+            return _unknown("provider_containment_unavailable")
         command = [
             sys.executable,
             "-m",
             "hermes_cli.kanban_provider_worker",
         ]
-        if boundary is not None:
-            command.extend(("--containment-cgroup", boundary.worker_argument()))
+        command.extend(("--containment-cgroup", boundary.worker_argument()))
         process = subprocess.Popen(
             command,
             cwd=repo_root,

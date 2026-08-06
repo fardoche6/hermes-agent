@@ -143,6 +143,15 @@ def _satisfied_provider(_context):
     return KanbanDependencyResult("satisfied", generation="g")
 
 
+def _blocking_file_provider(context):
+    metadata = context.link["metadata"]
+    Path(metadata["started_file"]).write_text("started")
+    release_file = Path(metadata["release_file"])
+    while not release_file.exists():
+        time.sleep(0.01)
+    return KanbanDependencyResult("satisfied", generation="released")
+
+
 @pytest.fixture
 def board_db(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
@@ -172,6 +181,34 @@ def _new_provider_child(conn, parent_id, *, kind="sample.gate", provider="sample
         board="alpha",
         **kwargs,
     )
+
+
+def _new_claimed_provider_task(conn, parent_id, *, metadata):
+    task_id = kb.create_task(
+        conn,
+        title="claimed provider task",
+        assignee="programmer",
+        board="alpha",
+    )
+    claimed = kb.claim_task(conn, task_id, board="alpha", claimer="programmer")
+    assert claimed is not None
+    kb.link_tasks(
+        conn,
+        parent_id,
+        task_id,
+        dependency_kind="sample.gate",
+        provider_name="sample",
+        metadata=metadata,
+        board="alpha",
+    )
+    return task_id, claimed
+
+
+def _wait_for_file(path, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert path.exists(), f"provider did not signal {path}"
 
 
 def test_legacy_typed_link_migration_and_completion_default(tmp_path, monkeypatch):
@@ -329,9 +366,68 @@ def test_provider_timeout_has_no_live_worker_thread_or_child(board_db):
 
 
 
-def test_provider_timeout_kills_detached_descendants(board_db):
+def test_provider_unavailable_without_containment_fails_closed(board_db, monkeypatch):
+    conn, tmp_path = board_db
+    parent = _new_parent(conn)
+    pid_file = tmp_path / "forced-unavailable.pid"
+    register_kanban_dependency_provider(
+        "sample.gate",
+        "sample",
+        _detached_child_provider,
+        timeout_seconds=0.5,
+    )
+    popen_calls = []
+
+    def forbidden_popen(*args, **kwargs):
+        popen_calls.append((args, kwargs))
+        raise AssertionError("provider Popen must not run without containment")
+
+    monkeypatch.setattr(kd, "_new_process_containment", lambda _invocation_id: None)
+    monkeypatch.setattr(kd.subprocess, "Popen", forbidden_popen)
+    child = _new_provider_child(
+        conn,
+        parent,
+        dependency_metadata={"pid_file": str(pid_file)},
+    )
+
+    evidence = kb.task_dependency_evidence(conn, child, board="alpha")[0]
+
+    assert evidence["status"] == "unknown"
+    assert evidence["diagnostics"]["reason"] == "provider_containment_unavailable"
+    assert popen_calls == []
+    assert not pid_file.exists()
+    assert multiprocessing.active_children() == []
+
+
+def test_provider_timeout_kills_detached_descendants(board_db, monkeypatch):
     if not kd._containment_available():
-        pytest.skip("no delegated process containment boundary on this host")
+        conn, tmp_path = board_db
+        parent = _new_parent(conn)
+        pid_file = tmp_path / "unavailable.pid"
+        register_kanban_dependency_provider(
+            "sample.gate",
+            "sample",
+            _detached_child_provider,
+            timeout_seconds=0.5,
+        )
+        popen_calls = []
+
+        def forbidden_popen(*args, **kwargs):
+            popen_calls.append((args, kwargs))
+            raise AssertionError("provider Popen must not run without containment")
+
+        monkeypatch.setattr(kd.subprocess, "Popen", forbidden_popen)
+        child = _new_provider_child(
+            conn,
+            parent,
+            dependency_metadata={"pid_file": str(pid_file)},
+        )
+        evidence = kb.task_dependency_evidence(conn, child, board="alpha")[0]
+        assert evidence["diagnostics"]["reason"] == "provider_containment_unavailable"
+        assert popen_calls == []
+        assert not pid_file.exists()
+        assert multiprocessing.active_children() == []
+        return
     conn, tmp_path = board_db
     parent = _new_parent(conn)
     pid_file = tmp_path / "detached-child.pid"
@@ -365,6 +461,176 @@ def test_provider_timeout_kills_detached_descendants(board_db):
     else:
         pytest.fail(f"detached provider PID {detached_pid} survived cleanup")
 
+
+
+def test_review_provider_resolution_does_not_hold_write_transaction(board_db):
+    conn, tmp_path = board_db
+    parent = _new_parent(conn)
+    started_file = tmp_path / "review-provider-started"
+    release_file = tmp_path / "review-provider-release"
+    task_id, _claimed = _new_claimed_provider_task(
+        conn,
+        parent,
+        metadata={
+            "started_file": str(started_file),
+            "release_file": str(release_file),
+        },
+    )
+    register_kanban_dependency_provider(
+        "sample.gate",
+        "sample",
+        _blocking_file_provider,
+        timeout_seconds=5.0,
+    )
+    submit_result = []
+    submit_errors = []
+
+    def submit():
+        worker_conn = kb.connect(db_path=tmp_path / "alpha.db", board="alpha")
+        try:
+            submit_result.append(
+                kb.submit_task_for_review(
+                    worker_conn,
+                    task_id,
+                    "code-reviewer",
+                    trusted_operator=True,
+                    board="alpha",
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - assertion below reports it
+            submit_errors.append(exc)
+        finally:
+            worker_conn.close()
+
+    submit_thread = threading.Thread(target=submit)
+    writer_thread = None
+    submit_thread.start()
+    try:
+        _wait_for_file(started_file)
+        writer_done = threading.Event()
+        writer_result = []
+        writer_errors = []
+
+        def competing_writer():
+            writer_conn = kb.connect(db_path=tmp_path / "alpha.db", board="alpha")
+            try:
+                writer_result.append(
+                    kb.create_task(writer_conn, title="competing writer", board="alpha")
+                )
+            except BaseException as exc:  # pragma: no cover - assertion below reports it
+                writer_errors.append(exc)
+            finally:
+                writer_conn.close()
+                writer_done.set()
+
+        writer_thread = threading.Thread(target=competing_writer)
+        writer_thread.start()
+        assert writer_done.wait(2.0), "competing writer waited on provider resolution"
+        assert writer_errors == []
+        assert writer_result
+        assert not release_file.exists()
+    finally:
+        release_file.touch()
+        submit_thread.join(timeout=5.0)
+        if writer_thread is not None:
+            writer_thread.join(timeout=5.0)
+
+    assert not submit_thread.is_alive()
+    assert submit_errors == []
+    assert submit_result and submit_result[0] is not None
+    reviewed = kb.get_task(conn, task_id)
+    assert reviewed is not None
+    assert reviewed.status == "review"
+
+
+def test_dispatch_parked_review_resolution_does_not_hold_write_transaction(
+    board_db, monkeypatch
+):
+    conn, tmp_path = board_db
+    parent = _new_parent(conn)
+    started_file = tmp_path / "dispatch-provider-started"
+    release_file = tmp_path / "dispatch-provider-release"
+    task_id, claimed = _new_claimed_provider_task(
+        conn,
+        parent,
+        metadata={
+            "started_file": str(started_file),
+            "release_file": str(release_file),
+        },
+    )
+    assert kb.block_task(
+        conn,
+        task_id,
+        reason="review-required: fix requested",
+        kind="dependency",
+        expected_run_id=claimed.current_run_id,
+        expected_assignee=claimed.assignee,
+        expected_claim=claimed.claim_lock,
+        board="alpha",
+    )
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+    register_kanban_dependency_provider(
+        "sample.gate",
+        "sample",
+        _blocking_file_provider,
+        timeout_seconds=5.0,
+    )
+    monkeypatch.setattr(kb, "recompute_ready", lambda *args, **kwargs: 0)
+    dispatch_result = []
+    dispatch_errors = []
+
+    def dispatch():
+        worker_conn = kb.connect(db_path=tmp_path / "alpha.db", board="alpha")
+        try:
+            dispatch_result.append(
+                kb.dispatch_once(worker_conn, board="alpha", max_spawn=0)
+            )
+        except BaseException as exc:  # pragma: no cover - assertion below reports it
+            dispatch_errors.append(exc)
+        finally:
+            worker_conn.close()
+
+    dispatch_thread = threading.Thread(target=dispatch)
+    writer_thread = None
+    dispatch_thread.start()
+    try:
+        _wait_for_file(started_file)
+        writer_done = threading.Event()
+        writer_result = []
+        writer_errors = []
+
+        def competing_writer():
+            writer_conn = kb.connect(db_path=tmp_path / "alpha.db", board="alpha")
+            try:
+                writer_result.append(
+                    kb.create_task(
+                        writer_conn,
+                        title="dispatch competing writer",
+                        board="alpha",
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - assertion below reports it
+                writer_errors.append(exc)
+            finally:
+                writer_conn.close()
+                writer_done.set()
+
+        writer_thread = threading.Thread(target=competing_writer)
+        writer_thread.start()
+        assert writer_done.wait(2.0), "competing writer waited on parked-review resolution"
+        assert writer_errors == []
+        assert writer_result
+        assert not release_file.exists()
+    finally:
+        release_file.touch()
+        dispatch_thread.join(timeout=5.0)
+        if writer_thread is not None:
+            writer_thread.join(timeout=5.0)
+
+    assert not dispatch_thread.is_alive()
+    assert dispatch_errors == []
+    assert dispatch_result
 
 
 def test_provider_unload_cancels_inflight_callback(board_db):
@@ -490,7 +756,7 @@ def test_readiness_and_claim_share_claim_time_provider_resolution(board_db):
     tampered_task = kb.get_task(conn, child)
     assert tampered_task is not None
     with pytest.raises(RuntimeError, match="identity|binding"):
-        kb.resolve_workspace(tampered_task, board="alpha")
+        kb.resolve_workspace(tampered_task, board="alpha", conn=conn)
 
 
 def test_concurrent_idempotent_replays_are_canonical_or_conflicts(board_db):
@@ -582,7 +848,10 @@ def test_claim_pin_is_consumed_by_worktree_and_mismatch_fails_closed(board_db):
         },
     )
     claimed = kb.claim_task(conn, child, board="alpha", claimer="worker")
-    workspace = kb.resolve_workspace(claimed, board="alpha")
+    assert claimed is not None
+    with pytest.raises(RuntimeError, match="board-bound"):
+        kb.resolve_workspace(claimed, board="alpha")
+    workspace = kb.resolve_workspace(claimed, board="alpha", conn=conn)
     assert _git(workspace, "rev-parse", "HEAD") == head
     assert _git(workspace, "rev-parse", "HEAD^{tree}") == tree
 
@@ -607,8 +876,9 @@ def test_claim_pin_is_consumed_by_worktree_and_mismatch_fails_closed(board_db):
         },
     )
     bad_claim = kb.claim_task(conn, bad_child, board="alpha", claimer="worker-2")
+    assert bad_claim is not None
     with pytest.raises(RuntimeError, match="unavailable|wrong tree"):
-        kb.resolve_workspace(bad_claim, board="alpha")
+        kb.resolve_workspace(bad_claim, board="alpha", conn=conn)
 
 
 def test_board_explicit_provider_isolation_and_concurrent_claim(tmp_path, monkeypatch):
