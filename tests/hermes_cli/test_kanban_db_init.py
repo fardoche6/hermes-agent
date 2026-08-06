@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import subprocess
 import threading
 from pathlib import Path
 
@@ -57,16 +58,31 @@ def _setup_home(tmp_path, monkeypatch) -> Path:
 
 
 def _table_struct(conn: sqlite3.Connection, table: str):
-    cols = [
-        (r["name"], (r["type"] or "").upper(), r["notnull"], r["pk"])
+    column_specs = [
+        (
+            r["name"],
+            (r["type"] or "").upper(),
+            r["notnull"],
+            r["dflt_value"],
+            r["pk"],
+        )
         for r in conn.execute(f"PRAGMA table_info({table})")
     ]
-    idx = sorted(
-        r["name"]
+    index_specs = sorted(
+        (
+            r["name"],
+            r["unique"],
+            r["origin"],
+            r["partial"],
+            tuple(
+                c["name"]
+                for c in conn.execute(f"PRAGMA index_info({r['name']})")
+            ),
+        )
         for r in conn.execute(f"PRAGMA index_list({table})")
         if not r["name"].startswith("sqlite_")
     )
-    return cols, idx
+    return column_specs, index_specs
 
 
 
@@ -87,12 +103,96 @@ def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkey
         assert lei["last_event_id"]["type"].upper() == "INTEGER"
         assert "delivery_metadata" in lei
 
+        # The rebuilt run table must have the exact current column/default/index
+        # shape, not just an INTEGER primary key. This catches rebuild specs
+        # that lag SCHEMA_SQL as new durable run fields are added.
+        fresh = sqlite3.connect(":memory:")
+        fresh.row_factory = sqlite3.Row
+        try:
+            fresh.executescript(kb.SCHEMA_SQL)
+            assert _table_struct(conn, "task_runs") == _table_struct(
+                fresh, "task_runs"
+            )
+        finally:
+            fresh.close()
+
         # Data preserved across the rebuild.
         assert len(conn.execute("SELECT * FROM task_events").fetchall()) == 2
         assert conn.execute("SELECT body FROM task_comments").fetchone()["body"] == "hi"
         assert len(conn.execute("SELECT * FROM task_runs").fetchall()) == 1
+        legacy_run = conn.execute(
+            "SELECT task_id, profile, status, started_at, recovery_required, "
+            "worker_boot_id, worker_starttime FROM task_runs WHERE task_id=?",
+            ("task-1",),
+        ).fetchone()
+        assert legacy_run is not None
+        assert (
+            legacy_run["task_id"],
+            legacy_run["profile"],
+            legacy_run["status"],
+            legacy_run["started_at"],
+            legacy_run["recovery_required"],
+            legacy_run["worker_boot_id"],
+            legacy_run["worker_starttime"],
+        ) == ("task-1", "default", "done", 1000, 0, None, None)
         # Non-numeric legacy cursor ("e-1") casts to 0.
         assert conn.execute("SELECT last_event_id FROM kanban_notify_subs").fetchone()["last_event_id"] == 0
+
+        # The rebuilt identity columns must support the same reviewer PID/run
+        # binding used by the production dispatch path.
+        review_task_id = kb.create_task(
+            conn, title="identity-bound review", assignee="programmer"
+        )
+        assert kb.claim_task(
+            conn, review_task_id, claimer="legacy-test:implementation"
+        ) is not None
+        assert kb.submit_task_for_review(
+            conn, review_task_id, "code-reviewer", trusted_operator=True
+        ) is not None
+        review = kb.claim_review_task(
+            conn, review_task_id, claimer="legacy-test:review"
+        )
+        assert review is not None
+        process = subprocess.Popen(["sleep", "30"])
+        try:
+            captured = kb._capture_process_handle(process.pid)
+            assert captured is not None
+            identity = captured.identity
+            captured.close()
+            authority = kb._latest_unconsumed_reviewer_authority(
+                conn, review_task_id
+            )
+            assert authority is not None
+            assert kb._set_worker_pid(
+                conn,
+                review_task_id,
+                process.pid,
+                expected_run_id=review.current_run_id,
+                expected_claim=review.claim_lock,
+                expected_assignee=review.assignee,
+                expected_authority=authority,
+            )
+            task_bound = conn.execute(
+                "SELECT worker_pid, worker_boot_id, worker_starttime "
+                "FROM tasks WHERE id=?",
+                (review_task_id,),
+            ).fetchone()
+            run_bound = conn.execute(
+                "SELECT worker_pid, worker_boot_id, worker_starttime "
+                "FROM task_runs WHERE id=?",
+                (review.current_run_id,),
+            ).fetchone()
+            for bound in (task_bound, run_bound):
+                assert bound is not None
+                assert (
+                    bound["worker_pid"],
+                    bound["worker_boot_id"],
+                    bound["worker_starttime"],
+                ) == (process.pid, identity.boot_id, identity.starttime)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            process.wait(timeout=5)
 
         # Indexes restored, including idx_events_run (added by the additive pass).
         indexes = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
