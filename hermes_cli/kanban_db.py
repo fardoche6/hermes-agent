@@ -11683,6 +11683,8 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_capability: list[tuple[str, str, str]] = field(default_factory=list)
+    """Tasks blocked before claim because required OAuth capability is unavailable."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -14637,6 +14639,67 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def _profile_model_provider(profile: Optional[str]) -> str:
+    if not profile:
+        return ""
+    try:
+        from hermes_cli.profiles import resolve_profile_env
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from hermes_cli.config import load_config_readonly
+        token = set_hermes_home_override(resolve_profile_env(profile))
+        try:
+            config = load_config_readonly()
+        finally:
+            reset_hermes_home_override(token)
+        model = config.get("model") if isinstance(config, dict) else None
+        if isinstance(model, dict):
+            return str(model.get("provider") or "").strip().lower()
+    except Exception:
+        _log.debug("kanban capability: unable to resolve model provider", exc_info=True)
+    return ""
+
+
+def _codex_capability_failure(task: Task) -> Optional[str]:
+    """Return a bounded remediation when Codex OAuth cannot serve a task."""
+    provider = (task.provider_override or _profile_model_provider(task.assignee)).strip().lower()
+    if provider != "openai-codex":
+        return None
+    profile_token = None
+    reset_profile_home = None
+    try:
+        from agent.credential_pool import STATUS_EXHAUSTED, load_pool
+        from hermes_cli.auth import AuthError
+        from hermes_cli.profiles import resolve_profile_env
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        reset_profile_home = reset_hermes_home_override
+        if task.assignee:
+            profile_token = set_hermes_home_override(resolve_profile_env(task.assignee))
+        pool = load_pool("openai-codex")
+        selected = pool.select()
+        if selected is None:
+            if any(entry.last_status == STATUS_EXHAUSTED for entry in pool._entries):
+                return None
+            raise AuthError(
+                "No usable Codex credentials remain after preflight",
+                provider="openai-codex", code="codex_auth_unavailable",
+                relogin_required=True,
+            )
+    except Exception as exc:
+        if not getattr(exc, "relogin_required", False):
+            return None
+        code = str(getattr(exc, "code", None) or "codex_auth_unavailable")
+        return (
+            "OpenAI Codex OAuth capability unavailable "
+            f"({code}); refresh/re-authenticate the assigned profile with "
+            "`hermes auth add openai-codex`, then unblock this task. "
+            "No provider fallback or retry was attempted."
+        )
+    finally:
+        if profile_token is not None and reset_profile_home is not None:
+            reset_profile_home(profile_token)
+    return None
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -15019,6 +15082,23 @@ def _dispatch_once_locked(
                         conn, row["id"], "respawn_guarded",
                         {"reason": guard_reason},
                     )
+            continue
+        capability_task = get_task(conn, row["id"])
+        capability_reason = (
+            _codex_capability_failure(capability_task)
+            if capability_task is not None
+            else None
+        )
+        if capability_reason is not None:
+            result.skipped_capability.append((row["id"], row_assignee, capability_reason))
+            if not dry_run:
+                with write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET status='blocked', block_kind='capability', "
+                        "last_failure_error=? WHERE id=? AND status='ready'",
+                        (capability_reason, row["id"]),
+                    )
+                    _append_event(conn, row["id"], "capability_blocked", {"reason": capability_reason})
             continue
         if dry_run:
             # A card the review planner claimed would be reconciled this

@@ -17,7 +17,9 @@ mocking the save boundary, so they exercise the actual atomic write path.
 """
 
 import json
+import multiprocessing
 import threading
+import time
 
 import pytest
 
@@ -26,6 +28,7 @@ from agent.credential_pool import (
     AUTH_TYPE_OAUTH,
     CredentialPool,
     PooledCredential,
+    STATUS_EXHAUSTED,
 )
 from hermes_cli import auth as A
 
@@ -51,6 +54,14 @@ def _entry(provider: str, *, id: str, access_token: str, refresh_token: str):
         refresh_token=refresh_token,
     )
 
+
+def _codex_entry(*, id, access_token, refresh_token, source="manual:device_code", grant_id=None):
+    return PooledCredential(
+        provider="openai-codex", id=id, label="codex", auth_type=AUTH_TYPE_OAUTH,
+        priority=0, source=source, access_token=access_token,
+        refresh_token=refresh_token,
+        extra={} if grant_id is None else {"shared_grant_id": grant_id},
+    )
 
 @pytest.fixture
 def profile_and_root(tmp_path, monkeypatch):
@@ -167,6 +178,159 @@ def test_global_write_through_preserves_concurrent_root_update(
     assert root["credential_pool"]["openrouter"] == [{"id": "openrouter-existing"}]
 
 
+def test_exact_idless_alias_gets_random_shared_grant_id(profile_and_root):
+    profile_path, root_path = profile_and_root
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    _write_store(root_path, {"version": 1, "providers": {"openai-codex": {
+        "tokens": {"access_token": "a", "refresh_token": "r"}}}})
+    alias = _codex_entry(id="alias", access_token="a", refresh_token="r")
+    second = _codex_entry(id="second", access_token="a", refresh_token="r")
+    pool = CredentialPool("openai-codex", [alias, second])
+    synced = pool._sync_codex_entry_from_auth_store(alias)
+    second_synced = pool._sync_codex_entry_from_auth_store(second)
+    grant = _read_store(root_path)["providers"]["openai-codex"]["shared_grant_id"]
+    assert len(grant) == 32 and all(c in "0123456789abcdef" for c in grant)
+    assert synced.extra["shared_grant_id"] == grant
+    assert second_synced.extra["shared_grant_id"] == grant
+
+
+def test_existing_grant_id_is_adopted_only_for_exact_provenance(profile_and_root):
+    profile_path, root_path = profile_and_root
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    _write_store(root_path, {"version": 1, "providers": {"openai-codex": {
+        "shared_grant_id": "g0", "tokens": {"access_token": "a", "refresh_token": "r"}}}})
+    exact = _codex_entry(id="exact", access_token="a", refresh_token="r")
+    mismatch = _codex_entry(id="mismatch", access_token="a", refresh_token="other")
+    wrong_id = _codex_entry(id="wrong-id", access_token="a", refresh_token="r", grant_id="other-grant")
+    pool = CredentialPool("openai-codex", [exact, mismatch])
+    assert pool._sync_codex_entry_from_auth_store(exact).extra["shared_grant_id"] == "g0"
+    assert pool._sync_codex_entry_from_auth_store(mismatch) is mismatch
+    assert pool._sync_codex_entry_from_auth_store(wrong_id) is wrong_id
+
+
+def test_stale_alias_refresh_uses_current_canonical_tokens(profile_and_root, monkeypatch):
+    profile_path, root_path = profile_and_root
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    _write_store(root_path, {"version": 1, "providers": {"openai-codex": {
+        "shared_grant_id": "g", "tokens": {"access_token": "a1", "refresh_token": "r1"}}}})
+    calls = []
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", lambda access, refresh: (
+        calls.append((access, refresh)) or {"access_token": "a2", "refresh_token": "r2"}))
+    alias = _codex_entry(id="alias", access_token="stale", refresh_token="revoked", grant_id="g")
+    updated = CredentialPool("openai-codex", [alias])._refresh_entry(alias, force=True)
+    assert calls == [("a1", "r1")]
+    assert (updated.access_token, updated.refresh_token) == ("a2", "r2")
+
+
+def test_canonical_rotations_converge_aliases(profile_and_root):
+    profile_path, root_path = profile_and_root
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    pool = CredentialPool("openai-codex", [])
+    alias = _codex_entry(id="alias", access_token="a0", refresh_token="r0", grant_id="g")
+    for generation in ("1", "2"):
+        _write_store(root_path, {"version": 1, "providers": {"openai-codex": {
+            "shared_grant_id": "g", "tokens": {
+                "access_token": f"a{generation}", "refresh_token": f"r{generation}"
+            }}}})
+        alias = pool._sync_codex_entry_from_auth_store(alias)
+        assert (alias.access_token, alias.refresh_token) == (f"a{generation}", f"r{generation}")
+
+
+def test_terminal_shared_refresh_quarantines_matching_aliases_only(profile_and_root, monkeypatch):
+    profile_path, root_path = profile_and_root
+    _write_store(profile_path, {"version": 1, "providers": {"openai-codex": {
+        "shared_grant_id": "g", "tokens": {"access_token": "shadow", "refresh_token": "shadow-r"}}}})
+    _write_store(root_path, {"version": 1, "providers": {"openai-codex": {
+        "shared_grant_id": "g", "tokens": {"access_token": "a", "refresh_token": "r"}}}})
+    def rejected(*args, **kwargs):
+        raise A.AuthError("revoked", provider="openai-codex", code="invalid_grant", relogin_required=True)
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", rejected)
+    same = _codex_entry(id="same", access_token="a", refresh_token="r", grant_id="g")
+    other = _codex_entry(id="other", access_token="x", refresh_token="y", grant_id="independent")
+    pool = CredentialPool("openai-codex", [same, other])
+    assert pool._refresh_entry(same, force=True) is None
+    assert [entry.id for entry in pool._entries] == ["other"]
+    assert _read_store(root_path)["providers"]["openai-codex"]["tokens"] == {}
+    assert "openai-codex" not in _read_store(profile_path).get("providers", {})
+
+
+def test_terminal_shared_refresh_removes_canonical_root_pool_alias_on_reload(
+    profile_and_root, monkeypatch
+):
+    profile_path, root_path = profile_and_root
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    _write_store(root_path, {
+        "version": 1,
+        "providers": {"openai-codex": {
+            "shared_grant_id": "grant-q",
+            "tokens": {"access_token": "a", "refresh_token": "r"},
+        }},
+        "credential_pool": {"openai-codex": [
+            _codex_entry(id="root-alias", access_token="a", refresh_token="r",
+                         grant_id="grant-q").to_dict(),
+            _codex_entry(id="independent", access_token="ia", refresh_token="ir",
+                         grant_id="grant-independent").to_dict(),
+        ]},
+    })
+
+    def rejected(*args, **kwargs):
+        raise A.AuthError("revoked", provider="openai-codex", code="invalid_grant", relogin_required=True)
+
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", rejected)
+    doomed = _codex_entry(id="doomed", access_token="a", refresh_token="r", grant_id="grant-q")
+    pool = CredentialPool("openai-codex", [doomed])
+    assert pool._refresh_entry(doomed, force=True) is None
+    assert all(
+        item.get("shared_grant_id") != "grant-q"
+        for item in _read_store(root_path)["credential_pool"]["openai-codex"]
+    )
+    reloaded = CP.load_pool("openai-codex")
+    assert reloaded.select() is not None
+    assert reloaded.select().extra["shared_grant_id"] == "grant-independent"
+
+
+def test_terminal_canonical_grant_fail_closed_for_copied_profile_alias(
+    profile_and_root,
+):
+    profile_path, root_path = profile_and_root
+    _write_store(profile_path, {"version": 1, "providers": {}, "credential_pool": {
+        "openai-codex": [_codex_entry(
+            id="copied-alias", access_token="stale-a", refresh_token="stale-r",
+            grant_id="grant-q",
+        ).to_dict(), _codex_entry(
+            id="independent", access_token="ia", refresh_token="ir",
+            grant_id="grant-independent",
+        ).to_dict()],
+    }})
+    _write_store(root_path, {"version": 1, "providers": {"openai-codex": {
+        "shared_grant_id": "grant-q",
+        "tokens": {},
+        "last_auth_error": {"relogin_required": True, "reason": "credential_pool_refresh_failure"},
+    }}})
+
+    pool = CP.load_pool("openai-codex")
+    selected = pool.select()
+    assert selected is not None
+    assert selected.extra["shared_grant_id"] == "grant-independent"
+    assert all(item.extra.get("shared_grant_id") != "grant-q" for item in pool._entries)
+
+
+def test_transient_refresh_failure_keeps_shared_grant_available(profile_and_root, monkeypatch):
+    profile_path, root_path = profile_and_root
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    _write_store(root_path, {"version": 1, "providers": {"openai-codex": {
+        "shared_grant_id": "g", "tokens": {"access_token": "a", "refresh_token": "r"}}}})
+    def transient(*args, **kwargs):
+        raise A.AuthError("busy", provider="openai-codex", code="codex_rate_limited", relogin_required=False)
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", transient)
+    entry = _codex_entry(id="same", access_token="a", refresh_token="r", grant_id="g")
+    pool = CredentialPool("openai-codex", [entry])
+    assert pool._refresh_entry(entry, force=True) is None
+    assert pool._entries[0].last_status == "exhausted"
+    assert pool._entries[0].extra.get("shared_grant_id") == "g"
+    assert _read_store(root_path)["providers"]["openai-codex"]["tokens"]["refresh_token"] == "r"
+
+
 def test_codex_pool_refresh_holds_auth_store_lock_across_post(monkeypatch, tmp_path):
     """The Codex OAuth pool refresh must POST under the cross-process auth lock.
 
@@ -232,6 +396,82 @@ def test_codex_pool_refresh_holds_auth_store_lock_across_post(monkeypatch, tmp_p
     assert refreshed.refresh_token == "rotated-refresh"
     # The invariant: the single-use token POST ran inside the auth-store lock.
     assert lock_held["during_post"] is True
+
+
+def _rotate_codex_refresh(access, refresh, calls, old_calls, release):
+    """Synthetic token endpoint with a single-use old refresh token."""
+    with calls.get_lock():
+        calls.value += 1
+        if (access, refresh) == ("old-access", "old-single-use-refresh"):
+            old_calls.value += 1
+        assert refresh != "revoked-old-refresh"
+    release.wait(timeout=10)
+    if (access, refresh) == ("old-access", "old-single-use-refresh"):
+        return {"access_token": "new-access", "refresh_token": "new-single-use-refresh"}
+    return {"access_token": "final-access", "refresh_token": "final-refresh"}
+
+
+def _concurrent_codex_refresh_worker(
+    profile_path, root_path, calls, old_calls, start, ready, release
+):
+    """Run one real pool refresh in a separate process with synthetic state."""
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(A, "_auth_file_path", lambda: profile_path)
+        monkeypatch.setattr(A, "_global_auth_file_path", lambda: root_path)
+        monkeypatch.setattr(CP, "_global_auth_file_path", lambda: root_path)
+        monkeypatch.setattr(CP, "_same_path", A._same_path)
+        monkeypatch.setattr(A, "refresh_codex_oauth_pure", lambda access, refresh: _rotate_codex_refresh(
+            access, refresh, calls, old_calls, release
+        ))
+        monkeypatch.setattr(CP, "refresh_codex_oauth_pure", A.refresh_codex_oauth_pure, raising=False)
+        entry = _codex_entry(
+            id=f"process-{multiprocessing.current_process().pid}",
+            access_token="old-access", refresh_token="old-single-use-refresh",
+            source="manual:device_code", grant_id="grant-1",
+        )
+        pool = CredentialPool("openai-codex", [entry])
+        ready.set()
+        start.wait(timeout=10)
+        refreshed = pool._refresh_entry(entry, force=True)
+        assert refreshed is not None
+        assert refreshed.refresh_token != "revoked-old-refresh"
+    finally:
+        monkeypatch.undo()
+
+
+def test_codex_refresh_concurrent_processes_serialize_and_adopt_canonical_rotation(
+    tmp_path, monkeypatch
+):
+    """Two processes spend the old token once and converge on root state."""
+    profile_path = tmp_path / "profile" / "auth.json"
+    root_path = tmp_path / "root" / "auth.json"
+    monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    _write_store(root_path, {"version": 1, "providers": {"openai-codex": {
+        "shared_grant_id": "grant-1",
+        "tokens": {"access_token": "old-access", "refresh_token": "old-single-use-refresh"},
+    }}})
+    ctx = multiprocessing.get_context("fork")
+    start, release = ctx.Event(), ctx.Event()
+    ready = [ctx.Event(), ctx.Event()]
+    calls, old_calls = ctx.Value("i", 0), ctx.Value("i", 0)
+    workers = [ctx.Process(target=_concurrent_codex_refresh_worker, args=(
+        profile_path, root_path, calls, old_calls, start, ready[i], release
+    )) for i in range(2)]
+    for worker in workers:
+        worker.start()
+    assert all(event.wait(timeout=10) for event in ready)
+    start.set()
+    time.sleep(0.2)
+    release.set()
+    for worker in workers:
+        worker.join(timeout=15)
+        assert worker.exitcode == 0
+    assert old_calls.value == 1
+    assert calls.value == 2
+    tokens = _read_store(root_path)["providers"]["openai-codex"]["tokens"]
+    assert tokens["refresh_token"] == "final-refresh"
 
 
 def test_write_through_fires_on_every_refresh_not_just_first(

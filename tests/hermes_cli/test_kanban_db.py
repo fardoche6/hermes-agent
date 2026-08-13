@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -15,6 +16,7 @@ from pathlib import Path
 import pytest
 
 import hermes_state
+from hermes_cli import auth as auth_mod
 from hermes_cli import kanban_db as kb
 
 
@@ -1200,6 +1202,124 @@ def test_resolve_hermes_argv_module_actually_runs():
         f"stderr={r.stderr[:200]!r}"
     )
     assert "Hermes Agent" in r.stdout, f"unexpected output: {r.stdout[:200]!r}"
+
+
+def test_codex_capability_preflight_uses_pool_and_blocks_irrecoverable_oauth(monkeypatch):
+    task = _make_task(id="codex", assignee="programmer", provider_override="openai-codex")
+    calls = []
+
+    class Pool:
+        _entries = []
+
+        def select(self):
+            calls.append("select")
+            raise auth_mod.AuthError(
+                "revoked", provider="openai-codex", code="invalid_grant", relogin_required=True
+            )
+
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: Pool())
+    monkeypatch.setattr(kb, "_profile_model_provider", lambda profile: "openai-codex")
+    monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda profile: "/tmp")
+    reason = kb._codex_capability_failure(task)
+    assert calls == ["select"]
+    assert reason is not None and "invalid_grant" in reason
+    assert "fallback" in reason.lower()
+
+
+def test_non_codex_programmer_route_is_not_capability_gated(monkeypatch):
+    task = _make_task(id="openrouter", assignee="programmer", provider_override="openrouter")
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: pytest.fail("unexpected pool access"))
+    assert kb._codex_capability_failure(task) is None
+
+
+def test_codex_capability_preflight_does_not_create_profile_shadow(monkeypatch):
+    task = _make_task(id="codex", assignee="reviewer", provider_override="openai-codex")
+
+    class Pool:
+        _entries = []
+
+        def select(self):
+            return object()
+
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: Pool())
+    monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda profile: "/tmp")
+    assert kb._codex_capability_failure(task) is None
+
+
+def test_dispatch_once_capability_blocks_codex_before_claim_without_fallback_or_shadow(
+    kanban_home, monkeypatch, tmp_path
+):
+    """Irrecoverable Codex OAuth blocks before dispatch creates a run."""
+    profile_home = tmp_path / "profiles" / "programmer"
+    calls = []
+
+    class DeadPool:
+        _entries = []
+
+        def select(self):
+            calls.append("select")
+            raise auth_mod.AuthError(
+                "revoked", provider="openai-codex", code="invalid_grant",
+                relogin_required=True,
+            )
+
+    monkeypatch.setattr(kb, "_profile_model_provider", lambda _: "openai-codex")
+    monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda _: str(profile_home))
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda _: DeadPool())
+    monkeypatch.setattr(kb, "_profile_is_configured", lambda _: True)
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="codex capability", assignee="programmer")
+        result = kb.dispatch_once(
+            conn, dry_run=False,
+            spawn_fn=lambda *args: pytest.fail("provider fallback or claim occurred"),
+        )
+        task = kb.get_task(conn, task_id)
+        runs = conn.execute("SELECT id FROM task_runs WHERE task_id = ?", (task_id,)).fetchall()
+    assert calls == ["select"]
+    assert result.spawned == []
+    assert result.skipped_capability and result.skipped_capability[0][0] == task_id
+    assert task.status == "blocked"
+    assert task.block_kind == "capability"
+    assert "invalid_grant" in task.last_failure_error
+    assert runs == []
+    assert not (profile_home / "auth.json").exists()
+
+
+def test_dispatch_once_healthy_codex_pool_claims_through_same_preflight(
+    kanban_home, monkeypatch, tmp_path
+):
+    """A healthy pool passes preflight and follows normal claim behavior."""
+    profile_home = tmp_path / "profiles" / "programmer"
+    spawned = []
+
+    class HealthyPool:
+        _entries = [object()]
+
+        def select(self):
+            return self._entries[0]
+
+    monkeypatch.setattr(kb, "_profile_model_provider", lambda _: "openai-codex")
+    monkeypatch.setattr("hermes_cli.profiles.resolve_profile_env", lambda _: str(profile_home))
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda _: HealthyPool())
+    monkeypatch.setattr(kb, "_profile_is_configured", lambda _: True)
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _: True)
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="codex healthy", assignee="programmer")
+        result = kb.dispatch_once(
+            conn, dry_run=False,
+            spawn_fn=lambda task, workdir, **kwargs: spawned.append(
+                (task.id, workdir)
+            ) or 4242,
+        )
+        task = kb.get_task(conn, task_id)
+        runs = conn.execute("SELECT id FROM task_runs WHERE task_id = ?", (task_id,)).fetchall()
+    assert task is not None
+    assert result.skipped_capability == []
+    assert spawned == [(task_id, task.workspace_path)]
+    assert task.status == "running"
+    assert len(runs) == 1
+    assert not (profile_home / "auth.json").exists()
 
 
 # ---------------------------------------------------------------------------
