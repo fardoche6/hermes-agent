@@ -9202,13 +9202,16 @@ def _profile_model_provider(profile: Optional[str]) -> str:
         return str(model.get("provider") or "").strip().lower() if isinstance(model, dict) else ""
     except Exception:
         _log.debug("kanban capability: unable to resolve model provider")
-        return "__capability_unavailable__"
+        # Provider resolution is intentionally tri-state at this boundary:
+        # only an explicit openai-codex result opts a task into the native
+        # Codex capability preflight.  An unresolved profile may be a
+        # launcher, external provider, or an ordinary test fixture, and must
+        # not be reinterpreted as Codex.
+        return ""
 
 
 def _codex_capability_failure(task: Task) -> Optional[str]:
     provider = (task.provider_override or _profile_model_provider(task.assignee)).strip().lower()
-    if provider == "__capability_unavailable__":
-        return "OpenAI Codex OAuth capability unavailable (codex_auth_unavailable); assigned profile capability could not be established. No provider fallback or retry was attempted."
     if provider != "openai-codex":
         return None
     profile_token = None

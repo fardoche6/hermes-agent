@@ -1325,6 +1325,16 @@ def test_non_codex_programmer_route_is_not_capability_gated(monkeypatch):
     assert kb._codex_capability_failure(task) is None
 
 
+def test_unresolved_profile_provider_is_not_capability_gated(monkeypatch):
+    task = _make_task(id="unresolved", assignee="ordinary-profile")
+    monkeypatch.setattr(kb, "_profile_model_provider", lambda _profile: "")
+    monkeypatch.setattr(
+        "agent.credential_pool.load_pool_readonly",
+        lambda _provider: pytest.fail("unexpected pool access"),
+    )
+    assert kb._codex_capability_failure(task) is None
+
+
 def test_codex_capability_preflight_does_not_create_profile_shadow(
     monkeypatch, tmp_path
 ):
