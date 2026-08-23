@@ -244,6 +244,121 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
         assert payload["host_local"] is True
 
 
+def test_stale_claim_at_heartbeat_boundary_reclaims_live_local_worker(
+    kanban_home, monkeypatch,
+):
+    """A live worker exactly at the heartbeat limit is already stale."""
+    import json
+    import hermes_cli.kanban_db as _kb
+
+    fixed_now = 1_900_000_000
+    monkeypatch.setattr(_kb.time, "time", lambda: fixed_now)
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(
+        _kb,
+        "_terminate_reclaimed_worker",
+        lambda *_args, **_kwargs: {
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": True,
+        },
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="heartbeat boundary", assignee="worker")
+        host = _kb._claimer_id().split(":", 1)[0]
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock=?, worker_pid=?, "
+            "claim_expires=?, last_heartbeat_at=? WHERE id=?",
+            (
+                f"{host}:worker",
+                12345,
+                fixed_now - 1,
+                fixed_now - _kb.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS,
+                task_id,
+            ),
+        )
+        conn.commit()
+
+        assert kb.release_stale_claims(conn, signal_fn=lambda *_args: None) == 1
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+        event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id=? AND kind='reclaimed'",
+            (task_id,),
+        ).fetchone()
+        assert event is not None
+        payload = json.loads(event["payload"])
+        assert payload["heartbeat_stale"] is True
+        assert payload["claim_expires"] == fixed_now - 1
+
+
+def test_stale_claim_with_null_expiry_and_stale_heartbeat_reclaims_without_crash(
+    kanban_home, monkeypatch,
+):
+    """Heartbeat staleness must reclaim a schema-valid NULL-expiry claim."""
+    import json
+    import hermes_cli.kanban_db as _kb
+
+    fixed_now = 1_900_000_000
+    monkeypatch.setattr(_kb.time, "time", lambda: fixed_now)
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="null expiry", assignee="worker")
+        host = _kb._claimer_id().split(":", 1)[0]
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock=?, worker_pid=NULL, "
+            "claim_expires=NULL, last_heartbeat_at=? WHERE id=?",
+            (
+                f"{host}:worker",
+                fixed_now - _kb.DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS,
+                task_id,
+            ),
+        )
+        conn.commit()
+
+        assert kb.release_stale_claims(conn, signal_fn=lambda *_args: None) == 1
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+        event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id=? AND kind='reclaimed'",
+            (task_id,),
+        ).fetchone()
+        assert event is not None
+        payload = json.loads(event["payload"])
+        assert payload["claim_expires"] is None
+        assert payload["heartbeat_stale"] is True
+
+
+def test_null_expiry_without_heartbeat_is_not_reclaimed(
+    kanban_home, monkeypatch,
+):
+    """NULL expiry without a stale heartbeat is an unleased claim, not stale."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="unleased claim", assignee="worker")
+        conn.execute(
+            "UPDATE tasks SET status='running', claim_lock='remote:worker', "
+            "claim_expires=NULL, worker_pid=NULL, last_heartbeat_at=NULL "
+            "WHERE id=?",
+            (task_id,),
+        )
+        conn.commit()
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        assert kb.release_stale_claims(conn, signal_fn=lambda *_args: None) == 0
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert task.claim_expires is None
+
+
 
 
 
