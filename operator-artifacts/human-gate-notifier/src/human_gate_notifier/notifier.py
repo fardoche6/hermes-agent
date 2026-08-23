@@ -17,6 +17,7 @@ _SECRET_PATTERNS = (
     re.compile(r"-----BEGIN [^-]*PRIVATE KEY-----", re.IGNORECASE),
     re.compile(r"\bbearer\s+[A-Za-z0-9._~+/=-]{20,}", re.IGNORECASE),
 )
+_SHORT_AGE_PATTERN = re.compile(r"[0-9]+ (?:minutes?|hours?|days?)\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +66,8 @@ def _validate(alert: HumanGateAlert) -> None:
         raise ValueError("task title, board, age, situation, and decision are required")
     if not isinstance(alert.task_id, str) or not alert.task_id.strip():
         raise ValueError("task id is required")
+    if not _SHORT_AGE_PATTERN.fullmatch(alert.blocked_age.strip()):
+        raise ValueError("age must be a short integer minutes, hours, or days value")
     if len(alert.suggestions) != 3:
         raise ValueError("exactly three suggestions are required")
     if sum(suggestion.recommended for suggestion in alert.suggestions) != 1:
