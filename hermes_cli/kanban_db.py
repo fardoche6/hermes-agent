@@ -4664,20 +4664,22 @@ def heartbeat_claim(
     Workers should call this periodically to keep ownership and publish
     observable progress before the one-hour heartbeat-staleness backstop.
     """
-    expires = int(time.time()) + _resolve_claim_ttl_seconds(ttl_seconds)
+    now = int(time.time())
+    expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     lock = claimer or _claimer_id()
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE tasks SET claim_expires = ? "
+            "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? "
             "WHERE id = ? AND status IN ('running', 'review') AND claim_lock = ?",
-            (expires, task_id, lock),
+            (expires, now, task_id, lock),
         )
         if cur.rowcount == 1:
             run_id = _current_run_id(conn, task_id)
             if run_id is not None:
                 conn.execute(
-                    "UPDATE task_runs SET claim_expires = ? WHERE id = ?",
-                    (expires, run_id),
+                    "UPDATE task_runs SET claim_expires = ?, last_heartbeat_at = ? "
+                    "WHERE id = ?",
+                    (expires, now, run_id),
                 )
             return True
         return False
