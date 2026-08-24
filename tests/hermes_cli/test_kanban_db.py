@@ -853,6 +853,29 @@ def test_fresh_retry_resets_prior_run_heartbeat(kanban_home, monkeypatch):
         assert refreshed.status == "running"
 
 
+def test_heartbeat_claim_refreshes_last_heartbeat_at(kanban_home, monkeypatch):
+    import hermes_cli.kanban_db as _kb
+
+    fixed_now = 1_900_000_000
+    monkeypatch.setattr(_kb.time, "time", lambda: fixed_now)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="heartbeat refresh", assignee="worker")
+        claimed = kb.claim_task(conn, task_id, claimer="test:worker")
+        assert claimed is not None
+        old_heartbeat = fixed_now - 60
+        conn.execute(
+            "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?",
+            (old_heartbeat, task_id),
+        )
+        conn.commit()
+
+        assert kb.heartbeat_claim(conn, task_id, claimer="test:worker") is True
+        refreshed = kb.get_task(conn, task_id)
+        assert refreshed is not None
+        assert refreshed.last_heartbeat_at == fixed_now
+
+
 def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
     kanban_home, monkeypatch,
 ):
