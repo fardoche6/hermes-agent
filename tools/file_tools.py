@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import posixpath
+import stat
 import sys
 import threading
 from pathlib import Path, PurePosixPath
@@ -411,6 +412,37 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
     return resolved.resolve()
 
 
+def _lexical_absolute_path_for_task(filepath: str, task_id: str = "default") -> str:
+    """Build an absolute host path without dereferencing its final component.
+
+    Protected-write preflight needs to inspect the directory entry the backend
+    would replace.  ``Path.resolve()`` follows the final symlink, so use only
+    lexical expansion and normalization here.  The task/session cwd remains
+    the anchor for relative paths, matching the normal file-tool resolver.
+    """
+    from tools.environments.local import _msys_to_windows_path
+
+    expanded = _expand_tilde(_msys_to_windows_path(filepath))
+    if sys.platform == "win32":
+        import ntpath
+
+        if ntpath.isabs(expanded):
+            return ntpath.normpath(expanded)
+        base = _authoritative_workspace_root(task_id) or os.getcwd()
+        base = _expand_tilde(_msys_to_windows_path(base))
+        if not ntpath.isabs(base):
+            base = ntpath.abspath(base)
+        return ntpath.normpath(ntpath.join(base, expanded))
+
+    if os.path.isabs(expanded):
+        return os.path.normpath(expanded)
+    base = _authoritative_workspace_root(task_id) or os.getcwd()
+    base = _expand_tilde(base)
+    if not os.path.isabs(base):
+        base = os.path.abspath(base)
+    return os.path.normpath(os.path.join(base, expanded))
+
+
 def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "default") -> str | None:
     """Warn when a relative path resolved OUTSIDE the task's workspace root.
 
@@ -793,7 +825,8 @@ def _protected_instruction_config() -> tuple[bool, list[str]]:
 
 def _protected_instruction_reason(filepath: str, task_id: str = "default",
                                   *, enabled: bool | None = None,
-                                  extra_patterns: list[str] | None = None) -> str | None:
+                                  extra_patterns: list[str] | None = None,
+                                  resolve_target: bool = True) -> str | None:
     """Return a short label when ``filepath`` targets a protected
     agent-instruction file, else ``None``.
 
@@ -808,10 +841,16 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         return None
 
     normalized = os.path.normpath(_expand_tilde(filepath))
-    try:
-        resolved = os.path.realpath(str(_resolve_path_for_task(filepath, task_id)))
-    except (OSError, ValueError, RuntimeError):
-        resolved = os.path.realpath(normalized)
+    if resolve_target:
+        try:
+            resolved = os.path.realpath(str(_resolve_path_for_task(filepath, task_id)))
+        except (OSError, ValueError, RuntimeError):
+            resolved = os.path.realpath(normalized)
+    else:
+        # The protected-write preflight passes a lexical absolute path here.
+        # Do not resolve it: resolving would follow the final symlink before
+        # lstat() gets a chance to classify the directory entry itself.
+        resolved = normalized
 
     # The authoritative ~/.hermes home is governed by its own guards
     # (config.yaml hard-block, cross-profile guard, write_approval); this
@@ -966,6 +1005,137 @@ def _check_protected_instruction_write(paths: list[str],
     if not reasons:
         return None
     return _request_protected_instruction_approval(reasons, task_id)
+
+
+def _protected_instruction_symlink_error(path: str, reason: str) -> str:
+    """Return the actionable refusal for a protected final symlink."""
+    return (
+        f"BLOCKED: protected agent-instruction destination {path!r} ({reason}) "
+        "is a symlink. The user—not an agent—must replace/remove the symlink "
+        "explicitly; the agent must not retry."
+    )
+
+
+def _protected_instruction_safe_verification_error(
+        path: str, backend: str, detail: str) -> str:
+    """Return a fail-closed error when final-link status cannot be proven."""
+    return (
+        "BLOCKED: unsupported-safe-verification: protected "
+        f"agent-instruction destination {path!r} cannot have its final-link "
+        f"status proven on backend {backend!r} ({detail}) before approval or "
+        "mutation; the agent must not retry."
+    )
+
+
+def _preflight_protected_instruction_write(
+        paths: list[str], task_id: str = "default") -> str | None:
+    """Refuse protected symlink destinations before the approval gate.
+
+    Only the local backend can prove the final directory entry with ``lstat``.
+    Remote/container paths are therefore rejected when their lexical path is a
+    protected instruction target, without inspecting a host-side lookalike.
+    """
+    enabled, extra = _protected_instruction_config()
+    if not enabled or not paths:
+        return None
+
+    try:
+        backend = str(_terminal_env_type_for_task(task_id) or "").strip().lower()
+    except Exception as exc:
+        backend = "unknown"
+        backend_error = f"backend type unavailable: {type(exc).__name__}: {exc}"
+    else:
+        backend_error = "final-link status is not locally provable"
+
+    for requested_path in paths:
+        path_text = str(requested_path)
+
+        if backend == "local":
+            try:
+                lexical_path = _lexical_absolute_path_for_task(
+                    requested_path, task_id
+                )
+            except Exception as exc:
+                try:
+                    reason = _protected_instruction_reason(
+                        requested_path,
+                        task_id,
+                        enabled=enabled,
+                        extra_patterns=extra,
+                        resolve_target=False,
+                    )
+                except Exception:
+                    reason = None
+                if reason:
+                    return _protected_instruction_safe_verification_error(
+                        path_text,
+                        backend,
+                        f"could not construct lexical destination: {type(exc).__name__}: {exc}",
+                    )
+                continue
+
+            try:
+                reason = _protected_instruction_reason(
+                    lexical_path,
+                    task_id,
+                    enabled=enabled,
+                    extra_patterns=extra,
+                    resolve_target=False,
+                )
+            except Exception as exc:
+                return _protected_instruction_safe_verification_error(
+                    path_text,
+                    backend,
+                    f"protected-path classification failed: {type(exc).__name__}: {exc}",
+                )
+            if not reason:
+                # Preserve existing behavior for non-protected symlinks,
+                # including an innocent name that points to a protected file;
+                # the existing realpath-aware approval gate handles that case.
+                continue
+
+            try:
+                entry = os.lstat(lexical_path)
+            except FileNotFoundError:
+                # A missing final entry is a new regular destination.  Its
+                # eventual creation is still covered by the normal approval
+                # gate below.
+                continue
+            except OSError as exc:
+                return _protected_instruction_safe_verification_error(
+                    path_text,
+                    backend,
+                    f"lstat failed: {type(exc).__name__}: {exc}",
+                )
+            if stat.S_ISLNK(entry.st_mode):
+                return _protected_instruction_symlink_error(path_text, reason)
+            continue
+
+        # Do not call the normal realpath-aware reason helper for remote or
+        # container paths: that would inspect a host-side lookalike.  The
+        # lexical-only mode still applies the same configured basename and
+        # project-local .hermes rules.
+        try:
+            reason = _protected_instruction_reason(
+                requested_path,
+                task_id,
+                enabled=enabled,
+                extra_patterns=extra,
+                resolve_target=False,
+            )
+        except Exception as exc:
+            return _protected_instruction_safe_verification_error(
+                path_text,
+                backend or "unknown",
+                f"protected-path classification failed: {type(exc).__name__}: {exc}",
+            )
+        if reason:
+            return _protected_instruction_safe_verification_error(
+                path_text,
+                backend or "unknown",
+                backend_error,
+            )
+    return None
 
 
 def _check_approval_required_write(paths: list[str],
@@ -2279,10 +2449,15 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     """Write content to a file.
 
     ``cross_profile`` bypasses the #32049 sandbox-mirror lost-write
-    guards (writes the host process would never read). Unadvertised in
-    the schema — the mirror rejection error teaches it. The cross-PROFILE
+    guards (writes the host process would never read). Unadvertised in the
+    schema — the mirror rejection error teaches it. The cross-PROFILE
     guard this flag was named for is removed (profiles are not isolated).
     """
+    protected_preflight_err = _preflight_protected_instruction_write(
+        [path], task_id
+    )
+    if protected_preflight_err:
+        return tool_error(protected_preflight_err)
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -2425,6 +2600,11 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 if _err:
                     return _err
                 _paths_to_check.append(v4a_path)
+    protected_preflight_err = _preflight_protected_instruction_write(
+        _paths_to_check, task_id
+    )
+    if protected_preflight_err:
+        return tool_error(protected_preflight_err)
     for _p in _paths_to_check:
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:

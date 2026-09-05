@@ -508,6 +508,165 @@ class TestProtectedInstructionFiles:
 
     # ---- adversarial path shapes ----------------------------------------
 
+    @pytest.mark.require_symlinks
+    @pytest.mark.parametrize("auto_approve", [False, True])
+    def test_final_protected_symlink_refused_before_approval(
+        self, tmp_path, approvals, monkeypatch, auto_approve
+    ):
+        import tools.approval as approval
+
+        target = tmp_path / "external-rules.md"
+        target.write_bytes(b"original\n")
+        link = tmp_path / "AGENTS.md"
+        link.symlink_to(target)
+        target_bytes = target.read_bytes()
+        link_target = os.readlink(link)
+        approvals["answer"] = "once"
+        if auto_approve:
+            monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", True)
+
+        res = self._write(link, "injected\n")
+
+        assert res.get("error")
+        assert "user" in res["error"] and "not an agent" in res["error"]
+        assert "replace/remove the symlink explicitly" in res["error"]
+        assert "must not retry" in res["error"]
+        assert approvals["calls"] == []
+        assert target.read_bytes() == target_bytes
+        assert link.is_symlink()
+        assert os.readlink(link) == link_target
+
+    @pytest.mark.require_symlinks
+    def test_dangling_final_protected_symlink_refused(self, tmp_path, approvals):
+        missing = tmp_path / "missing-rules.md"
+        link = tmp_path / "CLAUDE.md"
+        link.symlink_to(missing)
+        link_target = os.readlink(link)
+
+        res = self._write(link, "injected\n")
+
+        assert res.get("error")
+        assert "replace/remove the symlink explicitly" in res["error"]
+        assert approvals["calls"] == []
+        assert not missing.exists()
+        assert link.is_symlink()
+        assert os.readlink(link) == link_target
+
+    @pytest.mark.require_symlinks
+    def test_final_protected_symlink_to_directory_refused(self, tmp_path, approvals):
+        external_dir = tmp_path / "external-dir"
+        external_dir.mkdir()
+        marker = external_dir / "marker.txt"
+        marker.write_bytes(b"unchanged\n")
+        link = tmp_path / "SOUL.md"
+        link.symlink_to(external_dir, target_is_directory=True)
+        link_target = os.readlink(link)
+
+        res = self._write(link, "injected\n")
+
+        assert res.get("error")
+        assert "replace/remove the symlink explicitly" in res["error"]
+        assert approvals["calls"] == []
+        assert marker.read_bytes() == b"unchanged\n"
+        assert link.is_symlink()
+        assert os.readlink(link) == link_target
+
+    @pytest.mark.require_symlinks
+    def test_configured_protected_basename_symlink_refused(
+        self, tmp_path, approvals, monkeypatch
+    ):
+        import tools.file_tools as ft
+
+        monkeypatch.setattr(
+            ft, "_protected_instruction_config", lambda: (True, ["*.mdc"])
+        )
+        target = tmp_path / "external-rules.mdc"
+        target.write_bytes(b"original\n")
+        link = tmp_path / "rules.mdc"
+        link.symlink_to(target)
+
+        res = self._write(link, "injected\n")
+
+        assert res.get("error")
+        assert "replace/remove the symlink explicitly" in res["error"]
+        assert approvals["calls"] == []
+        assert target.read_bytes() == b"original\n"
+        assert link.is_symlink()
+
+    @pytest.mark.require_symlinks
+    def test_v4a_protected_symlink_rejects_entire_patch_before_approval(
+        self, tmp_path, approvals
+    ):
+        from tools.file_tools import patch_tool
+        import json
+
+        external = tmp_path / "external-agents.md"
+        external.write_bytes(b"original agents\n")
+        agents = tmp_path / "AGENTS.md"
+        agents.symlink_to(external)
+        agents_target = os.readlink(agents)
+        claude = tmp_path / "CLAUDE.md"
+        claude.write_text("original claude\n", encoding="utf-8")
+        patch = (
+            "*** Begin Patch\n"
+            f"*** Update File: {agents}\n"
+            "@@\n"
+            "-original agents\n"
+            "+injected agents\n"
+            f"*** Update File: {claude}\n"
+            "@@\n"
+            "-original claude\n"
+            "+injected claude\n"
+            "*** End Patch"
+        )
+
+        res = json.loads(patch_tool(mode="patch", patch=patch))
+
+        assert res.get("error")
+        assert "replace/remove the symlink explicitly" in res["error"]
+        assert approvals["calls"] == []
+        assert external.read_bytes() == b"original agents\n"
+        assert agents.is_symlink()
+        assert os.readlink(agents) == agents_target
+        assert claude.read_text(encoding="utf-8") == "original claude\n"
+
+    @pytest.mark.parametrize("backend", ["docker", "ssh"])
+    def test_remote_or_container_protected_write_fails_closed(
+        self, tmp_path, approvals, monkeypatch, backend
+    ):
+        import tools.file_tools as ft
+
+        monkeypatch.setattr(
+            ft, "_terminal_env_type_for_task", lambda task_id="default": backend
+        )
+
+        res = self._write(tmp_path / "AGENTS.md", "injected\n")
+
+        assert res.get("error")
+        assert "unsupported-safe-verification" in res["error"]
+        assert "before approval or mutation" in res["error"]
+        assert approvals["calls"] == []
+        assert not (tmp_path / "AGENTS.md").exists()
+
+    @pytest.mark.require_symlinks
+    def test_local_lstat_uncertainty_fails_closed_before_approval(
+        self, tmp_path, approvals, monkeypatch
+    ):
+        import tools.file_tools as ft
+
+        def uncertain_lstat(_path):
+            raise OSError("lstat unavailable")
+
+        monkeypatch.setattr(ft.os, "lstat", uncertain_lstat)
+
+        res = self._write(tmp_path / "AGENTS.md", "injected\n")
+
+        assert res.get("error")
+        assert "unsupported-safe-verification" in res["error"]
+        assert "before approval or mutation" in res["error"]
+        assert approvals["calls"] == []
+        assert not (tmp_path / "AGENTS.md").exists()
+
     def test_symlink_to_protected_file_is_gated(self, tmp_path, approvals):
         """#41351 lesson: realpath first — innocent name, protected target."""
         real = tmp_path / "AGENTS.md"
