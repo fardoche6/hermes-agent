@@ -444,6 +444,135 @@ class TestProtectedInstructionFiles:
         assert target.read_text(encoding="utf-8") == "approved content"
         assert len(approvals["calls"]) == 1
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink replacement semantics")
+    def test_approved_protected_write_replaces_symlink_without_touching_target(
+        self, tmp_path, approvals
+    ):
+        external = tmp_path / "external" / "agents-target.md"
+        external.parent.mkdir()
+        original = b"external target stays byte-identical\n"
+        external.write_bytes(original)
+        target = tmp_path / "AGENTS.md"
+        target.symlink_to(external)
+
+        approvals["answer"] = "once"
+        res = self._write(target, "approved replacement\n")
+
+        assert not res.get("error"), res
+        assert not target.is_symlink()
+        assert target.read_bytes() == b"approved replacement\n"
+        assert external.read_bytes() == original
+        assert res["resolved_path"] == str(target)
+        assert res["files_modified"] == [str(target)]
+        assert len(approvals["calls"]) == 1
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink replacement semantics")
+    def test_approved_protected_replace_patch_replaces_symlink_without_touching_target(
+        self, tmp_path, approvals
+    ):
+        external = tmp_path / "external" / "agents-target.md"
+        external.parent.mkdir()
+        original = b"external target stays byte-identical\n"
+        external.write_bytes(original)
+        target = tmp_path / "AGENTS.md"
+        target.symlink_to(external)
+
+        approvals["answer"] = "once"
+        import json
+        from tools.file_tools import patch_tool
+
+        res = json.loads(patch_tool(
+            mode="replace", path=str(target),
+            old_string="external target stays byte-identical",
+            new_string="replacement rules",
+        ))
+
+        assert not res.get("error"), res
+        assert not target.is_symlink()
+        assert target.read_bytes() == b"replacement rules\n"
+        assert external.read_bytes() == original
+        assert res["resolved_path"] == str(target)
+        assert len(approvals["calls"]) == 1
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink replacement semantics")
+    def test_approved_v4a_replaces_agents_symlink_and_adds_claude_once(
+        self, tmp_path, approvals
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        external = tmp_path / "external" / "agents-target.md"
+        external.parent.mkdir()
+        original = b"external target stays byte-identical\n"
+        external.write_bytes(original)
+        agents = repo / "AGENTS.md"
+        agents.symlink_to(external)
+        claude = repo / "CLAUDE.md"
+
+        patch = (
+            "*** Begin Patch\n"
+            f"*** Update File: {agents}\n"
+            "@@\n"
+            "-external target stays byte-identical\n"
+            "+replacement rules\n"
+            f"*** Add File: {claude}\n"
+            "+new claude rules\n"
+            "+\n"
+            "*** End Patch"
+        )
+        approvals["answer"] = "once"
+        import json
+        from tools.file_tools import patch_tool
+
+        res = json.loads(patch_tool(mode="patch", patch=patch))
+
+        assert not res.get("error"), res
+        assert not agents.is_symlink()
+        assert agents.read_bytes() == b"replacement rules\n"
+        assert external.read_bytes() == original
+        assert claude.is_file() and not claude.is_symlink()
+        assert claude.read_text(encoding="utf-8") == "new claude rules\n"
+        assert res["files_modified"] == [str(agents), str(claude)]
+        assert len(approvals["calls"]) == 1
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX symlink replacement semantics")
+    @pytest.mark.parametrize("decision", ["deny", "timeout"])
+    def test_denied_or_timed_out_v4a_leaves_symlink_target_and_second_file_unchanged(
+        self, tmp_path, approvals, decision
+    ):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        external = tmp_path / "external" / "agents-target.md"
+        external.parent.mkdir()
+        original = b"external target stays byte-identical\n"
+        external.write_bytes(original)
+        agents = repo / "AGENTS.md"
+        agents.symlink_to(external)
+        claude = repo / "CLAUDE.md"
+
+        patch = (
+            "*** Begin Patch\n"
+            f"*** Update File: {agents}\n"
+            "@@\n"
+            "-external target stays byte-identical\n"
+            "+replacement rules\n"
+            f"*** Add File: {claude}\n"
+            "+new claude rules\n"
+            "+\n"
+            "*** End Patch"
+        )
+        approvals["answer"] = decision
+        import json
+        from tools.file_tools import patch_tool
+
+        res = json.loads(patch_tool(mode="patch", patch=patch))
+
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert agents.is_symlink()
+        assert os.readlink(agents) == str(external)
+        assert external.read_bytes() == original
+        assert not claude.exists()
+        assert len(approvals["calls"]) == 1
+
     def test_prompts_even_under_yolo(self, tmp_path, approvals, monkeypatch):
         """The whole point: auto-approve/yolo must NOT bypass this gate."""
         import tools.approval as A

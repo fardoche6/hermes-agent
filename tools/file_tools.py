@@ -25,11 +25,12 @@ from tools.file_operations import (
 from tools import file_state
 from agent.redact import redact_sensitive_text
 from tools.file_tools_paths import (
-    _expand_tilde, _path_resolution_warning, _resolve_base_dir, _resolve_path_for_task)
+    _expand_tilde, _path_resolution_warning, _resolve_base_dir, _resolve_path_for_task,
+    _resolve_path_for_task_lexical)
 from tools.file_tools_write_guards import (
     _READ_DEDUP_STATUS_MESSAGE, _check_approval_required_write, _check_binary_document_write,
     _check_cross_profile_path, _check_protected_instruction_write, _check_sensitive_path,
-    _is_internal_file_tool_content)
+    _is_internal_file_tool_content, _is_protected_instruction_basename)
 from tools.file_tools_read_tracking import (
     _bump_consecutive, _cap_read_tracker_data, _check_file_staleness, _check_not_found_cache,
     _mark_verification_stale, _patch_failure_lock, _patch_failure_tracker, _read_tracker,
@@ -663,6 +664,14 @@ def _resolve_or_none(filepath: str, task_id: str) -> str | None:
         return None
 
 
+def _resolve_or_none_lexical(filepath: str, task_id: str) -> str | None:
+    """Task-resolved path preserving the final directory entry, or None on failure."""
+    try:
+        return str(_resolve_path_for_task_lexical(filepath, task_id))
+    except Exception:
+        return None
+
+
 def _write_precheck_error(paths: list[str], content_paths: list[str], task_id: str,
                           cross_profile: bool) -> str | None:
     """Run the shared write/patch guards in order; return the first error string.
@@ -719,6 +728,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     cross-PROFILE guard it was named for no longer exists).
     """
     # write_file checks the binary-document guard before the mirror guard.
+    replace_symlink = _is_protected_instruction_basename(path, task_id)
     err = (_check_sensitive_path(path, task_id)
            or _check_binary_document_write(path, task_id)
            or _check_protected_instruction_write([path], task_id)
@@ -733,7 +743,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     try:
         # Resolution failure falls back to the legacy unlocked path (the write
         # still proceeds; the per-task staleness check still runs).
-        _resolved = _resolve_or_none(path, task_id)
+        _resolved = (_resolve_or_none_lexical(path, task_id) if replace_symlink
+                     else _resolve_or_none(path, task_id))
         path_to_resolved = {path: _resolved}
         with ExitStack() as _lock:
             if _resolved:
@@ -741,7 +752,12 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                 # subagents; different paths stay fully parallel.
                 _lock.enter_context(file_state.lock_path(_resolved))
             warnings = _edit_warnings([path], path_to_resolved, task_id)
-            result_dict = _get_file_ops(task_id).write_file(_resolved or path, content).to_dict()
+            file_ops = _get_file_ops(task_id)
+            if replace_symlink:
+                result_dict = file_ops.write_file(
+                    _resolved or path, content, replace_symlink=True).to_dict()
+            else:
+                result_dict = file_ops.write_file(_resolved or path, content).to_dict()
             if warnings:
                 result_dict["_warning"] = warnings[0]
             if _resolved:
@@ -815,7 +831,17 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         # Lock paths in sorted, deduplicated order so concurrent callers with
         # overlapping multi-file patches can't deadlock (every caller locks in
         # the same order). An unresolvable path is simply not locked.
-        _path_to_resolved: dict[str, str] = {_p: _resolve_or_none(_p, task_id) for _p in _paths_to_check}
+        _protected_raw_paths = {
+            _p for _p in _paths_to_check
+            if _is_protected_instruction_basename(_p, task_id)
+        }
+        _path_to_resolved: dict[str, str | None] = {
+            _p: (_resolve_or_none_lexical(_p, task_id)
+                 if _p in _protected_raw_paths else _resolve_or_none(_p, task_id))
+            for _p in _paths_to_check}
+        _protected_instruction_paths = {
+            _path_to_resolved[_p] or _p for _p in _protected_raw_paths
+        }
         with ExitStack() as _locks:
             for _r in sorted({_r for _r in _path_to_resolved.values() if _r}):
                 _locks.enter_context(file_state.lock_path(_r))
@@ -830,11 +856,24 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 if old_string is None or new_string is None:
                     return tool_error("old_string and new_string required")
                 _replace_target = _path_to_resolved.get(path) or path
-                result = file_ops.patch_replace(_replace_target, old_string, new_string, replace_all)
+                if path in _protected_raw_paths:
+                    result = file_ops.patch_replace(
+                        _replace_target, old_string, new_string, replace_all,
+                        replace_symlink=True)
+                else:
+                    result = file_ops.patch_replace(
+                        _replace_target, old_string, new_string, replace_all)
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
-                result = file_ops.patch_v4a(_rewrite_v4a_patch_paths_for_host(patch, _path_to_resolved, file_ops))
+                rewritten_patch = _rewrite_v4a_patch_paths_for_host(
+                    patch, _path_to_resolved, file_ops)
+                if _protected_instruction_paths:
+                    result = file_ops.patch_v4a(
+                        rewritten_patch,
+                        protected_instruction_paths=_protected_instruction_paths)
+                else:
+                    result = file_ops.patch_v4a(rewritten_patch)
             else:
                 return tool_error(f"Unknown mode: {mode}")
 

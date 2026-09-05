@@ -171,6 +171,26 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     return None
 
 
+def _is_protected_instruction_basename(filepath: str, task_id: str = "default") -> bool:
+    """Return whether the lexical destination is a protected instruction basename.
+
+    Unlike ``_protected_instruction_reason``, this intentionally ignores a
+    protected basename reached only through a symlink target. The protected
+    replacement route is for an explicitly named instruction entry that is
+    itself a symlink; ordinary aliases keep the normal symlink-following write
+    behavior.
+    """
+    enabled, extra = _protected_instruction_config()
+    if not enabled:
+        return False
+    if _protected_instruction_reason(
+            filepath, task_id, enabled=enabled, extra_patterns=extra) is None:
+        return False
+    base = os.path.basename(os.path.normpath(_expand_tilde(filepath))).lower()
+    return base in _PROTECTED_INSTRUCTION_BASENAMES or any(
+        fnmatch.fnmatch(base, pattern.lower()) for pattern in extra)
+
+
 _APPROVAL_UNAVAILABLE = "requires approval but the approval subsystem is unavailable."
 _NO_HUMAN = "requires approval but no interactive user or gateway is present to approve it."
 

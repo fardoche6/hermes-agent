@@ -250,11 +250,17 @@ def _unified_diff(path: str, old: str, new: Optional[str]) -> str:
         fromfile=f"a/{path}", tofile="/dev/null" if new is None else f"b/{path}"))
 
 
-def apply_v4a_operations(operations: List[PatchOperation], file_ops: Any) -> 'PatchResult':
+def apply_v4a_operations(
+    operations: List[PatchOperation], file_ops: Any,
+    protected_instruction_paths: Optional[set[str]] = None,
+) -> 'PatchResult':
     """Two-phase: validate everything, then apply (atomic on validation failure). A phase-2
     failure (validate/apply race) carries a ``git diff`` note since state may be inconsistent.
-    ``file_ops`` needs read_file_raw/write_file/delete_file/move_file."""
+    ``file_ops`` needs read_file_raw/write_file/delete_file/move_file. The
+    protected path set is an internal-only signal for writes whose lexical
+    destination must replace a final symlink instead of following it."""
     from tools.file_operations_common import PatchResult  # avoid circular import
+    protected_instruction_paths = protected_instruction_paths or set()
 
     def _bullets(errs: List[str]) -> str:
         return "\n".join(f"  • {e}" for e in errs)
@@ -271,7 +277,7 @@ def apply_v4a_operations(operations: List[PatchOperation], file_ops: Any) -> 'Pa
     for op in operations:
         handler, verb, bucket = _APPLY_DISPATCH[op.operation]
         try:
-            ok, payload, lsp, lint = handler(op, file_ops)
+            ok, payload, lsp, lint = handler(op, file_ops, protected_instruction_paths)
         except Exception as e:
             ok, payload = None, str(e)
         if not ok:
@@ -306,15 +312,33 @@ def _write_file_accepts_pre_content(file_ops: Any) -> bool:
         p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
-def _apply_add(op: PatchOperation, file_ops: Any) -> ApplyResult:
+def _write_file_accepts_replace_symlink(file_ops: Any) -> bool:
+    """Whether the internal protected-symlink write flag is supported."""
+    try:
+        params = inspect.signature(file_ops.write_file).parameters
+    except (TypeError, ValueError):
+        return False
+    return "replace_symlink" in params or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _apply_add(
+    op: PatchOperation, file_ops: Any, protected_instruction_paths: Optional[set[str]] = None
+) -> ApplyResult:
     """Create a file from the hunks' '+' lines."""
     content_lines = [line.content for hunk in op.hunks for line in hunk.lines if line.prefix == '+']
-    result = file_ops.write_file(op.file_path, '\n'.join(content_lines))
+    extra = {}
+    if (protected_instruction_paths and op.file_path in protected_instruction_paths
+            and _write_file_accepts_replace_symlink(file_ops)):
+        extra["replace_symlink"] = True
+    result = file_ops.write_file(op.file_path, '\n'.join(content_lines), **extra)
     diff = f"--- /dev/null\n+++ b/{op.file_path}\n" + '\n'.join(f"+{line}" for line in content_lines)
     return _written(result, diff)
 
 
-def _apply_delete(op: PatchOperation, file_ops: Any) -> ApplyResult:
+def _apply_delete(
+    op: PatchOperation, file_ops: Any, protected_instruction_paths: Optional[set[str]] = None
+) -> ApplyResult:
     """Delete a file, producing a real unified diff of the removed content."""
     read_result = file_ops.read_file_raw(op.file_path)  # re-read guards validate/apply races
     if read_result.error:
@@ -324,7 +348,9 @@ def _apply_delete(op: PatchOperation, file_ops: Any) -> ApplyResult:
     return _fail(result.error) if result.error else (True, diff, None, None)
 
 
-def _apply_move(op: PatchOperation, file_ops: Any) -> ApplyResult:
+def _apply_move(
+    op: PatchOperation, file_ops: Any, protected_instruction_paths: Optional[set[str]] = None
+) -> ApplyResult:
     result = file_ops.move_file(op.file_path, op.new_path)
     return _fail(result.error) if result.error else (
         True, f"# Moved: {op.file_path} -> {op.new_path}", None, None)
@@ -346,7 +372,9 @@ def _insert_addition_only(new_content: str, hunk: Hunk, insert_text: str) -> Tup
     return new_content.rstrip('\n') + '\n' + insert_text + '\n', None
 
 
-def _apply_update(op: PatchOperation, file_ops: Any) -> ApplyResult:
+def _apply_update(
+    op: PatchOperation, file_ops: Any, protected_instruction_paths: Optional[set[str]] = None
+) -> ApplyResult:
     """Apply each hunk via fuzzy replace, then write once."""
     from tools.fuzzy_match import fuzzy_find_and_replace, is_already_applied
     read_result = file_ops.read_file_raw(op.file_path)  # raw: no line numbers / truncation
@@ -385,12 +413,17 @@ def _apply_update(op: PatchOperation, file_ops: Any) -> ApplyResult:
             return _fail(f"Could not apply hunk: {error}" + hint)
     # Pass pre_content to skip a redundant re-read inside write_file when supported.
     extra = {"pre_content": current_content} if _write_file_accepts_pre_content(file_ops) else {}
+    if (protected_instruction_paths and op.file_path in protected_instruction_paths
+            and _write_file_accepts_replace_symlink(file_ops)):
+        extra["replace_symlink"] = True
     write_result = file_ops.write_file(op.file_path, new_content, **extra)
     return _written(write_result, _unified_diff(op.file_path, current_content, new_content))
 
 
 # operation -> (handler, verb for error text, files_* bucket)
-_APPLY_DISPATCH: Dict[OperationType, Tuple[Callable[[PatchOperation, Any], ApplyResult], str, str]] = {
+_APPLY_DISPATCH: Dict[
+    OperationType, Tuple[Callable[[PatchOperation, Any, Optional[set[str]]], ApplyResult], str, str]
+] = {
     OperationType.ADD: (_apply_add, "add", "created"),
     OperationType.DELETE: (_apply_delete, "delete", "deleted"),
     OperationType.MOVE: (_apply_move, "move", "modified"),

@@ -105,16 +105,18 @@ class FileOperations(ABC):
         """Whole file as a plain string: no pagination, line numbers or clamping."""
 
     @abstractmethod
-    def write_file(self, path: str, content: str, pre_content: Optional[str] = None) -> WriteResult:
+    def write_file(self, path: str, content: str, pre_content: Optional[str] = None, *,
+                   replace_symlink: bool = False) -> WriteResult:
         """Write content to a file, creating directories as needed."""
 
     @abstractmethod
     def patch_replace(self, path: str, old_string: str, new_string: str,
-                      replace_all: bool = False) -> PatchResult:
+                      replace_all: bool = False, *, replace_symlink: bool = False) -> PatchResult:
         """Replace text in a file using fuzzy matching."""
 
     @abstractmethod
-    def patch_v4a(self, patch_content: str) -> PatchResult:
+    def patch_v4a(self, patch_content: str,
+                  protected_instruction_paths: Optional[set[str]] = None) -> PatchResult:
         """Apply a V4A format patch."""
 
     @abstractmethod
@@ -357,13 +359,15 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             arg = _msys_to_windows_path(arg).replace("\\", "/")
         return "'" + arg.replace("'", "'\"'\"'") + "'"
 
-    def _atomic_write(self, path: str, content: str) -> "ExecuteResult":
+    def _atomic_write(self, path: str, content: str, *, replace_symlink: bool = False) -> "ExecuteResult":
         """Write ``content`` atomically: stdin → temp file in the SAME directory →
         ``mv -f`` (same-FS rename; cross-device ``mv`` is copy+unlink, NOT atomic).
         ``mkdir -p`` folded in. Exit 0 = swap happened; non-zero = original intact.
 
         Symlink targets are resolved first (replacing the link would orphan the
-        target) and the temp dir recomputed from the RESOLVED target. Existing
+        target) and the temp dir recomputed from the RESOLVED target, unless the
+        internal protected-instruction route explicitly requests replacing the
+        final symlink directory entry. Existing
         target: mode copied via ``stat`` (GNU ``-c%a`` / BSD ``-f%Lp``) + ``chmod``
         (``chmod --reference`` is GNU-only). New target: ``chmod "=rw"`` AFTER cat
         gives umask-default perms instead of mktemp's 0600 — not ``$(umask)``
@@ -373,6 +377,12 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         q_path = self._escape_shell_arg(path)
         q_parent = self._escape_shell_arg(os.path.dirname(path) or ".")
         tmpl = self._escape_shell_arg(".hermes-tmp.XXXXXX")
+        resolve_symlink_script = "" if replace_symlink else (
+            'if [ -L "$t" ]; then '
+            'rt="$(readlink -f "$t" 2>/dev/null || realpath "$t" 2>/dev/null || true)"; '
+            '[ -n "$rt" ] && { t="$rt"; d="$(dirname "$t")"; }; '
+            "fi; "
+        )
         script = (
             "set -e; "
             # One shell script, fully quoted. Notes: - `mkdir -p "$d"` is folded in here so the parent
@@ -390,11 +400,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             # (pre-fix behavior) if an exotic chmod rejects it. - `trap ... EXIT` guarantees the temp is
             # removed on every error path (cat failure, mv failure, signal) but NOT after a successful mv
             # (the temp no longer exists by then). - we `cat >` the temp, then `mv -f` it over the target.
-            f"d={q_parent}; t={q_path}; "
-            'if [ -L "$t" ]; then '
-            'rt="$(readlink -f "$t" 2>/dev/null || realpath "$t" 2>/dev/null || true)"; '
-            '[ -n "$rt" ] && { t="$rt"; d="$(dirname "$t")"; }; '
-            "fi; "
+            f"d={q_parent}; t={q_path}; " + resolve_symlink_script +
             'mkdir -p "$d"; '
             'tmp="$(mktemp -p "$d" ' + tmpl + ' 2>/dev/null '
             '|| mktemp "$d/.hermes-tmp.$$.XXXXXX" 2>/dev/null '
@@ -1190,7 +1196,8 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             pass
         return None, None
 
-    def write_file(self, path: str, content: str, pre_content: Optional[str] = None) -> WriteResult:
+    def write_file(self, path: str, content: str, pre_content: Optional[str] = None, *,
+                   replace_symlink: bool = False) -> WriteResult:
         """Write content atomically, creating parent directories as needed.
 
         Order: deny list → lone-surrogate refusal → fail-closed syntax gate on the
@@ -1232,7 +1239,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         # this content, so these are the bytes on disk; the early rejection above
         # guarantees this cannot raise.
         content_bytes = content.encode("utf-8", "surrogateescape")
-        write_result = self._atomic_write(path, content)
+        write_result = self._atomic_write(path, content, replace_symlink=replace_symlink)
         if write_result.exit_code != 0:
             return WriteResult(error=f"Failed to write file: {write_result.stdout}")
         content_verified, verify_error = self._verify_written_hash(path, content_bytes)
@@ -1294,7 +1301,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         return None
 
     def patch_replace(self, path: str, old_string: str, new_string: str,
-                      replace_all: bool = False) -> PatchResult:
+                      replace_all: bool = False, *, replace_symlink: bool = False) -> PatchResult:
         """Replace text in a file using fuzzy matching (``old_string`` must be
         unique unless ``replace_all``). Returns a PatchResult with diff + lint."""
         path = self._expand_path(path)
@@ -1319,7 +1326,8 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         file_ending = _detect_line_ending(content)
         if file_ending:
             new_content = _normalize_line_endings(new_content, file_ending)
-        write_result = self.write_file(path, new_content, pre_content=raw_content)
+        write_result = self.write_file(
+            path, new_content, pre_content=raw_content, replace_symlink=replace_symlink)
         if write_result.error:
             return PatchResult(error=f"Failed to write changes: {write_result.error}")
         verify_error = self._verify_patch_persisted(path, new_content)
@@ -1332,14 +1340,16 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             # From the internal write_file call, whose baseline was the pre-patch content.
             lsp_diagnostics=write_result.lsp_diagnostics)
 
-    def patch_v4a(self, patch_content: str) -> PatchResult:
+    def patch_v4a(self, patch_content: str,
+                  protected_instruction_paths: Optional[set[str]] = None) -> PatchResult:
         """Apply a V4A format patch (``*** Begin Patch`` / ``*** Update File:`` /
         ``@@ hint @@`` hunks / ``*** End Patch``)."""
         from tools.patch_parser import parse_v4a_patch, apply_v4a_operations
         operations, parse_error = parse_v4a_patch(patch_content)
         if parse_error:
             return PatchResult(error=f"Failed to parse patch: {parse_error}")
-        return apply_v4a_operations(operations, self)
+        return apply_v4a_operations(
+            operations, self, protected_instruction_paths=protected_instruction_paths)
 
     # --- SEARCH -------------------------------------------------------------
 

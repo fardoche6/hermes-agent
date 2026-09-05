@@ -177,6 +177,40 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
                    lambda: _resolve_base_dir(task_id, container_paths=container_paths), container_paths)
 
 
+def _resolve_path_for_task_lexical(filepath: str, task_id: str = "default") -> Path | PurePosixPath:
+    """Resolve *filepath* while preserving its final directory entry.
+
+    Parent directories are resolved so the backend receives a safe absolute
+    destination, but the final component is deliberately not dereferenced.
+    This is needed when an approved protected instruction file is itself a
+    symlink: the write must replace that link rather than its target.
+    """
+    container_paths = _uses_container_paths(task_id)
+    text = _host_text(filepath, container_paths)
+    base = lambda: _resolve_base_dir(task_id, container_paths=container_paths)
+    if container_paths:
+        if not posixpath.isabs(text):
+            text = posixpath.join(str(base()), text)
+        return _normalize_without_host_deref(text)
+
+    if sys.platform == "win32":
+        import ntpath
+
+        if not ntpath.isabs(text):
+            text = ntpath.join(str(base()), text)
+        path = Path(ntpath.normpath(text))
+    else:
+        path = Path(text)
+        if not path.is_absolute():
+            path = Path(base()) / path
+
+    try:
+        parent = path.parent.resolve()
+    except (OSError, RuntimeError):
+        parent = path.parent.absolute()
+    return parent / path.name
+
+
 
 def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "default") -> str | None:
     """Warn when a RELATIVE path resolved OUTSIDE the task's workspace root (the
