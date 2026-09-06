@@ -27,7 +27,7 @@ from agent.credential_pool import (
 )
 from agent.error_classifier import FailoverReason
 from agent.turn_context import drop_stale_api_content
-from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
+from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_write_text
 logger = logging.getLogger(__name__)
 
 # Cap same-entry OAuth refreshes on a persistent auth failure, else a single-entry pool re-mints forever.
@@ -1251,6 +1251,71 @@ def _api_error_debug_info(error: Exception) -> Dict[str, Any]:
     return info
 
 
+def _serialized_text_size(value: str) -> int:
+    """Size guard for both the text representation and the UTF-8 file representation."""
+    try:
+        encoded_size = len(value.encode("utf-8"))
+    except UnicodeEncodeError:
+        encoded_size = len(value.encode("utf-8", errors="replace"))
+    return max(len(value), encoded_size)
+
+
+def _bounded_diagnostic_json(diagnostic: str, limit: int) -> str:
+    """Serialize a safe diagnostic envelope without exceeding its final bound."""
+    if limit <= 0:
+        return ""
+    from agent.redact import (
+        _PERSISTED_DIAGNOSTIC_FAILURE,
+        _contains_persisted_field_name,
+        _safe_truncation_fragment,
+    )
+
+    try:
+        diagnostic_text = str(diagnostic)
+        safe_diagnostic = (
+            _PERSISTED_DIAGNOSTIC_FAILURE
+            if _contains_persisted_field_name(diagnostic_text)
+            else _safe_truncation_fragment(diagnostic_text)
+        )
+    except Exception:
+        safe_diagnostic = _PERSISTED_DIAGNOSTIC_FAILURE
+
+    def _dump(value: str) -> str:
+        return json.dumps({"diagnostic": value}, ensure_ascii=False, separators=(",", ":"), default=str)
+
+    empty = _dump("")
+    if _serialized_text_size(empty) > limit:
+        minimal = "{}"
+        return minimal[:limit]
+
+    low, high = 0, len(safe_diagnostic)
+    best = empty
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = _dump(safe_diagnostic[:middle])
+        if _serialized_text_size(candidate) <= limit:
+            best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best
+
+
+def _serialize_bounded_request_dump(redacted_text: str, limit: int) -> str:
+    """Keep valid request JSON when it fits; otherwise emit a bounded safe envelope."""
+    try:
+        payload = json.loads(redacted_text)
+    except (TypeError, json.JSONDecodeError):
+        payload = {"diagnostic": redacted_text}
+    try:
+        serialized = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    except Exception:
+        serialized = ""
+    if serialized and _serialized_text_size(serialized) <= limit:
+        return serialized
+    return _bounded_diagnostic_json(redacted_text, limit)
+
+
 def dump_api_request_debug(
     agent, api_kwargs: Dict[str, Any], *, reason: str, error: Optional[Exception] = None
 ) -> Optional[Path]:
@@ -1281,15 +1346,19 @@ def dump_api_request_debug(
         from agent.session_persistence import _safe_session_filename_component
         safe_sid = _safe_session_filename_component(agent.session_id)
         dump_file = agent.logs_dir / f"request_dump_{safe_sid}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json"
-        # Redact secrets first: this fires unconditionally on API errors and captures the full
-        # request body, so context-embedded secrets would otherwise land in cleartext on disk.
-        from agent.redact import redact_sensitive_text
+        # Redact the complete serialized payload before applying the persistence bound. If the
+        # bounded diagnostic is no longer valid JSON, retain only a final-size-bounded safe envelope
+        # rather than writing the original structured payload back to disk.
+        from agent.redact import _PERSISTED_DIAGNOSTIC_DEFAULT_LIMIT, redact_persisted_diagnostic
         _serialized = json.dumps(dump_payload, ensure_ascii=False, indent=2, default=str)
-        _redacted_payload = json.loads(redact_sensitive_text(_serialized, force=True))
-        atomic_json_write(dump_file, _redacted_payload, default=str)
+        _redacted_text = redact_persisted_diagnostic(_serialized, limit=None)
+        _serialized_output = _serialize_bounded_request_dump(
+            _redacted_text, _PERSISTED_DIAGNOSTIC_DEFAULT_LIMIT
+        )
+        atomic_write_text(dump_file, _serialized_output)
         agent._vprint(f"{agent.log_prefix}🧾 Request debug dump written to: {dump_file}")
         if env_var_enabled("HERMES_DUMP_REQUEST_STDOUT"):
-            print(json.dumps(_redacted_payload, ensure_ascii=False, indent=2, default=str))
+            print(_serialized_output, end="")
         return dump_file
     except Exception as dump_error:
         if agent.verbose_logging:

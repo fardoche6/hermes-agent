@@ -8,7 +8,7 @@ import json
 import re
 from typing import Any, Dict, Optional
 
-from agent.redact import redact_sensitive_text
+from agent.redact import redact_persisted_diagnostic
 
 # Offline DNS failures are wrapped in a generic "Connection error" by SDKs — inspect the chain.
 _NETWORK_RESOLUTION_MARKERS = (
@@ -28,6 +28,9 @@ _XAI_ENTITLEMENT_HINT = (
     "which, or run `/model` to switch providers."
 )
 _ERROR_DETAIL_KEYS = ("message", "detail", "error", "code", "type")
+_SAFE_API_ERROR_SUMMARY = "Provider returned an error."
+_MAX_DETAIL_DEPTH = 8
+_MAX_DETAIL_NODES = 128
 
 
 def _is_xai_entitlement_text(lower: str) -> bool:
@@ -40,8 +43,18 @@ def _is_xai_entitlement_text(lower: str) -> bool:
 
 
 def _http_prefix(error: Exception) -> str:
-    status_code = getattr(error, "status_code", None)
-    return f"HTTP {status_code}: " if status_code else ""
+    try:
+        status_code = getattr(error, "status_code", None)
+    except Exception:
+        return ""
+    if type(status_code) is not int or not 100 <= status_code <= 599:
+        return ""
+    return f"HTTP {status_code}: "
+
+
+def _safe_api_error_summary(error: Exception) -> str:
+    """Return a fixed safe result when summary extraction itself fails."""
+    return f"{_http_prefix(error)}{_SAFE_API_ERROR_SUMMARY}"
 
 
 class ApiErrorSummaryMixin:
@@ -97,33 +110,85 @@ class ApiErrorSummaryMixin:
         return f"{detail}{_XAI_ENTITLEMENT_HINT}"
 
     @staticmethod
-    def _coerce_api_error_detail(value: Any) -> str:
+    def _coerce_api_error_detail(
+        value: Any, *, _depth: int = 0, _seen: Optional[set[int]] = None,
+        _nodes: Optional[list[int]] = None,
+    ) -> str:
         """Return a display-safe string for structured provider error fields."""
+        if _seen is None:
+            _seen = set()
+        if _nodes is None:
+            _nodes = [0]
+        if _depth > _MAX_DETAIL_DEPTH or _nodes[0] >= _MAX_DETAIL_NODES:
+            return "[structured error omitted]"
         if isinstance(value, str):
             return value
         if isinstance(value, dict):
-            for key in _ERROR_DETAIL_KEYS:
-                nested = value.get(key)
-                if isinstance(nested, str) and nested.strip():
-                    return nested
-            for key in _ERROR_DETAIL_KEYS:
-                if key in value:
-                    nested_detail = ApiErrorSummaryMixin._coerce_api_error_detail(value[key])
-                    if nested_detail:
-                        return nested_detail
+            value_id = id(value)
+            if value_id in _seen:
+                return "[structured error omitted]"
+            _seen.add(value_id)
+            _nodes[0] += 1
             try:
-                return json.dumps(value, ensure_ascii=False, sort_keys=True)
-            except TypeError:
-                return str(value)
+                for key in _ERROR_DETAIL_KEYS:
+                    nested = value.get(key)
+                    if isinstance(nested, str) and nested.strip():
+                        return nested
+                for key in _ERROR_DETAIL_KEYS:
+                    if key in value:
+                        nested_detail = ApiErrorSummaryMixin._coerce_api_error_detail(
+                            value[key], _depth=_depth + 1, _seen=_seen, _nodes=_nodes
+                        )
+                        if nested_detail:
+                            return nested_detail
+                try:
+                    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+                except Exception:
+                    return "[structured error omitted]"
+            except Exception:
+                return "[structured error omitted]"
+            finally:
+                _seen.discard(value_id)
         if isinstance(value, (list, tuple)):
-            parts = [ApiErrorSummaryMixin._coerce_api_error_detail(item) for item in value]
-            return "; ".join(part for part in parts if part)
+            value_id = id(value)
+            if value_id in _seen:
+                return "[structured error omitted]"
+            _seen.add(value_id)
+            _nodes[0] += 1
+            try:
+                parts = [
+                    ApiErrorSummaryMixin._coerce_api_error_detail(
+                        item, _depth=_depth + 1, _seen=_seen, _nodes=_nodes
+                    )
+                    for item in value[:_MAX_DETAIL_NODES]
+                ]
+                return "; ".join(part for part in parts if part)
+            except Exception:
+                return "[structured error omitted]"
+            finally:
+                _seen.discard(value_id)
         if value is None:
             return ""
-        return str(value)
+        try:
+            return str(value)
+        except Exception:
+            return "[structured error omitted]"
 
     @staticmethod
     def _summarize_api_error(error: Exception) -> str:
+        try:
+            status_code = getattr(error, "status_code", None)
+        except Exception:
+            return _SAFE_API_ERROR_SUMMARY
+        if status_code is not None and (type(status_code) is not int or not 100 <= status_code <= 599):
+            return _SAFE_API_ERROR_SUMMARY
+        try:
+            return ApiErrorSummaryMixin._summarize_api_error_unsafe(error)
+        except Exception:
+            return _safe_api_error_summary(error)
+
+    @staticmethod
+    def _summarize_api_error_unsafe(error: Exception) -> str:
         """Extract a human-readable one-liner from an API error.
 
         Cloudflare HTML pages → ``<title>``; network/DNS failures (even SDK-wrapped) → offline hint; else
@@ -136,14 +201,16 @@ class ApiErrorSummaryMixin:
         while current is not None and id(current) not in seen:
             seen.add(id(current))
             if any(marker in str(current).lower() for marker in _NETWORK_RESOLUTION_MARKERS):
-                return (
+                return redact_persisted_diagnostic(
                     "Hermes can't reach the model provider. You may be offline. "
                     "Check your internet connection and try again."
                 )
             current = current.__cause__ or current.__context__
 
         if isinstance(error, ValueError) and "expected ident at line" in raw.lower():
-            return f"Malformed provider streaming response: {raw[:300]}"
+            return redact_persisted_diagnostic(
+                f"Malformed provider streaming response: {raw}", limit=300
+            )
 
         prefix = _http_prefix(error)
         # Cloudflare / proxy HTML pages: grab the <title> (and Ray ID) for a clean summary
@@ -155,11 +222,11 @@ class ApiErrorSummaryMixin:
             parts.append(title)
             if ray:
                 parts.append(f"Ray {ray.group(1).strip()}")
-            return " — ".join(parts)
+            return redact_persisted_diagnostic(" — ".join(parts), limit=300)
 
         # GeminiAPIError already composes a clean one-liner with guidance; don't re-extract the raw body.
         if type(error).__name__ == "GeminiAPIError":
-            return redact_sensitive_text(raw[:1000])
+            return redact_persisted_diagnostic(raw, limit=1000)
 
         # JSON body errors from OpenAI/Anthropic SDKs
         body = getattr(error, "body", None)
@@ -167,7 +234,8 @@ class ApiErrorSummaryMixin:
             msg = body.get("error", {}).get("message") if isinstance(body.get("error"), dict) else body.get("message")
             if msg:
                 msg = ApiErrorSummaryMixin._coerce_api_error_detail(msg)
-                return ApiErrorSummaryMixin._decorate_xai_entitlement_error(f"{prefix}{msg[:300]}")
+                detail = ApiErrorSummaryMixin._decorate_xai_entitlement_error(f"{prefix}{msg}")
+                return redact_persisted_diagnostic(detail, limit=300)
 
         # SDK may leave body empty while httpx has the payload. Redact: the body is attacker-influenced
         # and may echo Authorization / x-api-key / request JSON.
@@ -183,18 +251,23 @@ class ApiErrorSummaryMixin:
             if snippet:
                 try:
                     payload = json.loads(snippet)
-                except (json.JSONDecodeError, TypeError):
+                except Exception:
                     payload = None
                 if isinstance(payload, dict):
                     err = payload.get("error")
                     if isinstance(err, dict) and err.get("message"):
-                        return redact_sensitive_text(f"{prefix}{str(err['message'])[:300]}")
+                        return redact_persisted_diagnostic(
+                            f"{prefix}{ApiErrorSummaryMixin._coerce_api_error_detail(err['message'])}", limit=300
+                        )
                     if payload.get("message"):
-                        return redact_sensitive_text(f"{prefix}{str(payload['message'])[:300]}")
-                return redact_sensitive_text(f"{prefix}{snippet[:300]}")
+                        return redact_persisted_diagnostic(
+                            f"{prefix}{ApiErrorSummaryMixin._coerce_api_error_detail(payload['message'])}", limit=300
+                        )
+                return redact_persisted_diagnostic(f"{prefix}{snippet}", limit=300)
 
-        # Fallback: truncate the raw string but give more room than 200 chars
-        return ApiErrorSummaryMixin._decorate_xai_entitlement_error(f"{prefix}{raw[:500]}")
+        # Fallback: redact the complete raw exception before applying the prior 500-character bound.
+        detail = ApiErrorSummaryMixin._decorate_xai_entitlement_error(f"{prefix}{raw}")
+        return redact_persisted_diagnostic(detail, limit=500)
 
     def _mask_api_key_for_logs(self, key: Any) -> Optional[str]:
         # Azure Foundry Entra ID bearer providers are callables — never invoke them in log
@@ -210,11 +283,11 @@ class ApiErrorSummaryMixin:
     def _clean_error_message(self, error_msg: str) -> str:
         """Clean up error messages for user display, removing HTML content and truncating."""
         if not error_msg:
-            return "Unknown error"
+            return redact_persisted_diagnostic("Unknown error")
         # HTML content is common with CloudFlare and gateway error pages
         if error_msg.strip().startswith('<!DOCTYPE html') or '<html' in error_msg:
-            return "Service temporarily unavailable (HTML error page returned)"
-        cleaned = ' '.join(error_msg.split())
+            return redact_persisted_diagnostic("Service temporarily unavailable (HTML error page returned)")
+        cleaned = redact_persisted_diagnostic(' '.join(error_msg.split()))
         if len(cleaned) > 150:
             cleaned = cleaned[:150] + "..."
         return cleaned

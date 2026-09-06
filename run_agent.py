@@ -490,8 +490,13 @@ class AIAgent(
         try:
             detail = self._summarize_api_error(exc)
         except Exception:
-            detail = str(exc)
-        detail = (detail or exc.__class__.__name__).strip()
+            detail = "Auxiliary failure details unavailable."
+        if not isinstance(detail, str):
+            detail = "Auxiliary failure details unavailable."
+        try:
+            detail = detail.strip() or "Auxiliary failure details unavailable."
+        except Exception:
+            detail = "Auxiliary failure details unavailable."
         if len(detail) > 220:
             detail = detail[:217].rstrip() + "..."
         self._emit_warning(f"⚠ Auxiliary {task} failed: {detail}")
