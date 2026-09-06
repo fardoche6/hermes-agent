@@ -1224,7 +1224,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
     ) -> tuple[bool, Optional[str], Optional[str]]:
         """Probe a protected final entry without following its lexical leaf."""
         try:
-            raw_bytes = read_candidate(candidate, refresh_regular_preimage=True)
+            raw_bytes = read_candidate(candidate)
         except FileNotFoundError:
             ending = _detect_line_ending(pre_content) if pre_content else None
             return False, pre_content, ending
@@ -1314,7 +1314,12 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
                 has_bom, pre_content, original_ending = self._probe_write_target(
                     path, pre_content, want_pre)
         except ProtectedLexicalError as exc:
-            return WriteResult(error=f"protected lexical read failed: {exc}")
+            return WriteResult(
+                error=f"protected lexical read failed: {exc}",
+                verified=False,
+                files_modified=[],
+                outcome="not_committed",
+            )
         # read_file strips the BOM and models send bare-LF text, so a round-trip would
         # otherwise normalize CRLF files and drop the BOM (prepend only when absent).
         if original_ending == "\r\n":
@@ -1422,13 +1427,20 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             try:
                 raw_content = read_candidate(
                     protected_lexical_candidate,
-                    refresh_regular_preimage=True,
                 ).decode(
                     "utf-8", "surrogateescape")
             except FileNotFoundError:
-                return PatchResult(error=f"Failed to read file: {path}")
+                return PatchResult(
+                    error=f"Failed to read file: {path}",
+                    verified=False,
+                    outcome="not_committed",
+                )
             except ProtectedLexicalError as exc:
-                return PatchResult(error=f"Failed to read protected file: {exc}")
+                return PatchResult(
+                    error=f"Failed to read protected file: {exc}",
+                    verified=False,
+                    outcome="not_committed",
+                )
         else:
             read_result = self._cat(path)
             if read_result.exit_code != 0:
@@ -1455,7 +1467,12 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             protected_lexical_candidate=protected_lexical_candidate,
         )
         if write_result.error:
-            return PatchResult(error=f"Failed to write changes: {write_result.error}")
+            return PatchResult(
+                error=f"Failed to write changes: {write_result.error}",
+                files_modified=write_result.files_modified or [],
+                verified=write_result.verified if protected_lexical_candidate is not None else None,
+                outcome=write_result.outcome if protected_lexical_candidate is not None else None,
+            )
         # The protected primitive already verified exact bytes through the retained
         # parent descriptor with O_NOFOLLOW. A second path-based cat would follow a
         # raced replacement and could validate the wrong target.
@@ -1472,7 +1489,10 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             success=True, diff=self._unified_diff(content, new_content, path), files_modified=[path],
             lint=lint_result.to_dict() if lint_result else None,
             # From the internal write_file call, whose baseline was the pre-patch content.
-            lsp_diagnostics=write_result.lsp_diagnostics)
+            lsp_diagnostics=write_result.lsp_diagnostics,
+            verified=write_result.verified if protected_lexical_candidate is not None else None,
+            outcome=write_result.outcome if protected_lexical_candidate is not None else None,
+        )
 
     def patch_v4a(
         self, patch_content: str,
@@ -1504,7 +1524,6 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
                         try:
                             content = read_candidate(
                                 candidate,
-                                refresh_regular_preimage=True,
                             ).decode("utf-8", "surrogateescape")
                         except FileNotFoundError:
                             return ReadResult(error=f"File not found: {path}")
@@ -1525,10 +1544,14 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
                 def __getattr__(self, name):
                     return getattr(self._delegate, name)
 
-            return apply_v4a_operations(
+            result = apply_v4a_operations(
                 operations,
                 _ProtectedV4AOperations(self, protected_lexical_candidates),
             )
+            if result.error and result.verified is None:
+                result.verified = False
+                result.outcome = "not_committed"
+            return result
         operations, parse_error = parse_v4a_patch(patch_content)
         if parse_error:
             return PatchResult(error=f"Failed to parse patch: {parse_error}")

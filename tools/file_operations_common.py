@@ -44,6 +44,10 @@ class WriteResult:
     lsp_diagnostics: Optional[str] = None
     error: Optional[str] = None
     warning: Optional[str] = None
+    # Protected lexical writes may fail after installing the candidate. These
+    # fields make that possibility explicit instead of dropping bookkeeping.
+    files_modified: Optional[List[str]] = None
+    outcome: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items() if v is not None}
@@ -63,6 +67,8 @@ class PatchResult:
     # Success-shaped no-op: the edit was already present, nothing written; ``note`` says why.
     no_change: bool = False
     note: Optional[str] = None
+    verified: Optional[bool] = None
+    outcome: Optional[str] = None
 
     # Emission order is part of the output contract.
     _DICT_FIELDS: ClassVar[tuple] = (
@@ -76,9 +82,16 @@ class PatchResult:
             result["no_change"] = True
         if self.note:
             result["note"] = self.note
+        if self.verified is not None:
+            result["verified"] = self.verified
+        if self.outcome:
+            result["outcome"] = self.outcome
         for key in self._DICT_FIELDS:
             value = getattr(self, key)
-            if value:
+            if value or (
+                key == "files_modified"
+                and (self.verified is not None or self.outcome is not None)
+            ):
                 result[key] = value
         return result
 
