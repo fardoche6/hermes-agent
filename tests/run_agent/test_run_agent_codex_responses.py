@@ -2243,6 +2243,46 @@ def test_dump_api_request_debug_redacts_structured_headers_in_file_and_stdout(mo
     assert len(persisted) <= 8192
 
 
+def test_dump_api_request_debug_fails_closed_for_malformed_nested_headers(
+    monkeypatch, tmp_path, capsys,
+):
+    from agent.redact import redact_persisted_diagnostic
+
+    agent = _build_agent(monkeypatch)
+    agent.base_url = "https://api.example.test/v1?token=SYN_R4_DUMP_QUERY&view=public"
+    agent.logs_dir = tmp_path
+    request = _codex_request_kwargs()
+    request["headers"] = {
+        "X-Api-Key": [8462057319],
+        "Authorization": {"nested": "SYN_R4_DUMP_OBJECT"},
+    }
+    request["input"] = [{
+        "role": "user",
+        "content": (
+            "Cookie: sid=SYN_R4_DUMP_COOKIE; UnknownFlag; "
+            "Authorization: Bearer SYN_R4_DUMP_COOKIE_AUTH\n"
+            "Set-Cookie: sid=SYN_R4_DUMP_SET; Priority=SYN_R4_DUMP_PRIORITY; Path=/"
+        ),
+    }]
+    monkeypatch.setenv("HERMES_DUMP_REQUEST_STDOUT", "1")
+
+    dump_file = agent._dump_api_request_debug(request, reason="malformed-nested-preflight")
+
+    persisted = dump_file.read_text(encoding="utf-8")
+    stdout = capsys.readouterr().out
+    markers = (
+        "8462057319", "SYN_R4_DUMP_OBJECT", "SYN_R4_DUMP_QUERY", "SYN_R4_DUMP_COOKIE",
+        "SYN_R4_DUMP_COOKIE_AUTH", "SYN_R4_DUMP_SET", "SYN_R4_DUMP_PRIORITY",
+    )
+    for marker in markers:
+        assert marker not in persisted
+        assert marker not in stdout
+    assert stdout[stdout.find("{"):] == persisted
+    assert json.loads(persisted)
+    assert len(persisted.encode("utf-8")) <= 8192
+    assert redact_persisted_diagnostic(persisted, limit=None) == persisted
+
+
 def test_dump_api_request_debug_redacts_non_ascii_prefixed_nested_fields_in_file_and_stdout(
     monkeypatch, tmp_path, capsys,
 ):

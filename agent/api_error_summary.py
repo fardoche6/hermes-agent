@@ -19,6 +19,7 @@ _NETWORK_RESOLUTION_MARKERS = (
     "no address associated with hostname",
     "network is unreachable",
 )
+_XAI_ENTITLEMENT_HINT_MARKER = "X Premium+ does NOT include"
 _XAI_ENTITLEMENT_HINT = (
     " — xAI rejected this OAuth account. NOTE: X Premium+ does NOT "
     "include xAI API access — only standalone SuperGrok subscribers "
@@ -105,9 +106,20 @@ class ApiErrorSummaryMixin:
         """
         if not detail or not _is_xai_entitlement_text(detail.lower()):
             return detail
-        if "X Premium+ does NOT include" in detail:
+        if _XAI_ENTITLEMENT_HINT_MARKER in detail:
             return detail
         return f"{detail}{_XAI_ENTITLEMENT_HINT}"
+
+    @staticmethod
+    def _redact_summary_detail(detail: str, *, limit: int) -> str:
+        """Bound untrusted detail before appending the complete trusted entitlement hint."""
+        if _is_xai_entitlement_text(detail.lower()):
+            marker_index = detail.find(_XAI_ENTITLEMENT_HINT_MARKER)
+            untrusted_detail = detail if marker_index < 0 else detail[:marker_index]
+            safe_detail = redact_persisted_diagnostic(untrusted_detail, limit=limit)
+            safe_hint = redact_persisted_diagnostic(_XAI_ENTITLEMENT_HINT, limit=None)
+            return f"{safe_detail}{safe_hint}"
+        return redact_persisted_diagnostic(detail, limit=limit)
 
     @staticmethod
     def _coerce_api_error_detail(
@@ -234,8 +246,8 @@ class ApiErrorSummaryMixin:
             msg = body.get("error", {}).get("message") if isinstance(body.get("error"), dict) else body.get("message")
             if msg:
                 msg = ApiErrorSummaryMixin._coerce_api_error_detail(msg)
-                detail = ApiErrorSummaryMixin._decorate_xai_entitlement_error(f"{prefix}{msg}")
-                return redact_persisted_diagnostic(detail, limit=300)
+                detail = f"{prefix}{msg}"
+                return ApiErrorSummaryMixin._redact_summary_detail(detail, limit=300)
 
         # SDK may leave body empty while httpx has the payload. Redact: the body is attacker-influenced
         # and may echo Authorization / x-api-key / request JSON.
@@ -256,18 +268,19 @@ class ApiErrorSummaryMixin:
                 if isinstance(payload, dict):
                     err = payload.get("error")
                     if isinstance(err, dict) and err.get("message"):
-                        return redact_persisted_diagnostic(
+                        return ApiErrorSummaryMixin._redact_summary_detail(
                             f"{prefix}{ApiErrorSummaryMixin._coerce_api_error_detail(err['message'])}", limit=300
                         )
                     if payload.get("message"):
-                        return redact_persisted_diagnostic(
+                        return ApiErrorSummaryMixin._redact_summary_detail(
                             f"{prefix}{ApiErrorSummaryMixin._coerce_api_error_detail(payload['message'])}", limit=300
                         )
-                return redact_persisted_diagnostic(f"{prefix}{snippet}", limit=300)
+                return ApiErrorSummaryMixin._redact_summary_detail(
+                    f"{prefix}{snippet}", limit=300
+                )
 
         # Fallback: redact the complete raw exception before applying the prior 500-character bound.
-        detail = ApiErrorSummaryMixin._decorate_xai_entitlement_error(f"{prefix}{raw}")
-        return redact_persisted_diagnostic(detail, limit=500)
+        return ApiErrorSummaryMixin._redact_summary_detail(f"{prefix}{raw}", limit=500)
 
     def _mask_api_key_for_logs(self, key: Any) -> Optional[str]:
         # Azure Foundry Entra ID bearer providers are callables — never invoke them in log
