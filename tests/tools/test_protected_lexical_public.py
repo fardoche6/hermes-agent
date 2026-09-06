@@ -161,6 +161,47 @@ def test_approval_exception_is_zero_change(tmp_path):
     assert target.read_bytes() == b"before\n"
 
 
+@pytest.mark.parametrize(
+    ("initial_kind", "operation"),
+    [
+        ("regular", "write"),
+        ("regular", "patch"),
+        ("absent", "write"),
+        ("absent", "patch"),
+    ],
+)
+def test_regular_or_absent_leaf_race_after_approval_fails_closed(
+    tmp_path, initial_kind, operation,
+):
+    external = tmp_path / "external.txt"
+    destination = tmp_path / "workspace" / "AGENTS.md"
+    destination.parent.mkdir()
+    external.write_bytes(b"before\n")
+    if initial_kind == "regular":
+        destination.write_bytes(b"before\n")
+
+    calls: list = []
+
+    def swap_final():
+        if destination.exists() or destination.is_symlink():
+            destination.unlink()
+        destination.symlink_to(external)
+
+    if operation == "write":
+        result = _write(destination, "after\n", calls, callback=swap_final)
+    else:
+        result = _patch(destination, "before", "after", calls, callback=swap_final)
+
+    assert result.get("error"), result
+    assert len(calls) == 1
+    assert destination.is_symlink()
+    assert external.read_bytes() == b"before\n"
+    assert result.get("files_modified", []) == []
+    assert result.get("resolved_path") != str(external)
+    assert result.get("verified") is not True
+    assert result.get("success") is not True
+
+
 @pytest.mark.parametrize("target_kind", ["directory", "broken"])
 def test_symlink_to_directory_or_broken_target_is_rejected_before_approval(
     tmp_path, target_kind,

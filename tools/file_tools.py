@@ -28,8 +28,7 @@ from agent.redact import redact_sensitive_text
 from tools.file_tools_paths import (
     _expand_tilde, _path_resolution_warning, _resolve_base_dir, _resolve_path_for_task)
 from tools.protected_lexical_write import (
-    BackendAdmission, ProtectedLexicalCandidate, ProtectedLexicalError, ProtectedLexicalNotApplicable,
-    lexical_path)
+    BackendAdmission, ProtectedLexicalCandidate, ProtectedLexicalError, lexical_path)
 from tools.file_tools_write_guards import (
     _READ_DEDUP_STATUS_MESSAGE, _check_approval_required_write, _check_binary_document_write,
     _check_cross_profile_path, _check_protected_instruction_write, _check_sensitive_path,
@@ -724,14 +723,11 @@ def _protected_candidates_for_paths(
         for path in dict.fromkeys(protected_paths):
             if path in deferred:
                 continue
-            try:
-                candidate = file_ops.prepare_protected_lexical_candidate(
-                    path,
-                    admission,
-                    cwd=_lexical_cwd(task_id, file_ops),
-                )
-            except ProtectedLexicalNotApplicable:
-                candidate = None
+            candidate = file_ops.prepare_protected_lexical_candidate(
+                path,
+                admission,
+                cwd=_lexical_cwd(task_id, file_ops),
+            )
             if candidate is not None:
                 candidates[path] = candidate
     except Exception as exc:
@@ -779,11 +775,14 @@ def _edit_warnings(
     warnings: list[str] = []
     path_to_identity = path_to_identity or {}
     for p in paths:
-        resolved = path_to_identity.get(p) or path_to_resolved.get(p)
-        w = (file_state.check_stale(task_id, resolved) if resolved else None)
-        if not w:
-            w = _check_file_staleness(
-                p, task_id, identity_path=path_to_identity.get(p))
+        identity_path = path_to_identity.get(p)
+        if identity_path:
+            w = _check_file_staleness(p, task_id, identity_path=identity_path)
+        else:
+            resolved = path_to_resolved.get(p)
+            w = file_state.check_stale(task_id, resolved) if resolved else None
+            if not w:
+                w = _check_file_staleness(p, task_id)
         if not w and path_to_resolved.get(p):
             w = _path_resolution_warning(p, Path(path_to_resolved[p]), task_id)
         if w:
@@ -803,7 +802,14 @@ def _note_edited(
             p, task_id, identity_path=path_to_identity.get(p))
         tracking_path = path_to_identity.get(p) or path_to_resolved.get(p)
         if tracking_path:
-            file_state.note_write(task_id, tracking_path)
+            if path_to_identity.get(p):
+                try:
+                    lexical_mtime = os.lstat(tracking_path).st_mtime
+                except OSError:
+                    continue
+                file_state.note_write(task_id, tracking_path, mtime=lexical_mtime)
+            else:
+                file_state.note_write(task_id, tracking_path)
 
 
 def write_file_tool(path: str, content: str, task_id: str = "default",
@@ -856,9 +862,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         return tool_error("protected path contains an ambiguous dot or empty component")
 
     try:
-        # Resolution failure falls back to the legacy unlocked path (the write
-        # still proceeds; the per-task staleness check still runs).
-        _resolved = _resolve_or_none(path, task_id)
+        # Protected candidates are already bound to the lexical parent and final
+        # entry. Never resolve their final leaf after approval.
+        _resolved = None if path in candidates else _resolve_or_none(path, task_id)
         path_to_resolved = {path: _resolved}
         path_to_identity = {
             path: candidates[path].path for path in candidates
@@ -998,6 +1004,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     if candidates and (
         mode != "replace"
         and (len(set(_paths_to_check)) != 1 or len(candidates) != 1)
+        and any(candidate.initial_kind == "symlink" for candidate in candidates.values())
     ):
         _close_protected_candidates(candidates)
         return tool_error(
@@ -1023,7 +1030,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         # Lexical identities are never produced by Path.resolve(); they remain
         # distinct from the followed physical paths used by ordinary backends.
         _path_to_resolved = {
-            _p: _resolve_or_none(_p, task_id) for _p in _paths_to_check
+            _p: None if _p in candidates else _resolve_or_none(_p, task_id)
+            for _p in _paths_to_check
         }
         _path_to_identity = {
             _p: _lexical_identity(_p, task_id, file_ops) for _p in _paths_to_check
