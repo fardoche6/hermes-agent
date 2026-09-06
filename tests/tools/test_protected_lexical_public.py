@@ -49,10 +49,12 @@ def _write(
     answer: str = "once",
     callback=None,
     task_id: str = "protected-public",
+    session_id: str | None = None,
 ):
     _approve(calls, answer=answer, callback=callback)
     try:
-        return json.loads(write_file_tool(str(path), content, task_id=task_id))
+        return json.loads(write_file_tool(
+            str(path), content, task_id=task_id, session_id=session_id))
     finally:
         set_approval_callback(None)
 
@@ -65,6 +67,7 @@ def _patch(
     answer: str = "once",
     callback=None,
     task_id: str = "protected-public",
+    session_id: str | None = None,
 ):
     _approve(calls, answer=answer, callback=callback)
     try:
@@ -74,6 +77,7 @@ def _patch(
             old_string=old,
             new_string=new,
             task_id=task_id,
+            session_id=session_id,
         ))
     finally:
         set_approval_callback(None)
@@ -87,6 +91,7 @@ def _v4a(
     answer: str = "once",
     callback=None,
     task_id: str = "protected-public",
+    session_id: str | None = None,
 ):
     _approve(calls, answer=answer, callback=callback)
     patch = (
@@ -98,7 +103,8 @@ def _v4a(
         "*** End Patch"
     )
     try:
-        return json.loads(patch_tool(mode="patch", patch=patch, task_id=task_id))
+        return json.loads(patch_tool(
+            mode="patch", patch=patch, task_id=task_id, session_id=session_id))
     finally:
         set_approval_callback(None)
 
@@ -112,12 +118,16 @@ def _run_operation(
     *,
     callback=None,
     task_id: str = "protected-public",
+    session_id: str | None = None,
 ):
     if operation == "write":
-        return _write(path, new, calls, callback=callback, task_id=task_id)
+        return _write(
+            path, new, calls, callback=callback, task_id=task_id, session_id=session_id)
     if operation == "replace":
-        return _patch(path, old, new, calls, callback=callback, task_id=task_id)
-    return _v4a(path, old, new, calls, callback=callback, task_id=task_id)
+        return _patch(
+            path, old, new, calls, callback=callback, task_id=task_id, session_id=session_id)
+    return _v4a(
+        path, old, new, calls, callback=callback, task_id=task_id, session_id=session_id)
 
 
 def _tree(tmp_path: Path):
@@ -968,3 +978,262 @@ def test_successful_result_contains_exact_regular_non_symlink_bytes(tmp_path, op
         "exact → bytes\n".encode()
     ).hexdigest()
     assert target.read_bytes() == b"before\n"
+
+
+@pytest.mark.parametrize("drift", ["classification", "config", "path"])
+@pytest.mark.parametrize("operation", ["write", "replace", "v4a"])
+def test_approval_uses_immutable_preflight_classification(
+    tmp_path, monkeypatch, operation, drift,
+):
+    import tools.file_tools as file_tools
+    import tools.file_tools_write_guards as guards
+
+    target, destination = _tree(tmp_path)
+    original_reason = guards._protected_instruction_reason
+    reason_calls = 0
+    config_calls = 0
+
+    def changing_config():
+        nonlocal config_calls
+        config_calls += 1
+        if drift == "config" and config_calls > 1:
+            return False, []
+        return True, []
+
+    def changing_reason(path, task_id="default", **kwargs):
+        nonlocal reason_calls
+        reason_calls += 1
+        if reason_calls == 1:
+            return original_reason(path, task_id, **kwargs)
+        if drift == "path":
+            if destination.exists() or destination.is_symlink():
+                destination.unlink()
+            destination.write_bytes(b"second classification interloper\n")
+        return None
+
+    monkeypatch.setattr(file_tools, "_protected_instruction_config", changing_config)
+    monkeypatch.setattr(guards, "_protected_instruction_config", changing_config)
+    monkeypatch.setattr(file_tools, "_protected_instruction_reason", changing_reason)
+    monkeypatch.setattr(guards, "_protected_instruction_reason", changing_reason)
+    calls: list = []
+
+    result = _run_operation(operation, destination, "before", "after", calls)
+
+    assert reason_calls == 1
+    assert config_calls == 1
+    assert len(calls) == 1
+    assert "error" not in result, result
+    assert destination.is_symlink() is False
+    assert destination.read_bytes() == (b"after" if operation == "write" else b"after\n")
+    assert target.read_bytes() == b"before\n"
+
+
+@pytest.mark.parametrize("operation", ["write", "replace", "v4a"])
+def test_failed_temp_creation_never_unlinks_unowned_replacement(
+    tmp_path, monkeypatch, operation,
+):
+    import tools.protected_lexical_write as primitive
+
+    target, destination = _tree(tmp_path)
+    original_open = primitive.os.open
+    created_name: list[str] = []
+
+    def fail_temp_create(path, flags, *args, **kwargs):
+        if (
+            kwargs.get("dir_fd") is not None
+            and isinstance(path, str)
+            and path.startswith(".hermes-protected-")
+        ):
+            replacement = destination.parent / path
+            replacement.write_bytes(b"unowned replacement\n")
+            created_name.append(path)
+            raise FileExistsError(path)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(primitive.os, "open", fail_temp_create)
+    monkeypatch.setattr(
+        primitive.os,
+        "supports_dir_fd",
+        set(primitive.os.supports_dir_fd) | {fail_temp_create},
+    )
+    calls: list = []
+
+    result = _run_operation(operation, destination, "before", "after", calls)
+
+    assert len(created_name) == 1
+    residue = destination.parent / created_name[0]
+    assert residue.read_bytes() == b"unowned replacement\n"
+    assert result.get("error"), result
+    assert result.get("outcome") == "not_committed"
+    assert result.get("files_modified") == []
+    assert destination.is_symlink()
+    assert target.read_bytes() == b"before\n"
+
+
+@pytest.mark.parametrize("operation", ["write", "replace", "v4a"])
+def test_temp_cleanup_preserves_replacement_after_bound_creation(
+    tmp_path, monkeypatch, operation,
+):
+    import tools.protected_lexical_write as primitive
+
+    target, destination = _tree(tmp_path)
+    original_fsync = primitive.os.fsync
+    swapped = False
+
+    def fail_staging_after_replacement(fd):
+        nonlocal swapped
+        original_fsync(fd)
+        if not swapped:
+            residues = list(destination.parent.glob(".hermes-protected-*.tmp"))
+            assert len(residues) == 1
+            residue = residues[0]
+            residue.unlink()
+            residue.write_bytes(b"replacement after creation\n")
+            swapped = True
+        raise OSError("injected staging failure")
+
+    monkeypatch.setattr(primitive.os, "fsync", fail_staging_after_replacement)
+    calls: list = []
+
+    result = _run_operation(operation, destination, "before", "after", calls)
+
+    residues = list(destination.parent.glob(".hermes-protected-*.tmp"))
+    assert swapped is True
+    assert len(residues) == 1
+    assert residues[0].read_bytes() == b"replacement after creation\n"
+    assert result.get("error"), result
+    assert "UNCERTAIN STATE" in result["error"]
+    assert destination.is_symlink()
+    assert target.read_bytes() == b"before\n"
+
+
+@pytest.mark.parametrize("outcome", ["committed", "uncertain"])
+@pytest.mark.parametrize("operation", ["write", "replace", "v4a"])
+def test_protected_terminal_outcome_updates_write_and_verification_state(
+    tmp_path, monkeypatch, operation, outcome,
+):
+    from agent.verification_evidence import record_verify_run, verification_status
+    from tools import file_state
+    from tools.file_tools_read_tracking import _patch_failure_tracker, _record_patch_failure
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(
+        "[project]\nname = 'protected-bookkeeping'\nversion = '0'\n",
+        encoding="utf-8",
+    )
+    target = project / "external.txt"
+    destination = project / "AGENTS.md"
+    target.write_bytes(b"before\n")
+    destination.symlink_to(target)
+    task_id = f"protected-bookkeeping-{operation}-{outcome}"
+    file_state.get_registry().clear()
+    _patch_failure_tracker.clear()
+    record_verify_run(root=project, session_id=task_id, ok=True)
+
+    import tools.protected_lexical_write as primitive
+
+    if operation != "write":
+        _record_patch_failure(task_id, str(destination))
+    if outcome == "committed":
+        original_rename = primitive.os.rename
+
+        def rename_then_raise(*args, **kwargs):
+            original_rename(*args, **kwargs)
+            raise OSError("injected after-rename failure")
+
+        monkeypatch.setattr(primitive.os, "rename", rename_then_raise)
+        monkeypatch.setattr(
+            primitive.os,
+            "supports_dir_fd",
+            set(primitive.os.supports_dir_fd) | {rename_then_raise},
+        )
+    else:
+        original_rename = primitive.os.rename
+        original_stat = primitive.os.stat
+        rename_done = False
+        fault_fired = False
+
+        def record_rename(*args, **kwargs):
+            nonlocal rename_done
+            result = original_rename(*args, **kwargs)
+            rename_done = True
+            return result
+
+        def mutate_after_rename(path, *args, **kwargs):
+            nonlocal fault_fired
+            if (
+                rename_done
+                and not fault_fired
+                and path == "AGENTS.md"
+                and kwargs.get("dir_fd") is not None
+            ):
+                fault_fired = True
+                destination.write_bytes(b"newer after rename\n")
+            return original_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(primitive.os, "rename", record_rename)
+        monkeypatch.setattr(primitive.os, "stat", mutate_after_rename)
+        monkeypatch.setattr(
+            primitive.os,
+            "supports_dir_fd",
+            set(primitive.os.supports_dir_fd) | {record_rename, mutate_after_rename},
+        )
+
+    calls: list = []
+    result = _run_operation(
+        operation,
+        destination,
+        "before",
+        "after",
+        calls,
+        task_id=task_id,
+        session_id=task_id,
+    )
+
+    assert result.get("error"), result
+    assert result.get("outcome") == outcome
+    assert result.get("files_modified") == [str(destination)]
+    assert result.get("verified") is False
+    writes = file_state.writes_since("observer", 0.0, [str(destination)])
+    assert task_id in writes
+    assert writes[task_id] == [str(destination)]
+    assert verification_status(session_id=task_id, cwd=project)["status"] == "stale"
+    if operation != "write":
+        assert str(destination) not in _patch_failure_tracker.get(task_id, {})
+
+
+@pytest.mark.parametrize("operation", ["write", "replace", "v4a"])
+def test_not_committed_drift_does_not_refresh_read_timestamp(
+    tmp_path, operation,
+):
+    from tools.file_tools import read_file_tool
+    from tools.file_tools_read_tracking import _read_tracker
+
+    destination = tmp_path / "AGENTS.md"
+    destination.write_bytes(b"before\n")
+    task_id = f"protected-drift-{operation}"
+    json.loads(read_file_tool(str(destination), task_id=task_id))
+    before_timestamp = _read_tracker[task_id]["read_timestamps"][str(destination)]
+    calls: list = []
+
+    def drift_in_place():
+        destination.write_bytes(
+            b"concurrent\n" if operation == "write" else b"before\nconcurrent\n"
+        )
+
+    result = _run_operation(
+        operation,
+        destination,
+        "before",
+        "candidate",
+        calls,
+        callback=drift_in_place,
+        task_id=task_id,
+    )
+
+    assert len(calls) == 1
+    assert result.get("error"), result
+    assert result.get("outcome") == "not_committed"
+    assert result.get("files_modified") == []
+    assert _read_tracker[task_id]["read_timestamps"][str(destination)] == before_timestamp

@@ -74,6 +74,31 @@ class BackendAdmission:
         return cls(True, True)
 
 
+@dataclass(frozen=True)
+class ProtectedInstructionToken:
+    """Immutable protected-file classification carried through one write."""
+
+    requested_path: str
+    candidate_path: str | None
+    protected: bool
+    reason: str | None
+
+    def __post_init__(self) -> None:
+        if self.protected != bool(self.reason):
+            raise ValueError("protected instruction token classification is inconsistent")
+
+    def bind(self, candidate_path: str) -> "ProtectedInstructionToken":
+        """Return the same classification bound to the admitted lexical path."""
+        if not self.protected or not candidate_path:
+            raise ValueError("cannot bind an unprotected instruction token")
+        return ProtectedInstructionToken(
+            requested_path=self.requested_path,
+            candidate_path=candidate_path,
+            protected=True,
+            reason=self.reason,
+        )
+
+
 @dataclass
 class ProtectedLexicalCandidate:
     """Preimage retained from one lexical parent and its final entry."""
@@ -95,6 +120,7 @@ class ProtectedLexicalCandidate:
     original_mode: int | None = None
     candidate_bytes: bytes = b""
     candidate_sha256: str = ""
+    protection_token: ProtectedInstructionToken | None = None
     staged_identity: dict | None = None
     committed_identity: dict | None = None
     closed: bool = False
@@ -143,6 +169,11 @@ def _identity(st: os.stat_result) -> dict:
 
 def _same_identity(expected: dict, actual: dict) -> bool:
     return all(expected.get(key) == actual.get(key) for key in ("st_dev", "st_ino", "st_mode"))
+
+
+def _same_inode(expected: dict, actual: dict) -> bool:
+    """Compare the inode identity while allowing a bound file's mode to change."""
+    return all(expected.get(key) == actual.get(key) for key in ("st_dev", "st_ino"))
 
 
 def _entry_identity(st: os.stat_result, link_text: str) -> dict:
@@ -228,13 +259,6 @@ def _random_name(parent_fd: int) -> str:
         except FileNotFoundError:
             return name
     raise ProtectedLexicalError("could not allocate a protected temporary name")
-
-
-def _unlink(parent_fd: int, name: str) -> None:
-    try:
-        os.unlink(name, dir_fd=parent_fd)
-    except FileNotFoundError:
-        return
 
 
 def _rename(source: str, destination: str, parent_fd: int) -> None:
@@ -433,6 +457,7 @@ def read_candidate(
 def _write_temp(candidate: ProtectedLexicalCandidate) -> str:
     name = _random_name(candidate.parent_fd)
     fd = -1
+    created = False
     try:
         fd = os.open(
             name,
@@ -440,6 +465,13 @@ def _write_temp(candidate: ProtectedLexicalCandidate) -> str:
             0o600 if candidate.candidate_mode is not None else 0o666,
             dir_fd=candidate.parent_fd,
         )
+        # Bind ownership immediately after O_EXCL succeeds.  All later cleanup
+        # must prove this exact inode still owns the generated name.
+        created = True
+        temp_identity = _identity(os.fstat(fd))
+        if not stat.S_ISREG(temp_identity["st_mode"]):
+            raise ProtectedLexicalError("protected temporary is not regular")
+        candidate.staged_identity = {"kind": "regular", **temp_identity}
         view = memoryview(candidate.candidate_bytes)
         while view:
             written = os.write(fd, view)
@@ -449,18 +481,23 @@ def _write_temp(candidate: ProtectedLexicalCandidate) -> str:
         if candidate.candidate_mode is not None:
             os.fchmod(fd, candidate.candidate_mode & 0o7777)
         os.fsync(fd)
-        temp_identity = _identity(os.fstat(fd))
-        if not stat.S_ISREG(temp_identity["st_mode"]):
-            raise ProtectedLexicalError("protected temporary is not regular")
-        candidate.staged_identity = {"kind": "regular", **temp_identity}
+        written_identity = _identity(os.fstat(fd))
+        if not _same_inode(candidate.staged_identity, written_identity):
+            raise ProtectedLexicalError("protected temporary identity changed while staging")
+        # fchmod above may legitimately change st_mode after the immediate
+        # ownership binding; retain the same inode with its final mode.
+        candidate.staged_identity = {"kind": "regular", **written_identity}
         return name
     except Exception as exc:
         if fd >= 0:
             os.close(fd)
             fd = -1
-        try:
-            _unlink(candidate.parent_fd, name)
-        except Exception as cleanup_error:
+        if not created:
+            # O_EXCL failed: Hermes never owned this pathname and must not
+            # unlink it, even if another actor installed an object there.
+            raise
+        cleanup_error = _cleanup_temp(candidate, name)
+        if cleanup_error:
             raise ProtectedLexicalError(
                 f"UNCERTAIN STATE: protected temporary write failed and cleanup failed: {cleanup_error}"
             ) from exc
@@ -521,18 +558,18 @@ def _final_is_candidate(candidate: ProtectedLexicalCandidate) -> bool:
 def _cleanup_temp(candidate: ProtectedLexicalCandidate, name: str | None) -> str | None:
     if not name:
         return None
+    if candidate.staged_identity is None:
+        return "protected temporary identity is not bound; leaving it in place"
     try:
         temp_stat = os.stat(name, dir_fd=candidate.parent_fd, follow_symlinks=False)
     except FileNotFoundError:
-        return None
+        return "protected temporary object could not be observed; leaving it in place"
     except Exception as exc:
-        return str(exc)
-    if candidate.staged_identity is not None and not _same_identity(
-        candidate.staged_identity, _identity(temp_stat)
-    ):
+        return f"protected temporary object could not be observed: {exc}"
+    if not _same_inode(candidate.staged_identity, _identity(temp_stat)):
         return "protected temporary object changed; leaving it in place"
     try:
-        _unlink(candidate.parent_fd, name)
+        os.unlink(name, dir_fd=candidate.parent_fd)
     except Exception as exc:
         return str(exc)
     return None
