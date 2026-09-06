@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, ClassVar
 from pathlib import Path
 from tools.binary_extensions import BINARY_EXTENSIONS
+from tools.protected_lexical_write import BackendAdmission, LexicalWriteTarget
 
 from agent.file_safety import (
     build_write_denied_paths,
@@ -1061,12 +1062,23 @@ class ShellFileOperations(FileOperations):
             original directory, producing apparent silent failures.
         """
         self.env = terminal_env
-        # Determine cwd from various possible sources.
-        # IMPORTANT: do NOT fall back to os.getcwd() -- that's the HOST's local
-        # path which doesn't exist inside container/cloud backends (modal, docker).
-        # If nothing provides a cwd, use "/" as a safe universal default.
-        self.cwd = cwd or getattr(terminal_env, 'cwd', None) or \
-                   getattr(getattr(terminal_env, 'config', None), 'cwd', None) or "/"
+        # Admission is captured once per file-operation boundary, before any
+        # caller can inspect a host path.  The environment's ``is_local``
+        # identity is authoritative; file tools must not infer it from a class
+        # name or configured backend string.
+        self.backend_admission = BackendAdmission.identify(terminal_env)
+        # Determine cwd from various possible sources.  A broken capability
+        # getter must not escape as a raw exception after admission has already
+        # classified the backend as unsupported.
+        try:
+            env_cwd = getattr(terminal_env, "cwd", None)
+        except Exception:
+            env_cwd = None
+        try:
+            config_cwd = getattr(getattr(terminal_env, "config", None), "cwd", None)
+        except Exception:
+            config_cwd = None
+        self.cwd = cwd or env_cwd or config_cwd or "/"
 
         # Preserve the historical bool cache for ordinary executables: both
         # hits and misses stay cached. Ripgrep is special because it has an
@@ -1075,6 +1087,14 @@ class ShellFileOperations(FileOperations):
         self._command_cache: Dict[str, bool] = {}
         self._rg_resolution_cache: Dict[str, str] = {}
         self._rg_modified_capability: Dict[str, Optional[str]] = {}
+
+    def _lexical_write_target(self, path: str) -> LexicalWriteTarget:
+        """Bind *path* to the environment cwd without resolving symlinks."""
+        try:
+            cwd = getattr(self.env, "cwd", None) or self.cwd
+        except Exception:
+            cwd = self.cwd
+        return LexicalWriteTarget.from_path(path, cwd=cwd)
     
     def _exec(self, command: str, cwd: str = None, timeout: int = None,
               stdin_data: str = None) -> ExecuteResult:

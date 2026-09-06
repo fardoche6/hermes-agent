@@ -10,6 +10,7 @@ import posixpath
 import sys
 import threading
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from agent.file_safety import get_read_block_error
 from tools.binary_extensions import (
@@ -22,6 +23,7 @@ from tools.file_operations import (
     normalize_read_pagination,
     normalize_search_pagination,
 )
+from tools.protected_lexical_write import BackendAdmission, BackendKind, LexicalWriteTarget
 from tools import file_state
 from agent.redact import redact_sensitive_text
 
@@ -685,13 +687,30 @@ def _get_hermes_config_resolved() -> str | None:
     return _hermes_config_resolved
 
 
-def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
-    """Return an error message if the path targets a sensitive system location."""
-    try:
-        resolved = str(_resolve_path_for_task(filepath, task_id))
-    except (OSError, ValueError):
-        resolved = filepath
+def _check_sensitive_path(
+    filepath: str,
+    task_id: str = "default",
+    *,
+    lexical_only: bool = False,
+    lexical_path: str | None = None,
+) -> str | None:
+    """Return an error message if the path targets a sensitive system location.
+
+    ``lexical_only`` is used before backend admission or for remote namespaces:
+    it deliberately avoids all host resolution and checks only the normalized
+    path text.  Local admitted operations run the historical followed-path
+    check after admission.
+    """
+    if not isinstance(filepath, str):
+        return None
     normalized = os.path.normpath(_expand_tilde(filepath))
+    if lexical_only:
+        resolved = lexical_path or normalized
+    else:
+        try:
+            resolved = str(_resolve_path_for_task(filepath, task_id))
+        except (OSError, ValueError):
+            resolved = filepath
     _err = (
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
@@ -701,17 +720,17 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             return _err
     if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
         return _err
-    # Prevent agents from modifying the Hermes config file directly.
-    # approvals.mode and other security settings live here; a malicious or
-    # prompt-injected agent could silently disable exec approval by writing to
-    # this file.
-    hermes_config = _get_hermes_config_resolved()
-    if hermes_config and (resolved == hermes_config or normalized == hermes_config):
-        return (
-            f"Refusing to write to Hermes config file: {filepath}\n"
-            "Agent cannot modify security-sensitive configuration. "
-            "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
-        )
+    # Prevent agents from modifying the Hermes config file directly.  This
+    # requires the host's canonical config path, so do not run it before
+    # backend admission or for remote lexical namespaces.
+    if not lexical_only:
+        hermes_config = _get_hermes_config_resolved()
+        if hermes_config and (resolved == hermes_config or normalized == hermes_config):
+            return (
+                f"Refusing to write to Hermes config file: {filepath}\n"
+                "Agent cannot modify security-sensitive configuration. "
+                "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
+            )
     return None
 
 
@@ -1438,7 +1457,16 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     import time
 
     raw_task_id = task_id or "default"
-    task_id = _resolve_container_task_id(raw_task_id)
+    # An already-registered environment is authoritative for this exact key.
+    # Inspect it before the alias/session resolver: that resolver may load
+    # configuration and touch host paths before backend admission has had a
+    # chance to fail closed.
+    with _env_lock:
+        direct_environment = _active_environments.get(raw_task_id)
+    if direct_environment is not None:
+        task_id = raw_task_id
+    else:
+        task_id = _resolve_container_task_id(raw_task_id)
 
     # Fast path: check cache -- but also verify the underlying environment
     # is still alive (it may have been killed by the cleanup thread).
@@ -1594,6 +1622,52 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     with _file_ops_lock:
         _file_ops_cache[task_id] = file_ops
     return file_ops
+
+
+def _lexical_write_context(
+    path: str,
+    task_id: str = "default",
+    *,
+    file_ops: Any = None,
+) -> tuple[Any, LexicalWriteTarget | None, str | None]:
+    """Get the production write boundary and bind its lexical identity.
+
+    The concrete shell boundary is the only production object that carries
+    backend admission.  Test doubles used by the older handler-unit tests are
+    returned untouched so those tests continue to exercise their existing
+    dispatch assertions; an actual ``ShellFileOperations`` instance without a
+    structured admission is rejected rather than defaulting to local.
+    """
+    if file_ops is None:
+        file_ops = _get_file_ops(task_id)
+    if not isinstance(file_ops, ShellFileOperations):
+        return file_ops, None, None
+
+    admission = getattr(file_ops, "backend_admission", None)
+    if not isinstance(admission, BackendAdmission):
+        return (
+            file_ops,
+            None,
+            "UNSUPPORTED: backend identity is unavailable or ambiguous",
+        )
+
+    if admission.kind is not BackendKind.LOCAL_POSIX:
+        return file_ops, None, f"UNSUPPORTED: {admission.reason}"
+
+    try:
+        lexical_cwd = _registered_task_cwd_override(task_id)
+        if lexical_cwd:
+            target = LexicalWriteTarget.from_path(path, cwd=lexical_cwd)
+        else:
+            target = file_ops._lexical_write_target(path)
+    except (TypeError, ValueError, OSError, RuntimeError):
+        return (
+            file_ops,
+            None,
+            "INVALID_LEXICAL_WRITE_TARGET: path must name one NUL-free file "
+            "entry under an absolute cwd",
+        )
+    return file_ops, target, None
 
 
 def clear_file_ops_cache(task_id: str = None):
@@ -2103,23 +2177,20 @@ def notify_other_tool_call(task_id: str = "default"):
                 nf.clear()
 
 
-def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
-    """Remove all dedup cache entries whose resolved path matches *filepath*.
-
-    Called after write_file and patch so that a subsequent read_file on
-    the same path always returns fresh content instead of a stale
-    "File unchanged" stub.  The dedup cache keys are tuples of
-    ``(resolved_path, offset, limit)``; we must evict **all** offset/limit
-    combinations for the written path because any cached range could now
-    be stale.
-
-    Must be called with ``_read_tracker_lock`` **not** held — acquires it
-    internally.
-    """
+def _invalidate_dedup_for_path(
+    filepath: str,
+    task_id: str,
+    *,
+    identity_path: str | None = None,
+) -> None:
+    """Remove dedup entries for both the physical path and lexical identity."""
     try:
         resolved = str(_resolve_path(filepath, task_id))
     except (OSError, ValueError):
         return
+    paths = {resolved}
+    if identity_path:
+        paths.add(identity_path)
     with _read_tracker_lock:
         task_data = _read_tracker.get(task_id)
         if task_data is None:
@@ -2127,7 +2198,7 @@ def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
         dedup = task_data.get("dedup")
         if dedup:
             # Collect keys to remove (can't mutate dict during iteration).
-            stale_keys = [k for k in dedup if k[0] == resolved]
+            stale_keys = [k for k in dedup if k[0] in paths]
             for k in stale_keys:
                 del dedup[k]
         # Also evict from the negative-result cache: a write_file that
@@ -2135,50 +2206,63 @@ def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
         # must hit disk.
         nf = task_data.get("not_found")
         if nf:
-            nf.pop(("read", resolved), None)
-            nf.pop(("search", resolved), None)
+            for key_path in paths:
+                nf.pop(("read", key_path), None)
+                nf.pop(("search", key_path), None)
 
 
-def _update_read_timestamp(filepath: str, task_id: str) -> None:
-    """Record the file's current modification time after a successful write.
-
-    Called after write_file and patch so that consecutive edits by the
-    same task don't trigger false staleness warnings — each write
-    refreshes the stored timestamp to match the file's new state.
-
-    Also invalidates the dedup cache for the written path so that
-    subsequent reads return fresh content (fixes #13144).
-    """
+def _update_read_timestamp(
+    filepath: str,
+    task_id: str,
+    *,
+    identity_path: str | None = None,
+) -> None:
+    """Record current mtime while keeping the bookkeeping key lexical."""
     # Invalidate dedup first (before acquiring lock for timestamp update).
-    _invalidate_dedup_for_path(filepath, task_id)
+    _invalidate_dedup_for_path(
+        filepath,
+        task_id,
+        identity_path=identity_path,
+    )
     try:
         resolved = str(_resolve_path_for_task(filepath, task_id))
         current_mtime = os.path.getmtime(resolved)
     except (OSError, ValueError):
         return
+    key = identity_path or resolved
     with _read_tracker_lock:
         task_data = _read_tracker.get(task_id)
         if task_data is not None:
-            task_data.setdefault("read_timestamps", {})[resolved] = current_mtime
+            timestamps = task_data.setdefault("read_timestamps", {})
+            timestamps[key] = current_mtime
+            if identity_path and identity_path != resolved:
+                timestamps.pop(resolved, None)
             _cap_read_tracker_data(task_data)
 
 
-def _check_file_staleness(filepath: str, task_id: str) -> str | None:
-    """Check whether a file was modified since the agent last read it.
-
-    Returns a warning string if the file is stale (mtime changed since
-    the last read_file call for this task), or None if the file is fresh
-    or was never read.  Does not block — the write still proceeds.
-    """
+def _check_file_staleness(
+    filepath: str,
+    task_id: str,
+    *,
+    identity_path: str | None = None,
+) -> str | None:
+    """Check mtime while looking up the caller's lexical bookkeeping key."""
     try:
         resolved = str(_resolve_path_for_task(filepath, task_id))
     except (OSError, ValueError):
         return None
+    key = identity_path or resolved
     with _read_tracker_lock:
         task_data = _read_tracker.get(task_id)
         if not task_data:
             return None
-        read_mtime = task_data.get("read_timestamps", {}).get(resolved)
+        timestamps = task_data.get("read_timestamps", {})
+        read_mtime = timestamps.get(key)
+        # Reads made before lexical bookkeeping was introduced were stamped
+        # with the followed path.  Accept that one legacy lookup, but never
+        # write a new physical key.
+        if read_mtime is None and identity_path and identity_path != resolved:
+            read_mtime = timestamps.get(resolved)
     if read_mtime is None:
         return None  # File was never read — nothing to compare against
     try:
@@ -2283,6 +2367,30 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     the schema — the mirror rejection error teaches it. The cross-PROFILE
     guard this flag was named for is removed (profiles are not isolated).
     """
+    # This content-only guard is safe before backend admission and preserves
+    # the established fast rejection for accidental read_file display writes.
+    if _is_internal_file_tool_content(content):
+        return tool_error(
+            "Refusing to write internal read_file display text as file content. "
+            "Strip read_file line-number prefixes or reconstruct the intended "
+            "file contents before writing."
+        )
+
+    file_ops = None
+    lexical_target = None
+    try:
+        file_ops, lexical_target, boundary_error = _lexical_write_context(
+            path, task_id
+        )
+        if boundary_error:
+            return tool_error(boundary_error)
+    except Exception as e:
+        if _is_expected_write_exception(e):
+            logger.debug("write_file expected denial: %s: %s", type(e).__name__, e)
+        else:
+            logger.error("write_file error: %s: %s", type(e).__name__, e, exc_info=True)
+        return tool_error(str(e))
+
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -2299,12 +2407,6 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         cross_warning = _check_cross_profile_path(path, task_id)
         if cross_warning:
             return tool_error(cross_warning)
-    if _is_internal_file_tool_content(content):
-        return tool_error(
-            "Refusing to write internal read_file display text as file content. "
-            "Strip read_file line-number prefixes or reconstruct the intended "
-            "file contents before writing."
-        )
     try:
         # Resolve once for the registry lock + stale check.  Failures here
         # fall back to the legacy path — write proceeds, per-task staleness
@@ -2314,47 +2416,80 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         except Exception:
             _resolved = None
 
+        identity_path = lexical_target.lexical_path if lexical_target else None
+        bookkeeping_path = identity_path or _resolved or path
+
         if _resolved is None:
-            stale_warning = _check_file_staleness(path, task_id)
-            file_ops = _get_file_ops(task_id)
+            stale_warning = _check_file_staleness(
+                path,
+                task_id,
+                identity_path=identity_path,
+            )
             result = file_ops.write_file(path, content)
             result_dict = result.to_dict()
+            if identity_path:
+                result_dict["resolved_path"] = identity_path
+                result_dict["lexical_path"] = identity_path
+                result_dict["identity_key"] = list(lexical_target.identity_key)
             if stale_warning:
                 result_dict["_warning"] = stale_warning
             if not result_dict.get("error"):
-                _mark_verification_stale(task_id, [path], session_id=session_id)
-            _update_read_timestamp(path, task_id)
+                result_dict["files_modified"] = [bookkeeping_path]
+                _mark_verification_stale(
+                    task_id, [bookkeeping_path], session_id=session_id
+                )
+            _update_read_timestamp(
+                path,
+                task_id,
+                identity_path=identity_path,
+            )
+            if not result_dict.get("error"):
+                file_state.note_write(task_id, bookkeeping_path)
             return json.dumps(result_dict, ensure_ascii=False)
 
         # Serialize the read→modify→write region per-path so concurrent
         # subagents can't interleave on the same file.  Different paths
-        # remain fully parallel.
-        with file_state.lock_path(_resolved):
+        # remain fully parallel.  The lock key is the lexical directory entry;
+        # the shell operation may still follow a normal symlink for this
+        # checkpoint's compatibility contract.
+        with file_state.lock_path(bookkeeping_path):
             # Cross-agent staleness wins over per-task warning when both
             # fire — its message names the sibling subagent.
-            cross_warning = file_state.check_stale(task_id, _resolved)
-            stale_warning = _check_file_staleness(path, task_id)
+            cross_warning = file_state.check_stale(task_id, bookkeeping_path)
+            stale_warning = _check_file_staleness(
+                path,
+                task_id,
+                identity_path=identity_path,
+            )
             # Workspace-divergence warning: relative path resolving outside the
             # terminal's cwd (the worktree-cwd bug). Lowest priority of the three.
             cwd_warning = _path_resolution_warning(path, Path(_resolved), task_id)
-            file_ops = _get_file_ops(task_id)
             result = file_ops.write_file(_resolved, content)
             result_dict = result.to_dict()
             effective_warning = cross_warning or stale_warning or cwd_warning
             if effective_warning:
                 result_dict["_warning"] = effective_warning
-            # Always report the ABSOLUTE path actually written, so a wrong-cwd
-            # mismatch is visible in the response instead of silently routing
-            # the edit to the wrong checkout.
-            result_dict["resolved_path"] = _resolved
+            # Report the lexical directory entry selected by the caller.  The
+            # underlying normal write still follows a final symlink; only the
+            # identity/bookkeeping surface changes in checkpoint 1.
+            result_dict["resolved_path"] = bookkeeping_path
+            if lexical_target:
+                result_dict["lexical_path"] = lexical_target.lexical_path
+                result_dict["identity_key"] = list(lexical_target.identity_key)
             if not result_dict.get("error"):
-                result_dict["files_modified"] = [_resolved]
-                _mark_verification_stale(task_id, [_resolved], session_id=session_id)
+                result_dict["files_modified"] = [bookkeeping_path]
+                _mark_verification_stale(
+                    task_id, [bookkeeping_path], session_id=session_id
+                )
             # Refresh stamps after the successful write so consecutive
             # writes by this task don't trigger false staleness warnings.
-            _update_read_timestamp(path, task_id)
+            _update_read_timestamp(
+                path,
+                task_id,
+                identity_path=identity_path,
+            )
             if not result_dict.get("error"):
-                file_state.note_write(task_id, _resolved)
+                file_state.note_write(task_id, bookkeeping_path)
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
         if _is_expected_write_exception(e):
@@ -2425,6 +2560,49 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 if _err:
                     return _err
                 _paths_to_check.append(v4a_path)
+
+    # Pure lexical sensitive-path rejection preserves the no-I/O fast path for
+    # obvious absolute system targets.  The followed-path check below still
+    # runs after backend admission for symlink aliases and relative paths.
+    for _p in _paths_to_check:
+        sensitive_err = _check_sensitive_path(_p, task_id, lexical_only=True)
+        if sensitive_err:
+            return tool_error(sensitive_err)
+
+    # Select the backend and bind every caller-selected path before any of the
+    # legacy sensitive/cross-profile/protected checks can resolve a host path.
+    # The map is intentionally lexical; physical resolution remains an
+    # implementation detail of the ordinary patch operation below.
+    file_ops = None
+    lexical_targets: dict[str, LexicalWriteTarget] = {}
+    if _paths_to_check:
+        try:
+            file_ops, _first_target, boundary_error = _lexical_write_context(
+                _paths_to_check[0], task_id
+            )
+            if boundary_error:
+                return tool_error(boundary_error)
+            if isinstance(file_ops, ShellFileOperations):
+                for _p in _paths_to_check:
+                    _ops, _target, boundary_error = _lexical_write_context(
+                        _p,
+                        task_id,
+                        file_ops=file_ops,
+                    )
+                    if boundary_error:
+                        return tool_error(boundary_error)
+                    if _target is None:
+                        return tool_error(
+                            "UNSUPPORTED: backend identity is unavailable or ambiguous"
+                        )
+                    lexical_targets[_p] = _target
+        except Exception as e:
+            if _is_expected_write_exception(e):
+                logger.debug("patch boundary denial: %s: %s", type(e).__name__, e)
+            else:
+                logger.error("patch boundary error: %s: %s", type(e).__name__, e, exc_info=True)
+            return tool_error(str(e))
+
     for _p in _paths_to_check:
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
@@ -2446,41 +2624,49 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     if approval_err:
         return tool_error(approval_err)
     try:
-        # Resolve paths for locking.  Ordered + deduplicated so concurrent
-        # callers lock in the same order — prevents deadlock on overlapping
-        # multi-file V4A patches.
-        _resolved_paths: list[str] = []
+        # Resolve paths for the shell operation.  Lock identities are kept
+        # separately and remain lexical even when resolution follows a link.
+        _lock_paths: list[str] = []
         _seen: set[str] = set()
         for _p in _paths_to_check:
             try:
                 _r = str(_resolve_path_for_task(_p, task_id))
             except Exception:
                 _r = None
-            if _r and _r not in _seen:
-                _resolved_paths.append(_r)
-                _seen.add(_r)
-        _resolved_paths.sort()
+            _target = lexical_targets.get(_p)
+            _lock_path = _target.lexical_path if _target else _r
+            if _lock_path and _lock_path not in _seen:
+                _lock_paths.append(_lock_path)
+                _seen.add(_lock_path)
 
         # Acquire per-path locks in sorted order via ExitStack.  On single
         # path this degenerates to one lock; on empty list (unresolvable)
         # it's a no-op and execution falls through unchanged.
         from contextlib import ExitStack
         with ExitStack() as _locks:
-            for _r in _resolved_paths:
-                _locks.enter_context(file_state.lock_path(_r))
+            for _lock_path in sorted(_lock_paths):
+                _locks.enter_context(file_state.lock_path(_lock_path))
 
             # Collect warnings — cross-agent registry first (names sibling),
             # then per-task tracker as a fallback.
             stale_warnings: list[str] = []
-            _path_to_resolved: dict[str, str] = {}
+            _path_to_resolved: dict[str, str | None] = {}
+            _path_to_identity: dict[str, str] = {}
             for _p in _paths_to_check:
                 try:
                     _r = str(_resolve_path_for_task(_p, task_id))
                 except Exception:
                     _r = None
                 _path_to_resolved[_p] = _r
-                _cross = file_state.check_stale(task_id, _r) if _r else None
-                _sw = _cross or _check_file_staleness(_p, task_id)
+                _target = lexical_targets.get(_p)
+                _identity = _target.lexical_path if _target else (_r or _p)
+                _path_to_identity[_p] = _identity
+                _cross = file_state.check_stale(task_id, _identity)
+                _sw = _cross or _check_file_staleness(
+                    _p,
+                    task_id,
+                    identity_path=_identity if _target else None,
+                )
                 if not _sw and _r:
                     # Workspace-divergence warning (worktree-cwd bug): relative
                     # path resolving outside the terminal's cwd.
@@ -2488,7 +2674,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 if _sw:
                     stale_warnings.append(_sw)
 
-            file_ops = _get_file_ops(task_id)
+            if file_ops is None:
+                file_ops = _get_file_ops(task_id)
 
             if mode == "replace":
                 if not path:
@@ -2520,30 +2707,40 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             result_dict = result.to_dict()
             if stale_warnings:
                 result_dict["_warning"] = stale_warnings[0] if len(stale_warnings) == 1 else " | ".join(stale_warnings)
-            # Report the ABSOLUTE path(s) actually patched so a wrong-cwd
-            # mismatch (e.g. a worktree session editing the main checkout) is
-            # visible in the response instead of silently landing elsewhere.
-            _resolved_modified = [
-                _path_to_resolved.get(_p) or _p for _p in _paths_to_check
+            # Report the lexical path(s) selected by the caller.  A normal
+            # patch may still follow a final symlink, but its coordination
+            # identity is the directory entry, never the followed target.
+            _identity_modified = [
+                _path_to_identity.get(_p)
+                or _path_to_resolved.get(_p)
+                or _p
+                for _p in _paths_to_check
             ]
+            _resolved_modified = _identity_modified
             # Refresh stored timestamps for all successfully-patched paths so
             # consecutive edits by this task don't trigger false warnings.
             if not result_dict.get("error"):
                 result_dict["files_modified"] = _resolved_modified
                 if len(_resolved_modified) == 1:
                     result_dict["resolved_path"] = _resolved_modified[0]
+                    _target = lexical_targets.get(_paths_to_check[0])
+                    if _target:
+                        result_dict["lexical_path"] = _target.lexical_path
+                        result_dict["identity_key"] = list(_target.identity_key)
                 _mark_verification_stale(task_id, _resolved_modified, session_id=session_id)
                 for _p in _paths_to_check:
-                    _update_read_timestamp(_p, task_id)
-                    _r = _path_to_resolved.get(_p)
-                    if _r:
-                        file_state.note_write(task_id, _r)
+                    _update_read_timestamp(
+                        _p,
+                        task_id,
+                        identity_path=_path_to_identity.get(_p),
+                    )
+                    _identity = _path_to_identity.get(_p)
+                    if _identity:
+                        file_state.note_write(task_id, _identity)
                 # Successful patch: clear any prior consecutive-failure
                 # counters for the touched paths so a future failure on
                 # the same path starts the escalation cycle fresh.
-                _reset_patch_failures(task_id, [
-                    _r for _r in (_path_to_resolved.get(_p) for _p in _paths_to_check) if _r
-                ])
+                _reset_patch_failures(task_id, _identity_modified)
         # Hint when old_string not found — saves iterations where the agent
         # retries with stale content instead of re-reading the file.
         # Suppressed when patch_replace already attached a rich "Did you mean?"
