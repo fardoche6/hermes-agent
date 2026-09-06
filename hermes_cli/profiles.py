@@ -1816,7 +1816,10 @@ def _profile_root_from_env(env: Mapping[str, str], *, use_process_home: bool = F
     if inherited_home:
         candidate = _require_absolute_home(inherited_home)
         if candidate.parent.name == "profiles" or (
-            candidate.name == "home" and candidate.parent.parent.parent.name == "profiles"
+            candidate.name == "home"
+            and candidate.parent.parent.name == "profiles"
+            and not candidate.parent.name.startswith(".")
+            and _PROFILE_ID_RE.fullmatch(candidate.parent.name)
         ):
             raise ValueError(f"HOME is not anchored to a Hermes profiles root: {candidate}")
     return _platform_profile_root(None if use_process_home else env)

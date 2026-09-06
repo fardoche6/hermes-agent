@@ -1251,6 +1251,86 @@ class TestResolveProfileEnvSpelling:
         assert child["HOME"] != str(parent / "home")
         assert child["HERMES_REAL_HOME"] == str(real_home)
 
+    def test_markerless_custom_root_rejects_absent_named_home(self, tmp_path):
+        """An absent named managed HOME under an explicit custom root is not an account home."""
+        root = tmp_path / "custom-root"
+        target = root / "profiles" / "target"
+        target.mkdir(parents=True)
+        stale_home = root / "profiles" / "parent" / "home"
+        fallback_home = tmp_path / "fallback-user"
+        fallback_home.mkdir()
+        inherited = {
+            "HERMES_HOME": str(root),
+            "HOME": str(stale_home),
+            "USERPROFILE": str(fallback_home),
+            "PATH": "/usr/bin",
+        }
+
+        child = build_profile_launch_env("target", base_env=inherited)
+
+        assert child["HERMES_HOME"] == str(target)
+        assert child["HOME"] != str(stale_home)
+        assert child["HERMES_REAL_HOME"] != str(stale_home)
+        assert inherited["HOME"] == str(stale_home)
+
+    def test_markerless_custom_root_rejects_absent_default_home(self, tmp_path):
+        """An absent custom-root default HOME is also managed, not an account home."""
+        root = tmp_path / "custom-root"
+        target = root / "profiles" / "target"
+        target.mkdir(parents=True)
+        stale_home = root / "home"
+        fallback_home = tmp_path / "fallback-user"
+        fallback_home.mkdir()
+        inherited = {
+            "HERMES_HOME": str(root),
+            "HOME": str(stale_home),
+            "USERPROFILE": str(fallback_home),
+            "PATH": "/usr/bin",
+        }
+
+        child = build_profile_launch_env("target", base_env=inherited)
+
+        assert child["HERMES_HOME"] == str(target)
+        assert child["HOME"] != str(stale_home)
+        assert child["HERMES_REAL_HOME"] != str(stale_home)
+        assert inherited["HOME"] == str(stale_home)
+
+    def test_home_only_absent_profile_shape_rejected_without_mutating_mapping(self, tmp_path):
+        """A copied absent profile HOME fails before platform-root fallback."""
+        stale_home = tmp_path / "custom-root" / "profiles" / "parent" / "home"
+        real_home = tmp_path / "real-home"
+        real_home.mkdir()
+        inherited = {
+            "HOME": str(stale_home),
+            "HERMES_REAL_HOME": str(real_home),
+            "PATH": "/usr/bin",
+        }
+        before = dict(inherited)
+
+        with pytest.raises(ValueError, match="not anchored to a Hermes profiles root"):
+            build_profile_launch_env("default", base_env=inherited)
+
+        assert inherited == before
+
+    def test_profile_home_descendant_is_not_classified_as_managed_home(self, tmp_path):
+        """A descendant below ``<profile>/home`` remains an ordinary account-home candidate."""
+        root = tmp_path / "custom-root"
+        root.mkdir()
+        (root / "config.yaml").write_text("{}\n", encoding="utf-8")
+        target = root / "profiles" / "target"
+        target.mkdir(parents=True)
+        near_miss = root / "profiles" / "parent" / "home" / "child"
+        inherited = {
+            "HERMES_HOME": str(root),
+            "HOME": str(near_miss),
+            "PATH": "/usr/bin",
+        }
+
+        child = build_profile_launch_env("target", base_env=inherited)
+
+        assert child["HERMES_REAL_HOME"] == str(near_miss)
+        assert child["HOME"] == str(near_miss)
+
     def test_markerless_custom_root_uses_parent_managed_home_as_anchor(self, tmp_path):
         """An explicit custom profile can anchor a root without root marker files."""
         root = tmp_path / "custom-root"
