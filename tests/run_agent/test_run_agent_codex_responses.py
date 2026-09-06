@@ -2197,7 +2197,9 @@ def test_dump_api_request_debug_redacts_persisted_json_and_stdout(monkeypatch, t
         assert secret not in stdout
     assert payload["request"]["url"].startswith("https://api.example.test/v1")
     assert "limit=20" in persisted
-    assert "Path=/" in persisted
+    assert "Cookie: ***" in persisted
+    assert "Set-Cookie: ***" in persisted
+    assert "Path=/" not in persisted
 
 
 def test_dump_api_request_debug_redacts_structured_headers_in_file_and_stdout(monkeypatch, tmp_path, capsys):
@@ -2237,9 +2239,8 @@ def test_dump_api_request_debug_redacts_structured_headers_in_file_and_stdout(mo
         assert marker not in persisted
         assert marker not in stdout
     assert "public-value" in persisted
-    assert "Path=/" in persisted
-    assert "HttpOnly" in persisted
-    assert "Secure" in persisted
+    for cookie_detail in ("Path=/", "HttpOnly", "Secure", "SameSite=Lax"):
+        assert cookie_detail not in persisted
     assert len(persisted) <= 8192
 
 
@@ -2281,6 +2282,26 @@ def test_dump_api_request_debug_fails_closed_for_malformed_nested_headers(
     assert json.loads(persisted)
     assert len(persisted.encode("utf-8")) <= 8192
     assert redact_persisted_diagnostic(persisted, limit=None) == persisted
+
+
+def test_dump_api_request_debug_preserves_safe_sibling_for_bare_scalar_header(
+    monkeypatch, tmp_path, capsys,
+):
+    agent = _build_agent(monkeypatch)
+    agent.base_url = "https://api.example.test/v1"
+    agent.logs_dir = tmp_path
+    request = _codex_request_kwargs()
+    request["headers"] = {"X-Api-Key": True, "safe": "public"}
+    monkeypatch.setenv("HERMES_DUMP_REQUEST_STDOUT", "1")
+
+    dump_file = agent._dump_api_request_debug(request, reason="bare-scalar-preflight")
+
+    persisted = dump_file.read_text(encoding="utf-8")
+    stdout = capsys.readouterr().out
+    payload = json.loads(persisted)
+    assert payload["request"]["body"]["headers"] == {"X-Api-Key": "***", "safe": "public"}
+    assert stdout[stdout.find("{"):] == persisted
+    assert len(persisted.encode("utf-8")) <= 8192
 
 
 def test_dump_api_request_debug_redacts_non_ascii_prefixed_nested_fields_in_file_and_stdout(
