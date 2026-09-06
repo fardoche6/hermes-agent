@@ -316,8 +316,41 @@ def test_summary_fails_closed_for_malformed_outer_cookie_with_nested_credentials
     }
 
     summary = AIAgent._summarize_api_error(error)
+    warnings = []
+    agent = object.__new__(AIAgent)
+    agent._emit_warning = warnings.append
+    AIAgent._emit_auxiliary_failure(agent, "summary", error)
+
     assert all(marker not in summary for marker in markers)
     assert summary == "[redaction-unavailable]"
+    assert warnings == ["⚠ Auxiliary summary failed: [redaction-unavailable]"]
+    assert all(marker not in warnings[0] for marker in markers)
+
+
+def test_summary_and_auxiliary_warning_mask_complete_set_cookie_value():
+    marker = "SYN_R5_SUMMARY_SET_COOKIE"
+    error = Exception("synthetic provider failure")
+    error.status_code = 502
+    error.body = {
+        "error": {
+            "message": (
+                "provider detail Set-Cookie: sid=" + marker
+                + "; SameSite=bogus; Max-Age=opaque; Path=/"
+            ),
+        },
+    }
+
+    summary = AIAgent._summarize_api_error(error)
+    warnings = []
+    agent = object.__new__(AIAgent)
+    agent._emit_warning = warnings.append
+    AIAgent._emit_auxiliary_failure(agent, "summary", error)
+
+    assert marker not in summary
+    assert "Set-Cookie: ***" in summary
+    assert all(detail not in summary for detail in ("SameSite=bogus", "Max-Age=opaque", "Path=/"))
+    assert warnings and marker not in warnings[0]
+    assert "Set-Cookie: ***" in warnings[0]
 
 
 def test_entitlement_hint_is_complete_after_detail_redaction_and_second_pass():

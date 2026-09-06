@@ -393,6 +393,29 @@ class TestRedactingFormatter:
         assert "SYN_FORMAT_QUERY" not in result
         assert "https://api.example.test/x?token=***&view=public" in result
 
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            (
+                "Set-Cookie: sid=SYN_FORMAT_COOKIE; SameSite=bogus; Path=/",
+                "Set-Cookie: ***",
+            ),
+            (
+                '{"Authorization": "Bearer SYN_FORMAT_AUTH" suffix SYN_FORMAT_TAIL}',
+                "[redaction-unavailable]",
+            ),
+            (
+                '{"X-Api-Key": true, "safe": "public"}',
+                '{"X-Api-Key": "***", "safe": "public"}',
+            ),
+        ],
+    )
+    def test_formats_r5_persisted_boundaries(self, text, expected):
+        formatter = RedactingFormatter("%(message)s")
+        record = logging.makeLogRecord({"msg": text})
+
+        assert formatter.format(record) == expected
+
 
 class TestPrintenvSimulation:
     """Simulate what happens when the agent runs `env` or `printenv`."""
@@ -631,12 +654,12 @@ class TestPersistedDiagnosticRedaction:
             (
                 "Cookie: session=SYN_COOKIE_SESSION; csrf=SYN_COOKIE_CSRF",
                 ("SYN_COOKIE_SESSION", "SYN_COOKIE_CSRF"),
-                "Cookie: session=***; csrf=***",
+                "Cookie: ***",
             ),
             (
                 "Set-Cookie: sid=SYN_SET_COOKIE; Path=/; HttpOnly; Secure; SameSite=Lax",
                 ("SYN_SET_COOKIE",),
-                "Set-Cookie: sid=***; Path=/; HttpOnly; Secure; SameSite=Lax",
+                "Set-Cookie: ***",
             ),
         ],
     )
@@ -1382,11 +1405,6 @@ class TestPersistedHttpCredentialCorrection:
             "SYN_SET_ARRAY", "SYN_COOKIE_ESCAPED", "SYN_CSRF_ESCAPED",
         ):
             assert marker not in result
-        for safe in ("Path=/", "Domain=example.test", "Expires=Wed, 21 Oct 2015 07:28:00 GMT",
-                     "Max-Age=3600", "SameSite=Lax", "Secure", "HttpOnly"):
-            if safe in text:
-                assert safe in result
-
     def test_strict_userinfo_masks_through_last_authority_at(self):
         text = "https://user:SYN_USERINFO_LEFT@SYN_USERINFO_RIGHT@api.example.test/path?view=public"
         result = redact_sensitive_text(text, force=True, redact_url_credentials=True)
@@ -1424,7 +1442,7 @@ class TestPersistedHttpCredentialCorrection:
             assert marker not in result
             assert marker not in formatted
         assert '"safe": "public"' in result
-        assert '"Set-Cookie": "sid=***; Path=/; Secure; HttpOnly"' in result
+        assert '"Set-Cookie": "***"' in result
 
     @pytest.mark.parametrize(
         ("text", "expected"),
@@ -1451,16 +1469,6 @@ class TestPersistedHttpCredentialCorrection:
         result = redact_persisted_diagnostic(text, limit=None)
         assert marker not in result
         assert "***" in result
-
-    def test_set_cookie_first_pair_and_valued_flags_are_not_allowlisted(self):
-        text = (
-            "Set-Cookie: Path=SYN_COOKIE_NAME; Secure=SYN_SECURE_VALUE; "
-            "HttpOnly=SYN_HTTPONLY_VALUE; SameSite=Lax; Secure; HttpOnly"
-        )
-
-        result = redact_persisted_diagnostic(text, limit=None)
-
-        assert result == "Set-Cookie: Path=***; Secure=***; HttpOnly=***; SameSite=Lax; Secure; HttpOnly"
 
     def test_uncertain_structured_boundaries_fail_closed_for_the_whole_diagnostic(self):
         text = '{"Authorization": ["Bearer SYN_MALFORMED_AUTH", "tail": "SYN_MALFORMED_TAIL"}'
@@ -1556,26 +1564,51 @@ class TestPersistedHttpCredentialCorrection:
             assert result == "[redaction-unavailable]"
 
     @pytest.mark.parametrize(
-        ("text", "markers"),
+        "text",
         [
-            (
-                "Cookie: sid=SYN_R4_COOKIE; extension=SYN_R4_EXTENSION; SYN_R4_TRAILER",
-                ("SYN_R4_COOKIE", "SYN_R4_EXTENSION", "SYN_R4_TRAILER"),
-            ),
-            (
-                "Set-Cookie: sid=SYN_R4_SET; UnknownFlag; Priority=SYN_R4_PRIORITY; Path=/",
-                ("SYN_R4_SET", "UnknownFlag", "SYN_R4_PRIORITY"),
-            ),
-            (
-                "Set-Cookie: sid=SYN_R4_SAFE; Path=/SYN_R4_PATH=token=SYN_R4_NESTED; Secure",
-                ("SYN_R4_SAFE", "SYN_R4_PATH", "SYN_R4_NESTED"),
-            ),
+            "Set-Cookie: sid=SYN_R5_COOKIE; SameSite=not-a-mode; Max-Age=not-a-number; Path=/",
+            "Set-Cookie: sid=SYN_R5_OUTER; Path=/\\\"Authorization\\\":\\\"Bearer SYN_R5_NESTED\\\"; Secure",
         ],
     )
-    def test_cookie_parser_consumes_unknown_and_nested_syntax(self, text, markers):
+    def test_cookie_values_are_atomic_even_when_attributes_look_structured(self, text):
         result = redact_persisted_diagnostic(text, limit=None)
-        assert all(marker not in result for marker in markers)
+        assert result == "Set-Cookie: ***"
         assert redact_persisted_diagnostic(result, limit=None) == result
+
+    def test_quoted_plain_cookie_value_masks_the_complete_header_line(self):
+        text = 'Cookie: "sid=SYN_R5_QUOTED_COOKIE"; Path=/; HttpOnly'
+        assert redact_persisted_diagnostic(text, limit=None) == "Cookie: ***"
+
+    def test_quoted_plain_auth_value_with_suffix_fails_closed(self):
+        text = 'Authorization: "Bearer SYN_R5_QUOTED_AUTH" suffix SYN_R5_TAIL'
+        assert redact_persisted_diagnostic(text, limit=None) == "[redaction-unavailable]"
+
+    @pytest.mark.parametrize("token", ["8462057319", "true", "false", "null"])
+    def test_bare_json_scalars_are_masked_as_valid_strings_with_safe_sibling(self, token):
+        result = redact_persisted_diagnostic(
+            '{"X-Api-Key": ' + token + ', "safe": "public"}', limit=None
+        )
+        assert json.loads(result) == {"X-Api-Key": "***", "safe": "public"}
+        assert token not in result
+
+    def test_invalid_bare_json_scalar_fails_closed(self):
+        result = redact_persisted_diagnostic(
+            '{"X-Api-Key": opaque-token, "safe": "public"}', limit=None
+        )
+        assert result == "[redaction-unavailable]"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '{"Authorization": "Bearer SYN_R5_INCOMPLETE}',
+            '{"Authorization": \\"Bearer SYN_R5_MISMATCH\\"suffix SYN_R5_TAIL}',
+            '{\\\\"Authorization\\\\": \\\\"Bearer SYN_R5_UNSUPPORTED\\\\"}',
+        ],
+    )
+    def test_ambiguous_quoted_depth_fails_closed_for_the_diagnostic(self, text):
+        result = redact_persisted_diagnostic(text, limit=None)
+        assert result == "[redaction-unavailable]"
+        assert all(marker not in result for marker in ("SYN_R5_INCOMPLETE", "SYN_R5_MISMATCH", "SYN_R5_TAIL", "SYN_R5_UNSUPPORTED"))
 
     def test_backslash_run_work_is_linear_under_a_deterministic_budget(self, monkeypatch):
         import agent.redact as redact_module
