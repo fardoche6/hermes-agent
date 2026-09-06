@@ -79,6 +79,47 @@ def _patch(
         set_approval_callback(None)
 
 
+def _v4a(
+    path: Path | str,
+    old: str,
+    new: str,
+    calls: list,
+    answer: str = "once",
+    callback=None,
+    task_id: str = "protected-public",
+):
+    _approve(calls, answer=answer, callback=callback)
+    patch = (
+        "*** Begin Patch\n"
+        f"*** Update File: {path}\n"
+        "@@\n"
+        f"-{old}\n"
+        f"+{new}\n"
+        "*** End Patch"
+    )
+    try:
+        return json.loads(patch_tool(mode="patch", patch=patch, task_id=task_id))
+    finally:
+        set_approval_callback(None)
+
+
+def _run_operation(
+    operation: str,
+    path: Path | str,
+    old: str,
+    new: str,
+    calls: list,
+    *,
+    callback=None,
+    task_id: str = "protected-public",
+):
+    if operation == "write":
+        return _write(path, new, calls, callback=callback, task_id=task_id)
+    if operation == "replace":
+        return _patch(path, old, new, calls, callback=callback, task_id=task_id)
+    return _v4a(path, old, new, calls, callback=callback, task_id=task_id)
+
+
 def _tree(tmp_path: Path):
     target = tmp_path / "external.txt"
     destination = tmp_path / "workspace" / "AGENTS.md"
@@ -165,9 +206,11 @@ def test_approval_exception_is_zero_change(tmp_path):
     ("initial_kind", "operation"),
     [
         ("regular", "write"),
-        ("regular", "patch"),
+        ("regular", "replace"),
+        ("regular", "v4a"),
         ("absent", "write"),
-        ("absent", "patch"),
+        ("absent", "replace"),
+        ("absent", "v4a"),
     ],
 )
 def test_regular_or_absent_leaf_race_after_approval_fails_closed(
@@ -187,10 +230,14 @@ def test_regular_or_absent_leaf_race_after_approval_fails_closed(
             destination.unlink()
         destination.symlink_to(external)
 
-    if operation == "write":
-        result = _write(destination, "after\n", calls, callback=swap_final)
-    else:
-        result = _patch(destination, "before", "after", calls, callback=swap_final)
+    result = _run_operation(
+        operation,
+        destination,
+        "before",
+        "after\n",
+        calls,
+        callback=swap_final,
+    )
 
     assert result.get("error"), result
     assert len(calls) == 1
@@ -202,67 +249,208 @@ def test_regular_or_absent_leaf_race_after_approval_fails_closed(
     assert result.get("success") is not True
 
 
-@pytest.mark.parametrize("operation", ["write", "patch"])
-def test_regular_leaf_approval_drift_rollback_preserves_newer_bytes(
+@pytest.mark.parametrize("operation", ["write", "replace", "v4a"])
+def test_rename_committed_then_raised_reports_committed_path(
     tmp_path, monkeypatch, operation,
 ):
-    import stat
-
     import tools.protected_lexical_write as primitive
 
+    target, destination = _tree(tmp_path)
+    original_rename = primitive.os.rename
+    rename_called = False
+
+    def rename_then_raise(*args, **kwargs):
+        nonlocal rename_called
+        original_rename(*args, **kwargs)
+        rename_called = True
+        raise OSError("injected after-rename failure")
+
+    monkeypatch.setattr(primitive.os, "rename", rename_then_raise)
+    monkeypatch.setattr(
+        primitive.os,
+        "supports_dir_fd",
+        set(primitive.os.supports_dir_fd) | {rename_then_raise},
+    )
+    calls: list = []
+
+    result = _run_operation(operation, destination, "before", "after", calls)
+
+    assert rename_called is True
+    assert result.get("error"), result
+    assert "COMMITTED" in result["error"]
+    assert "possibly modified" in result["error"]
+    assert "rollback" not in result["error"].lower()
+    assert result.get("outcome") == "committed"
+    assert result.get("files_modified") == [str(destination)]
+    assert result.get("verified") is False
+    assert result.get("success") is not True
+    assert destination.read_bytes() == (b"after" if operation == "write" else b"after\n")
+    assert target.read_bytes() == b"before\n"
+
+
+@pytest.mark.parametrize("operation", ["write", "replace", "v4a"])
+def test_rename_rejected_before_install_reports_not_committed(
+    tmp_path, monkeypatch, operation,
+):
+    import tools.protected_lexical_write as primitive
+
+    target, destination = _tree(tmp_path)
+
+    def reject_rename(*args, **kwargs):
+        raise OSError("injected before-rename failure")
+
+    monkeypatch.setattr(primitive, "_rename", reject_rename)
+    calls: list = []
+
+    result = _run_operation(operation, destination, "before", "after", calls)
+
+    assert result.get("error"), result
+    assert "NOT COMMITTED" in result["error"]
+    assert "rollback" not in result["error"].lower()
+    assert result.get("outcome") == "not_committed"
+    assert result.get("files_modified") == []
+    assert result.get("verified") is False
+    assert result.get("success") is not True
+    assert destination.is_symlink()
+    assert target.read_bytes() == b"before\n"
+    assert list(destination.parent.glob(".hermes-protected-*.tmp")) == []
+
+
+@pytest.mark.parametrize("fault", ["mutation", "observation"])
+@pytest.mark.parametrize("operation", ["write", "replace", "v4a"])
+def test_post_rename_mutation_or_observation_is_uncertain(
+    tmp_path, monkeypatch, operation, fault,
+):
+    import tools.protected_lexical_write as primitive
+
+    target, destination = _tree(tmp_path)
+    original_rename = primitive.os.rename
+    original_stat = primitive.os.stat
+    rename_done = False
+    fault_fired = False
+
+    def record_rename(*args, **kwargs):
+        nonlocal rename_done
+        result = original_rename(*args, **kwargs)
+        rename_done = True
+        return result
+
+    def fail_or_mutate_after_rename(path, *args, **kwargs):
+        nonlocal fault_fired
+        if (
+            rename_done
+            and not fault_fired
+            and path == "AGENTS.md"
+            and kwargs.get("dir_fd") is not None
+        ):
+            fault_fired = True
+            if fault == "mutation":
+                destination.write_bytes(b"newer after rename\n")
+            else:
+                raise OSError("injected post-rename observation failure")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(primitive.os, "rename", record_rename)
+    monkeypatch.setattr(primitive.os, "stat", fail_or_mutate_after_rename)
+    monkeypatch.setattr(
+        primitive.os,
+        "supports_dir_fd",
+        set(primitive.os.supports_dir_fd) | {record_rename, fail_or_mutate_after_rename},
+    )
+    calls: list = []
+
+    result = _run_operation(operation, destination, "before", "after", calls)
+
+    assert fault_fired is True
+    assert result.get("error"), result
+    assert "UNCERTAIN STATE" in result["error"]
+    assert "possibly modified" in result["error"]
+    assert "rollback" not in result["error"].lower()
+    assert result.get("outcome") == "uncertain"
+    assert result.get("files_modified") == [str(destination)]
+    assert result.get("verified") is False
+    assert result.get("success") is not True
+    assert destination.read_bytes() == (
+        b"newer after rename\n"
+        if fault == "mutation"
+        else (b"after" if operation == "write" else b"after\n")
+    )
+    assert target.read_bytes() == b"before\n"
+
+
+@pytest.mark.parametrize("operation", ["write", "replace", "v4a"])
+def test_in_place_drift_after_approval_fails_closed_before_commit(
+    tmp_path, operation,
+):
     destination = tmp_path / "workspace" / "AGENTS.md"
     destination.parent.mkdir()
     destination.write_bytes(b"before\n")
-    original_inode = destination.stat().st_ino
-    original_mode = stat.S_IMODE(destination.stat().st_mode)
     calls: list = []
-    parent_fsync_failed = False
-    original_fsync = primitive.os.fsync
-
-    def fail_one_parent_fsync(fd):
-        nonlocal parent_fsync_failed
-        if stat.S_ISDIR(os.fstat(fd).st_mode) and not parent_fsync_failed:
-            parent_fsync_failed = True
-            raise OSError("injected post-rename durability failure")
-        return original_fsync(fd)
 
     def change_in_place_during_approval():
         with destination.open("wb") as handle:
             handle.write(
-                b"concurrent\n"
-                if operation == "write"
-                else b"before\nconcurrent\n"
+                b"concurrent\n" if operation == "write" else b"before\nconcurrent\n"
             )
-        assert destination.stat().st_ino == original_inode
 
-    monkeypatch.setattr(primitive.os, "fsync", fail_one_parent_fsync)
-    if operation == "write":
-        result = _write(
-            destination,
-            "candidate\n",
-            calls,
-            callback=change_in_place_during_approval,
-        )
-        expected = b"concurrent\n"
-    else:
-        result = _patch(
-            destination,
-            "before",
-            "candidate",
-            calls,
-            callback=change_in_place_during_approval,
-        )
-        expected = b"before\nconcurrent\n"
+    result = _run_operation(
+        operation,
+        destination,
+        "before",
+        "candidate",
+        calls,
+        callback=change_in_place_during_approval,
+    )
 
-    assert parent_fsync_failed is True
     assert len(calls) == 1
     assert result.get("error"), result
-    assert "rollback verified" in result["error"]
+    assert "rollback" not in result["error"].lower()
     assert result.get("files_modified", []) == []
-    assert result.get("verified") is not True
+    assert result.get("verified") is False
     assert result.get("success") is not True
-    assert destination.read_bytes() == expected
-    assert stat.S_IMODE(destination.stat().st_mode) == original_mode
+    assert result.get("outcome") == "not_committed"
+    assert destination.read_bytes() == (
+        b"concurrent\n" if operation == "write" else b"before\nconcurrent\n"
+    )
+
+
+@pytest.mark.parametrize("operation", ["write", "replace", "v4a"])
+def test_late_in_place_drift_is_not_accepted_as_a_new_preimage(
+    tmp_path, monkeypatch, operation,
+):
+    import tools.file_operations as file_operations
+
+    destination = tmp_path / "workspace" / "AGENTS.md"
+    destination.parent.mkdir()
+    destination.write_bytes(b"before\n")
+    original_read_candidate = file_operations.read_candidate
+    first_read = True
+    calls: list = []
+
+    def read_then_drift(candidate):
+        nonlocal first_read
+        content = original_read_candidate(candidate)
+        if first_read:
+            first_read = False
+            with destination.open("wb") as handle:
+                handle.write(
+                    b"concurrent\n" if operation == "write" else b"before\nconcurrent\n"
+                )
+        return content
+
+    monkeypatch.setattr(file_operations, "read_candidate", read_then_drift)
+    result = _run_operation(operation, destination, "before", "candidate", calls)
+
+    assert first_read is False
+    assert result.get("error"), result
+    assert result.get("files_modified", []) == []
+    assert result.get("verified") is False
+    assert result.get("outcome") == "not_committed"
+    assert result.get("success") is not True
+    assert "rollback" not in result["error"].lower()
+    assert destination.read_bytes() == (
+        b"concurrent\n" if operation == "write" else b"before\nconcurrent\n"
+    )
 
 
 @pytest.mark.parametrize("target_kind", ["directory", "broken"])
@@ -409,6 +597,32 @@ def test_ordinary_symlink_patch_still_updates_physical_target(tmp_path):
     assert calls == []
     assert destination.is_symlink()
     assert target.read_text(encoding="utf-8") == "after\n"
+
+
+@pytest.mark.parametrize("initial_kind", ["regular", "symlink"])
+def test_ordinary_v4a_still_updates_physical_target(tmp_path, initial_kind):
+    target = tmp_path / "external.txt"
+    destination = tmp_path / "ordinary.txt"
+    target.write_text("before\n", encoding="utf-8")
+    if initial_kind == "symlink":
+        destination.symlink_to(target)
+    else:
+        destination.write_text("before\n", encoding="utf-8")
+        target = destination
+
+    patch = (
+        "*** Begin Patch\n"
+        f"*** Update File: {destination}\n"
+        "@@\n"
+        "-before\n"
+        "+after\n"
+        "*** End Patch"
+    )
+    result = json.loads(patch_tool(mode="patch", patch=patch, task_id="ordinary-v4a"))
+
+    assert result.get("success") is True, result
+    assert target.read_text(encoding="utf-8") == "after\n"
+    assert destination.is_symlink() is (initial_kind == "symlink")
 
 
 class _RemoteEnvironment:
@@ -673,7 +887,7 @@ def test_post_commit_verification_uses_retained_parent_and_no_follow_final_leaf(
     assert len(set(final_stat_dir_fds)) == 1
     assert final_open_flags
     assert all(flags & os.O_NOFOLLOW for flags in final_open_flags)
-    assert final_open_dir_fds == [final_stat_dir_fds[0]]
+    assert all(fd == final_stat_dir_fds[0] for fd in final_open_dir_fds)
     assert destination.read_bytes() == b"candidate\n"
     assert target.read_bytes() == b"before\n"
 
