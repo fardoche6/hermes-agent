@@ -245,14 +245,45 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
     return timed_out if timed else denied
 
 
-def _check_protected_instruction_write(paths: list[str], task_id: str = "default") -> str | None:
-    """Gate a write/patch touching protected instruction files. ONE protected file gates
-    the ENTIRE multi-file patch (one prompt, all-or-nothing)."""
-    enabled, extra = _protected_instruction_config()
-    if not enabled:
-        return None
-    reasons = [r for r in (_protected_instruction_reason(p, task_id, enabled=enabled, extra_patterns=extra)
-                           for p in paths) if r]
+def _check_protected_instruction_write(
+    paths: list[str], task_id: str = "default", *, protection_tokens: dict | None = None,
+) -> str | None:
+    """Gate a write/patch touching protected instruction files.
+
+    Public file operations pass the immutable preflight snapshot in
+    ``protection_tokens``.  That path deliberately does not reread config or
+    resolve a mutable destination.  ``None`` retains the legacy direct-call
+    behavior for callers that have not performed public preflight.
+    """
+    if protection_tokens is not None:
+        reasons = []
+        for path in paths:
+            token = protection_tokens.get(path)
+            try:
+                valid = (
+                    token is not None
+                    and token.requested_path == path
+                    and token.protected == bool(token.reason)
+                )
+                protected = bool(token.protected) if token is not None else False
+                reason = token.reason if token is not None else None
+            except (AttributeError, TypeError):
+                valid = False
+                protected = False
+                reason = None
+            if not valid:
+                return (
+                    "protected instruction authorization classification is missing "
+                    "or inconsistent; the operation was not approved"
+                )
+            if protected:
+                reasons.append(reason)
+    else:
+        enabled, extra = _protected_instruction_config()
+        if not enabled:
+            return None
+        reasons = [r for r in (_protected_instruction_reason(p, task_id, enabled=enabled, extra_patterns=extra)
+                               for p in paths) if r]
     if not reasons:
         return None
     return _request_protected_instruction_approval(reasons, task_id)

@@ -18,6 +18,8 @@ import time
 from contextlib import ExitStack
 from pathlib import Path
 
+import tools.file_tools_write_guards as _file_tools_write_guards
+
 from agent.file_safety import get_read_block_error
 from tools.binary_extensions import has_binary_extension
 from tools.file_operations import (
@@ -28,11 +30,12 @@ from agent.redact import redact_sensitive_text
 from tools.file_tools_paths import (
     _expand_tilde, _path_resolution_warning, _resolve_base_dir, _resolve_path_for_task)
 from tools.protected_lexical_write import (
-    BackendAdmission, ProtectedLexicalCandidate, ProtectedLexicalError, lexical_path)
+    BackendAdmission, ProtectedInstructionToken, ProtectedLexicalCandidate,
+    ProtectedLexicalError, lexical_path)
 from tools.file_tools_write_guards import (
     _READ_DEDUP_STATUS_MESSAGE, _check_approval_required_write, _check_binary_document_write,
     _check_cross_profile_path, _check_protected_instruction_write, _check_sensitive_path,
-    _is_internal_file_tool_content, _protected_instruction_config, _protected_instruction_reason)
+    _is_internal_file_tool_content)
 from tools.file_tools_read_tracking import (
     _bump_consecutive, _cap_read_tracker_data, _check_file_staleness, _check_not_found_cache,
     _mark_verification_stale, _patch_failure_lock, _patch_failure_tracker, _read_tracker,
@@ -40,6 +43,16 @@ from tools.file_tools_read_tracking import (
     _task_data, _update_read_timestamp)
 
 logger = logging.getLogger(__name__)
+
+
+def _protected_instruction_config() -> tuple[bool, list[str]]:
+    """Read protection configuration once through the live guard module."""
+    return _file_tools_write_guards._protected_instruction_config()
+
+
+def _protected_instruction_reason(path: str, task_id: str = "default", **kwargs) -> str | None:
+    """Classify a path during preflight; approval never calls this adapter."""
+    return _file_tools_write_guards._protected_instruction_reason(path, task_id, **kwargs)
 
 
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
@@ -702,20 +715,44 @@ def _lexical_path_is_ambiguous(filepath: str) -> bool:
 
 def _protected_candidates_for_paths(
     paths: list[str], task_id: str, file_ops, admission: BackendAdmission,
-) -> tuple[dict[str, ProtectedLexicalCandidate], str | None, list[str]]:
-    """Preflight protected symlinks after backend admission and before approval."""
+) -> tuple[
+    dict[str, ProtectedLexicalCandidate],
+    dict[str, ProtectedInstructionToken],
+    str | None,
+    list[str],
+]:
+    """Preflight protection and protected lexical candidates before approval.
+
+    The returned token map is the complete classification snapshot for this
+    operation, including ordinary paths. Approval must consume this snapshot;
+    it must not classify the mutable path or configuration a second time.
+    """
+    unique_paths = list(dict.fromkeys(paths))
     enabled, extra = _protected_instruction_config()
+    reasons = {
+        path: (
+            _protected_instruction_reason(
+                path, task_id, enabled=enabled, extra_patterns=extra)
+            if enabled else None
+        )
+        for path in unique_paths
+    }
+    tokens = {
+        path: ProtectedInstructionToken(
+            requested_path=path,
+            candidate_path=None,
+            protected=bool(reason),
+            reason=reason,
+        )
+        for path, reason in reasons.items()
+    }
     if not enabled:
-        return {}, None, []
-    protected_paths = [
-        path for path in paths
-        if _protected_instruction_reason(
-            path, task_id, enabled=enabled, extra_patterns=extra)
-    ]
+        return {}, tokens, None, []
+    protected_paths = [path for path in unique_paths if reasons[path]]
     if not protected_paths:
-        return {}, None, []
+        return {}, tokens, None, []
     if not admission.supported:
-        return {}, admission.error or "protected lexical replacement capability unavailable", []
+        return {}, tokens, admission.error or "protected lexical replacement capability unavailable", []
 
     deferred = [path for path in dict.fromkeys(protected_paths) if _lexical_path_is_ambiguous(path)]
     candidates: dict[str, ProtectedLexicalCandidate] = {}
@@ -728,12 +765,51 @@ def _protected_candidates_for_paths(
                 admission,
                 cwd=_lexical_cwd(task_id, file_ops),
             )
-            if candidate is not None:
-                candidates[path] = candidate
+            if candidate is None:
+                raise ProtectedLexicalError("protected lexical candidate was not bound")
+            token = tokens[path].bind(candidate.path)
+            candidate.protection_token = token
+            tokens[path] = token
+            candidates[path] = candidate
     except Exception as exc:
         _close_protected_candidates(candidates)
-        return {}, str(exc), deferred
-    return candidates, None, deferred
+        return {}, tokens, str(exc), deferred
+    return candidates, tokens, None, deferred
+
+
+def _protected_candidate_binding_error(
+    candidates: dict[str, ProtectedLexicalCandidate],
+    protection_tokens: dict[str, ProtectedInstructionToken],
+    deferred_paths: list[str] | None = None,
+) -> str | None:
+    """Fail closed unless the snapshot and every protected candidate are paired."""
+    deferred = set(deferred_paths or [])
+    for requested_path, candidate in candidates.items():
+        token = protection_tokens.get(requested_path)
+        if (
+            token is None
+            or not token.protected
+            or token.requested_path != requested_path
+            or token.candidate_path != candidate.path
+            or candidate.protection_token != token
+        ):
+            return (
+                "protected lexical authorization binding is inconsistent; "
+                "the operation was not approved or executed"
+            )
+    for requested_path, token in protection_tokens.items():
+        try:
+            missing_candidate = token.protected and requested_path not in deferred and (
+                requested_path not in candidates or token.candidate_path is None
+            )
+        except (AttributeError, TypeError):
+            missing_candidate = True
+        if missing_candidate:
+            return (
+                "protected lexical authorization binding is incomplete; "
+                "the operation was not approved or executed"
+            )
+    return None
 
 
 def _backend_path(path: str, path_to_resolved: dict, candidates: dict) -> str:
@@ -844,12 +920,18 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             logger.error("write_file error: %s: %s", type(exc).__name__, exc, exc_info=True)
         return tool_error(str(exc))
 
-    candidates, preflight_error, deferred_paths = _protected_candidates_for_paths(
+    candidates, protection_tokens, preflight_error, deferred_paths = _protected_candidates_for_paths(
         [path], task_id, file_ops, admission)
     if preflight_error:
         return tool_error(preflight_error)
+    binding_error = _protected_candidate_binding_error(
+        candidates, protection_tokens, deferred_paths)
+    if binding_error:
+        _close_protected_candidates(candidates)
+        return tool_error(binding_error)
     try:
-        approval_error = (_check_protected_instruction_write([path], task_id)
+        approval_error = (_check_protected_instruction_write(
+                              [path], task_id, protection_tokens=protection_tokens)
                           or _check_approval_required_write([path], task_id))
     except Exception as exc:
         _close_protected_candidates(candidates)
@@ -899,8 +981,15 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                 # wrong-cwd mismatch is visible instead of silently landing elsewhere.
                 result_dict["resolved_path"] = backend_path
             if result_dict.get("error"):
-                _update_read_timestamp(
-                    path, task_id, identity_path=tracking.get(path))
+                outcome = result_dict.get("outcome")
+                modified = result_dict.get("files_modified") or []
+                if outcome in {"committed", "uncertain"} and modified:
+                    _note_edited(
+                        task_id, [path], path_to_resolved, session_id,
+                        path_to_identity=tracking)
+                elif outcome != "not_committed" or not candidate:
+                    _update_read_timestamp(
+                        path, task_id, identity_path=tracking.get(path))
             else:
                 if backend_path:
                     result_dict["files_modified"] = [backend_path]
@@ -997,10 +1086,15 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             logger.error("patch error: %s: %s", type(exc).__name__, exc, exc_info=True)
         return tool_error(str(exc))
 
-    candidates, preflight_error, deferred_paths = _protected_candidates_for_paths(
+    candidates, protection_tokens, preflight_error, deferred_paths = _protected_candidates_for_paths(
         _paths_to_check, task_id, file_ops, admission)
     if preflight_error:
         return tool_error(preflight_error)
+    binding_error = _protected_candidate_binding_error(
+        candidates, protection_tokens, deferred_paths)
+    if binding_error:
+        _close_protected_candidates(candidates)
+        return tool_error(binding_error)
     if candidates and (
         mode != "replace"
         and (len(set(_paths_to_check)) != 1 or len(candidates) != 1)
@@ -1012,7 +1106,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             "V4A patch; no files were modified."
         )
     try:
-        approval_error = (_check_protected_instruction_write(_paths_to_check, task_id)
+        approval_error = (_check_protected_instruction_write(
+                              _paths_to_check, task_id, protection_tokens=protection_tokens)
                           or _check_approval_required_write(_paths_to_check, task_id))
     except Exception as exc:
         _close_protected_candidates(candidates)
@@ -1086,6 +1181,35 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             result_dict = result.to_dict()
             if stale_warnings:
                 result_dict["_warning"] = " | ".join(stale_warnings)
+            if result_dict.get("error"):
+                outcome = result_dict.get("outcome")
+                modified = set(result_dict.get("files_modified") or [])
+                if outcome in {"committed", "uncertain"} and modified:
+                    edited_paths = [
+                        edited_path for edited_path in _paths_to_check
+                        if edited_path in candidates
+                        and (
+                            path_to_backend.get(edited_path) in modified
+                            or candidates[edited_path].path in modified
+                        )
+                    ]
+                    if edited_paths:
+                        _note_edited(
+                            task_id,
+                            edited_paths,
+                            _path_to_resolved,
+                            session_id,
+                            path_to_identity=tracking,
+                        )
+                        _reset_patch_failures(
+                            task_id,
+                            [
+                                _path_to_identity.get(edited_path)
+                                or _path_to_resolved.get(edited_path)
+                                or edited_path
+                                for edited_path in edited_paths
+                            ],
+                        )
             if not result_dict.get("error"):
                 modified = [
                     path_to_backend.get(_p) or _p for _p in _paths_to_check
