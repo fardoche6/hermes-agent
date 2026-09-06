@@ -217,8 +217,10 @@ def record_read(task_id: str, resolved_or_path: str | Path, *, partial: bool = F
     _registry.record_read(task_id, str(resolved_or_path), partial=partial)
 
 
-def note_write(task_id: str, resolved_or_path: str | Path) -> None:
-    _registry.note_write(task_id, str(resolved_or_path))
+def note_write(
+    task_id: str, resolved_or_path: str | Path, *, mtime: Optional[float] = None,
+) -> None:
+    _registry.note_write(task_id, str(resolved_or_path), mtime=mtime)
 
 
 def check_stale(task_id: str, resolved_or_path: str | Path) -> Optional[str]:

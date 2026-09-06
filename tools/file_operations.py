@@ -25,13 +25,14 @@ from pathlib import Path
 from tools.binary_extensions import BINARY_EXTENSIONS
 from agent.file_safety import get_write_denied_error
 from tools.file_operations_common import (
-    ExecuteResult, PatchResult, ReadResult, SearchResult, WriteResult,
+    ExecuteResult, LintResult, PatchResult, ReadResult, SearchResult, WriteResult,
     _UTF8_BOM, _detect_line_ending, _has_bom, _normalize_line_endings, _strip_bom,
     _strip_terminal_fence_leaks, normalize_read_pagination, normalize_search_pagination)
-from tools.file_operations_lint import LINTERS_INPROC, LintMixin, _FAIL_CLOSED_INPROC_EXTS
+from tools.file_operations_lint import LINTERS, LINTERS_INPROC, LintMixin, _FAIL_CLOSED_INPROC_EXTS
 from tools.file_operations_search import SearchMixin
 from tools.protected_lexical_write import (
-    BackendAdmission, ProtectedLexicalCandidate, commit_candidate, prepare_candidate)
+    BackendAdmission, ProtectedLexicalCandidate, ProtectedLexicalError, commit_candidate,
+    prepare_candidate, read_candidate)
 
 logger = logging.getLogger(__name__)
 
@@ -1215,6 +1216,40 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             ending = _detect_line_ending(head.stdout) if head.exit_code == 0 and head.stdout else None
         return self._file_has_bom(path, pre_content), pre_content, ending
 
+    @staticmethod
+    def _probe_protected_write_target(
+        candidate: ProtectedLexicalCandidate,
+        pre_content: Optional[str],
+        want_pre: bool,
+    ) -> tuple[bool, Optional[str], Optional[str]]:
+        """Probe a protected final entry without following its lexical leaf."""
+        try:
+            raw_bytes = read_candidate(candidate)
+        except FileNotFoundError:
+            ending = _detect_line_ending(pre_content) if pre_content else None
+            return False, pre_content, ending
+        raw_content = raw_bytes.decode("utf-8", "surrogateescape")
+        has_bom = raw_bytes.startswith(_UTF8_BOM.encode("utf-8"))
+        if want_pre and pre_content is None:
+            pre_content = raw_content
+        if pre_content:
+            ending = _detect_line_ending(pre_content)
+        else:
+            ending = _detect_line_ending(raw_content[:4096])
+        return has_bom, pre_content, ending
+
+    def _protected_lint_delta(
+        self, path: str, pre_content: Optional[str], post_content: Optional[str],
+    ) -> LintResult:
+        """Lint protected content in memory; never give a shell linter a raced leaf."""
+        ext = os.path.splitext(path)[1].lower()
+        if ext in LINTERS and ext not in LINTERS_INPROC:
+            return LintResult(
+                skipped=True,
+                message=f"Path-based linter skipped for protected lexical {ext} entry",
+            )
+        return self._check_lint_delta(path, pre_content=pre_content, post_content=post_content)
+
     def _verify_written_hash(self, path: str, content_bytes: bytes) -> tuple[Optional[bool], Optional[WriteResult]]:
         """Compare the on-disk sha256 to the intended bytes: ``(verified, error)``.
         The explicit flag saves the model a confirming re-read; a mismatch is a hard
@@ -1266,8 +1301,20 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
 
         # Pre-content is read only for extensions in the UNION of in-process lint and
         # LSP coverage (keeps the hot path fast for binaries).
-        want_pre = ext in LINTERS_INPROC or self._lsp_handles_extension(ext)
-        has_bom, pre_content, original_ending = self._probe_write_target(path, pre_content, want_pre)
+        protected = protected_lexical_candidate is not None
+        want_pre = ext in LINTERS_INPROC or (not protected and self._lsp_handles_extension(ext))
+        try:
+            if protected:
+                has_bom, pre_content, original_ending = self._probe_protected_write_target(
+                    protected_lexical_candidate,
+                    pre_content,
+                    want_pre,
+                )
+            else:
+                has_bom, pre_content, original_ending = self._probe_write_target(
+                    path, pre_content, want_pre)
+        except ProtectedLexicalError as exc:
+            return WriteResult(error=f"protected lexical read failed: {exc}")
         # read_file strips the BOM and models send bare-LF text, so a round-trip would
         # otherwise normalize CRLF files and drop the BOM (prepend only when absent).
         if original_ending == "\r\n":
@@ -1275,7 +1322,8 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         if has_bom and not _has_bom(content):
             content = _UTF8_BOM + content
         # Best-effort snapshot so the LSP tier reports only this edit's diagnostics.
-        self._snapshot_lsp_baseline(path)
+        if not protected:
+            self._snapshot_lsp_baseline(path)
         # ``dirs_created`` means "parent dirs ensured" (mkdir -p is folded into
         # _atomic_write; its failure surfaces as the atomic-write error below).
         dirs_created = bool(os.path.dirname(path))
@@ -1297,11 +1345,15 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             if verify_error is not None:
                 return verify_error
 
-        lint_result = self._check_lint_delta(path, pre_content=pre_content, post_content=content)
+        lint_result = (
+            self._protected_lint_delta(path, pre_content, content)
+            if protected
+            else self._check_lint_delta(path, pre_content=pre_content, post_content=content)
+        )
         # LSP diagnostics are a separate channel, fired only when the syntax tier is
         # clean (no point asking an LSP about a file that won't parse).
         lsp_diagnostics: Optional[str] = None
-        if lint_result.success or lint_result.skipped:
+        if (lint_result.success or lint_result.skipped) and not protected:
             lsp_diagnostics = self._maybe_lsp_diagnostics(path, pre_content=pre_content, post_content=content) or None
         return WriteResult(
             bytes_written=len(content_bytes), dirs_created=dirs_created, verified=content_verified,
@@ -1366,12 +1418,21 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         denied = get_write_denied_error(path)
         if denied:
             return PatchResult(error=denied)
-        read_result = self._cat(path)
-        if read_result.exit_code != 0:
-            return PatchResult(error=f"Failed to read file: {path}")
+        if protected_lexical_candidate is not None:
+            try:
+                raw_content = read_candidate(protected_lexical_candidate).decode(
+                    "utf-8", "surrogateescape")
+            except FileNotFoundError:
+                return PatchResult(error=f"Failed to read file: {path}")
+            except ProtectedLexicalError as exc:
+                return PatchResult(error=f"Failed to read protected file: {exc}")
+        else:
+            read_result = self._cat(path)
+            if read_result.exit_code != 0:
+                return PatchResult(error=f"Failed to read file: {path}")
+            raw_content = read_result.stdout
         # Match and diff on BOM-stripped content (a phantom U+FEFF defeats an exact
         # first-line match); the raw read becomes write_file's pre_content.
-        raw_content = read_result.stdout
         content, _ = _strip_bom(raw_content)
 
         from tools.fuzzy_match import fuzzy_find_and_replace
@@ -1399,7 +1460,11 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             verify_error = self._verify_patch_persisted(path, new_content)
             if verify_error is not None:
                 return verify_error
-        lint_result = self._check_lint_delta(path, pre_content=content, post_content=new_content)
+        lint_result = (
+            self._protected_lint_delta(path, content, new_content)
+            if protected_lexical_candidate is not None
+            else self._check_lint_delta(path, pre_content=content, post_content=new_content)
+        )
         return PatchResult(
             success=True, diff=self._unified_diff(content, new_content, path), files_modified=[path],
             lint=lint_result.to_dict() if lint_result else None,
@@ -1431,6 +1496,15 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
                     self._candidates = candidates
 
                 def read_file_raw(self, path):
+                    candidate = self._candidates.get(path)
+                    if candidate is not None:
+                        try:
+                            content = read_candidate(candidate).decode("utf-8", "surrogateescape")
+                        except FileNotFoundError:
+                            return ReadResult(error=f"File not found: {path}")
+                        except ProtectedLexicalError as exc:
+                            return ReadResult(error=f"Failed to read protected file: {exc}")
+                        return ReadResult(content=content, file_size=len(content.encode("utf-8", "surrogateescape")))
                     return self._delegate.read_file_raw(path)
 
                 def write_file(self, path, content, pre_content=None):
