@@ -11,10 +11,15 @@ active_profile (child-process inheritance contract).
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
 import sys
+import textwrap
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 
 def _run_apply_profile_override(
@@ -60,6 +65,177 @@ def _run_apply_profile_override(
     _apply_profile_override()
 
     return os.environ.get("HERMES_HOME")
+
+
+def test_direct_cli_binds_target_before_dotenv_config_plugin_mcp_and_path_home(
+    tmp_path,
+):
+    """Import the real CLI in a fresh process and inspect every target-bound reader."""
+    root = tmp_path / ".hermes"
+    parent = root / "profiles" / "parent"
+    target = root / "profiles" / "target"
+    (parent / "home").mkdir(parents=True)
+    (target / "home").mkdir(parents=True)
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+    (parent / "config.yaml").write_text("profile_marker: parent-config\n", encoding="utf-8")
+    (parent / ".env").write_text("TARGET_DOTENV_MARKER=parent-dotenv\n", encoding="utf-8")
+    (target / "config.yaml").write_text(
+        "profile_marker: target-config\n"
+        "mcp_servers:\n"
+        "  target_only:\n"
+        "    command: /bin/false\n"
+        "plugins:\n"
+        "  enabled:\n"
+        "    - target_plugin\n",
+        encoding="utf-8",
+    )
+    (target / ".env").write_text("TARGET_DOTENV_MARKER=target-dotenv\n", encoding="utf-8")
+    plugin_dir = target / "plugins" / "target_plugin"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.yaml").write_text(
+        "name: target_plugin\nversion: '1.0'\ndescription: target-only\n",
+        encoding="utf-8",
+    )
+
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import sys
+        from pathlib import Path
+
+        sys.argv = ["hermes", "-p", "target", "--help"]
+        import hermes_cli.main  # noqa: F401 — exercise the real early startup path
+        from hermes_cli.config import read_raw_config
+        from hermes_cli.plugins_discovery import collect_directory_manifests
+        from tools.mcp_tool_config import _load_mcp_config
+
+        raw = read_raw_config()
+        target_plugins = [
+            str(manifest.path)
+            for manifest in collect_directory_manifests()
+            if manifest.name == "target_plugin"
+        ]
+        print(json.dumps({
+            "hermes_home": os.environ["HERMES_HOME"],
+            "home": os.environ["HOME"],
+            "real_home": os.environ["HERMES_REAL_HOME"],
+            "path_home": str(Path.home()),
+            "dotenv": os.environ.get("TARGET_DOTENV_MARKER"),
+            "config": raw.get("profile_marker"),
+            "plugins": target_plugins,
+            "mcp": sorted(_load_mcp_config()),
+        }))
+        """
+    )
+    env = {
+        "HOME": str(parent / "home"),
+        "HERMES_HOME": str(parent),
+        "HERMES_REAL_HOME": str(real_home),
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+        "PYTHONUTF8": "1",
+        "TERM": "dumb",
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    observed = json.loads(result.stdout.strip().splitlines()[-1])
+    assert observed == {
+        "hermes_home": str(target),
+        "home": str(target / "home"),
+        "real_home": str(real_home),
+        "path_home": str(target / "home"),
+        "dotenv": "target-dotenv",
+        "config": "target-config",
+        "plugins": [str(plugin_dir)],
+        "mcp": ["target_only"],
+    }
+
+
+def test_early_interface_probe_reads_selected_profile_after_binding(tmp_path):
+    """The early interface cache must not read the parent before ``-p`` binds."""
+    root = tmp_path / ".hermes"
+    parent = root / "profiles" / "parent"
+    target = root / "profiles" / "target"
+    (parent / "home").mkdir(parents=True)
+    (target / "home").mkdir(parents=True)
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+    (parent / "config.yaml").write_text("display:\n  interface: tui\n", encoding="utf-8")
+    (target / "config.yaml").write_text("display:\n  interface: cli\n", encoding="utf-8")
+    script = textwrap.dedent(
+        """
+        import sys
+
+        sys.argv = ["hermes", "-p", "target"]
+
+        class TTYProxy:
+            def __init__(self, wrapped):
+                self.wrapped = wrapped
+
+            def isatty(self):
+                return True
+
+            def __getattr__(self, name):
+                return getattr(self.wrapped, name)
+
+        sys.stdin = TTYProxy(sys.stdin)
+        sys.stdout = TTYProxy(sys.stdout)
+        import hermes_cli.main as main
+
+        assert main._config_default_interface_early() == "cli"
+        """
+    )
+    env = {
+        "HOME": str(parent / "home"),
+        "HERMES_HOME": str(parent),
+        "HERMES_REAL_HOME": str(real_home),
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+        "PYTHONUTF8": "1",
+        "TERM": "dumb",
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[2],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_profile_override_rejects_relative_home_before_mutation(monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", "relative/profile")
+    monkeypatch.setattr(sys, "argv", ["hermes", "-p", "target", "chat"])
+
+    from hermes_cli.main import _apply_profile_override
+
+    with pytest.raises(SystemExit):
+        _apply_profile_override()
+    assert os.environ["HERMES_HOME"] == "relative/profile"
+
+
+def test_profile_resolution_rejects_unrelated_profiles_segment(tmp_path, monkeypatch):
+    unrelated = tmp_path / "srv" / "profiles" / "buildcache"
+    unrelated.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(unrelated))
+
+    from hermes_cli.profiles import resolve_profile_env
+
+    with pytest.raises(ValueError, match="not anchored"):
+        resolve_profile_env("target")
 
 
 class TestApplyProfileOverrideHermesHomeGuard:

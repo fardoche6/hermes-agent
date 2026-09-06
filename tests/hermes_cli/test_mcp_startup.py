@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from argparse import Namespace
 from contextlib import nullcontext
+import os
 import sys
 import threading
 import time
@@ -20,16 +21,22 @@ from hermes_cli import mcp_startup
 def _reset_mcp_startup_state():
     saved_started = mcp_startup._mcp_discovery_started
     saved_thread = mcp_startup._mcp_discovery_thread
+    saved_deferred = mcp_startup._mcp_discovery_deferred
     try:
         mcp_startup._mcp_discovery_started = False
         mcp_startup._mcp_discovery_thread = None
+        mcp_startup._mcp_discovery_deferred = None
         yield
     finally:
         thread = mcp_startup._mcp_discovery_thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=1.0)
+        deferred = mcp_startup._mcp_discovery_deferred
+        if deferred is not None:
+            deferred.cancel()
         mcp_startup._mcp_discovery_started = saved_started
         mcp_startup._mcp_discovery_thread = saved_thread
+        mcp_startup._mcp_discovery_deferred = saved_deferred
 
 
 def _agent_args(**overrides) -> Namespace:
@@ -43,6 +50,24 @@ def _agent_args(**overrides) -> Namespace:
     }
     base.update(overrides)
     return Namespace(**base)
+
+
+def test_main_profile_override_binds_root_shaped_home(monkeypatch, tmp_path):
+    root = tmp_path / ".hermes"
+    target = root / "profiles" / "programmer-luna"
+    (root / "home").mkdir(parents=True)
+    target.mkdir(parents=True)
+    monkeypatch.setattr(main_mod.Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HOME", str(root / "home"))
+    monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+    monkeypatch.setattr(main_mod.sys, "argv", ["hermes", "-p", "programmer-luna", "--help"])
+
+    main_mod._apply_profile_override()
+
+    assert os.environ["HERMES_HOME"] == str(target)
+    assert os.environ["HERMES_REAL_HOME"] != str(root / "home")
+    assert main_mod.sys.argv == ["hermes", "--help"]
 
 
 def test_prepare_agent_startup_backgrounds_blocking_mcp_for_chat(monkeypatch):
@@ -385,6 +410,117 @@ def test_background_discovery_honors_server_filter(monkeypatch, _reset_mcp_serve
     mcp_startup.set_mcp_server_filter("terminal,code-mcp")
     mcp_startup._discover_mcp_tools_without_interactive_oauth()
     assert calls == [["terminal", "code-mcp"]]
+
+
+def test_background_discovery_uses_context_local_target_home(monkeypatch, tmp_path):
+    calls: list = []
+    target_home = str(tmp_path / "hermes-target-profile")
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.config",
+        types.SimpleNamespace(
+            read_raw_config=lambda: {"mcp_servers": {"target": {"command": "never"}}},
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_oauth",
+        types.SimpleNamespace(suppress_interactive_oauth=nullcontext),
+    )
+
+    def fake_discover(*, allowed_mcp_names=None):
+        from hermes_constants import get_hermes_home
+
+        calls.append((str(get_hermes_home()), allowed_mcp_names))
+
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_tool_discovery",
+        types.SimpleNamespace(
+            discover_mcp_tools=fake_discover,
+            get_mcp_status=lambda: [],
+        ),
+    )
+    monkeypatch.setattr(mcp_startup, "_has_configured_mcp_servers", lambda: True)
+    from hermes_constants import set_hermes_home_override
+
+    token = set_hermes_home_override(target_home)
+    try:
+        mcp_startup.start_background_mcp_discovery(
+            logger=_retry_logger(),
+            thread_name="test-context-target",
+        )
+        assert mcp_startup._mcp_discovery_thread is not None
+        mcp_startup._mcp_discovery_thread.join(timeout=1.0)
+    finally:
+        from hermes_constants import reset_hermes_home_override
+
+        reset_hermes_home_override(token)
+
+    assert calls == [(target_home, None)]
+
+
+def test_file_terminal_filter_blocks_inline_background_and_deferred_discovery(
+    monkeypatch,
+    _reset_mcp_server_filter,
+):
+    """The production discovery entry point filters before registration in every startup mode."""
+    from tools import mcp_tool as _mcp_origin
+    from tools import mcp_tool_config as _mcp_config
+    from tools import mcp_tool_discovery as _mcp_discovery
+
+    registered: list[set[str]] = []
+    monkeypatch.setattr(
+        _mcp_config,
+        "_load_mcp_config",
+        lambda: {"unrelated": {"command": "never"}},
+    )
+    monkeypatch.setattr(_mcp_origin, "_ensure_mcp_sdk", lambda: True)
+    monkeypatch.setattr(
+        _mcp_discovery,
+        "_acquire_discovery_lock_with_retry",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        _mcp_discovery,
+        "register_mcp_servers",
+        lambda servers: registered.append(set(servers)) or [],
+    )
+    monkeypatch.setattr(mcp_startup, "_has_configured_mcp_servers", lambda: True)
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_oauth",
+        types.SimpleNamespace(suppress_interactive_oauth=nullcontext),
+    )
+    mcp_startup.set_mcp_server_filter("file,terminal")
+
+    # Inline discovery.
+    mcp_startup._discover_mcp_tools_without_interactive_oauth()
+    assert registered == []
+
+    # Background discovery.
+    mcp_startup._mcp_discovery_started = False
+    mcp_startup._mcp_discovery_thread = None
+    mcp_startup.start_background_mcp_discovery(
+        logger=_retry_logger(),
+        thread_name="test-filter-background",
+    )
+    assert mcp_startup._mcp_discovery_thread is not None
+    mcp_startup._mcp_discovery_thread.join(timeout=1.0)
+    assert registered == []
+
+    # Deferred discovery.
+    mcp_startup._mcp_discovery_started = False
+    mcp_startup._mcp_discovery_thread = None
+    mcp_startup.defer_background_mcp_discovery(
+        logger=_retry_logger(),
+        thread_name="test-filter-deferred",
+        delay=60.0,
+    )
+    mcp_startup._start_deferred_mcp_discovery_now()
+    assert mcp_startup._mcp_discovery_thread is not None
+    mcp_startup._mcp_discovery_thread.join(timeout=1.0)
+    assert registered == []
 
 
 def test_prepare_agent_startup_installs_server_filter(monkeypatch, _reset_mcp_server_filter):

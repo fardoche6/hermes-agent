@@ -42,12 +42,24 @@ def get_hermes_home_override() -> str | None:
     return str(override) if override is not _UNSET and override else None
 
 
+def _windows_hermes_home(
+    local_appdata: str | os.PathLike[str] | None,
+    user_home: str | Path,
+) -> Path:
+    """Return the Windows Hermes home from platform data, without probing the host OS.
+
+    The fallback is deliberately a pure path operation so it can be tested on
+    non-Windows hosts; the caller decides whether the Windows branch applies.
+    """
+    raw_local_appdata = os.fspath(local_appdata).strip() if local_appdata else ""
+    base = Path(raw_local_appdata) if raw_local_appdata else Path(user_home) / "AppData" / "Local"
+    return base / "hermes"
+
+
 def _get_platform_default_hermes_home() -> Path:
     """Return the platform-native default Hermes home path."""
     if sys.platform == "win32":
-        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
-        base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
-        return base / "hermes"
+        return _windows_hermes_home(os.environ.get("LOCALAPPDATA"), Path.home())
     return Path.home() / ".hermes"
 
 
@@ -779,7 +791,12 @@ def _norm_home_path(path: str | None) -> str:
 
 def _profile_home_path(env: dict[str, str] | None = None) -> str | None:
     """Return ``{HERMES_HOME}/home`` when the profile-home directory exists."""
-    hermes_home = get_hermes_home_override() or (env or {}).get("HERMES_HOME") or os.getenv("HERMES_HOME")
+    # An explicit child environment is authoritative. A context-local override belongs to the
+    # in-process request and must not re-anchor a copied environment for another profile.
+    if env is not None and "HERMES_HOME" in env:
+        hermes_home = env.get("HERMES_HOME")
+    else:
+        hermes_home = get_hermes_home_override() or os.getenv("HERMES_HOME")
     if not hermes_home:
         return None
     profile_home = os.path.join(hermes_home, "home")
@@ -790,27 +807,100 @@ def _is_profile_home(candidate: str | None, profile_home: str | None) -> bool:
     return bool(candidate and profile_home and _norm_home_path(candidate) == _norm_home_path(profile_home))
 
 
-def _env_get(env: dict[str, str], key: str, default: str = "") -> str:
-    """Stripped *key* from *env*, falling back to the process environment."""
-    return str(env.get(key) or os.getenv(key, default)).strip()
+def _named_profile_tool_home(
+    candidate: str | None,
+    *,
+    env: dict[str, str] | None = None,
+) -> str | None:
+    """Return the owning profile when *candidate* is a managed ``<profile>/home`` path."""
+    if not candidate:
+        return None
+    candidate_path = Path(candidate)
+    try:
+        owner = named_profile_home(candidate)
+    except Exception:
+        owner = None
+
+    # A copied environment can carry a custom deployment whose root has no
+    # config/.env marker yet. The profile's own ``home/`` directory is the
+    # managed-home marker in that case; do not mistake it for an OS home.
+    if owner is None:
+        for possible_owner in (candidate_path, *candidate_path.parents):
+            if (
+                possible_owner.parent.name == "profiles"
+                and not possible_owner.name.startswith(".")
+                and possible_owner.is_dir()
+                and (possible_owner / "home").is_dir()
+            ):
+                owner = possible_owner
+                break
+
+    if owner is not None and _norm_home_path(candidate) == _norm_home_path(str(owner / "home")):
+        return str(owner)
+
+    # ``base_env`` may describe a canonical custom root that is not the current
+    # process's HERMES_HOME. Use that explicit anchor to reject sibling profile
+    # homes without mutating process-global state.
+    configured = None
+    if env is not None and "HERMES_HOME" in env:
+        configured = str(env.get("HERMES_HOME") or "").strip()
+    elif env is None:
+        configured = os.getenv("HERMES_HOME", "").strip()
+    if configured:
+        root = Path(configured)
+        if root.parent.name == "profiles":
+            root = root.parent.parent
+        if candidate_path.parent.name == "home" and candidate_path.parent.parent.parent == root:
+            return str(candidate_path.parent.parent)
+    try:
+        if _norm_home_path(candidate) == _norm_home_path(str(_get_platform_default_hermes_home() / "home")):
+            return "default"
+    except Exception:
+        pass
+    return None
+
+
+def _env_get(
+    env: dict[str, str],
+    key: str,
+    default: str = "",
+    *,
+    fallback_process: bool = True,
+) -> str:
+    """Stripped *key* from *env*, optionally falling back to the process environment."""
+    value = env.get(key)
+    if value:
+        return str(value).strip()
+    if fallback_process:
+        return os.getenv(key, default).strip()
+    return default
 
 
 def _iter_real_home_candidates(env: dict[str, str] | None = None) -> list[str]:
     """Return likely OS-user home candidates in trust order."""
-    env = env or {}
-    candidates = [_env_get(env, "HERMES_REAL_HOME"), _env_get(env, "HOME")]
+    explicit_env = env is not None
+    env = {} if env is None else env
+    fallback_process = not explicit_env
+    candidates = [
+        _env_get(env, "HERMES_REAL_HOME", fallback_process=fallback_process),
+        _env_get(env, "HOME", fallback_process=fallback_process),
+    ]
     with contextlib.suppress(Exception):
         import pwd
-        candidates.append(pwd.getpwuid(os.getuid()).pw_dir.strip())  # windows-footgun: ok — POSIX-only module inside try/except
-    candidates.append(_env_get(env, "USERPROFILE"))
-    drive, path = _env_get(env, "HOMEDRIVE"), _env_get(env, "HOMEPATH")
+
+        candidates.append(pwd.getpwuid(os.getuid()).pw_dir)
+    candidates.append(_env_get(env, "USERPROFILE", fallback_process=fallback_process))
+    drive, path = (
+        _env_get(env, "HOMEDRIVE", fallback_process=fallback_process),
+        _env_get(env, "HOMEPATH", fallback_process=fallback_process),
+    )
     if drive and path:
         candidates.append(f"{drive}{path}" if path.startswith(("\\", "/")) else os.path.join(drive, path))
-    expanded = os.path.expanduser("~")
-    if expanded != "~":
-        candidates.append(expanded)
+    if not explicit_env:
+        expanded = os.path.expanduser("~")
+        if expanded != "~":
+            candidates.append(expanded)
     return [c for c in candidates if c]
-
 
 def get_real_home(env: dict[str, str] | None = None) -> str:
     """The OS user's real home, avoiding the Hermes profile HOME.
@@ -825,7 +915,7 @@ def get_real_home(env: dict[str, str] | None = None) -> str:
         if not key or key in seen:
             continue
         seen.add(key)
-        if not _is_profile_home(candidate, profile_home):
+        if not _is_profile_home(candidate, profile_home) and not _named_profile_tool_home(candidate, env=env):
             return candidate
     return "/tmp"
 
@@ -840,15 +930,15 @@ def get_subprocess_home(env: dict[str, str] | None = None) -> str | None:
     ``auto``: hosts keep real HOME (repairing a profile-home parent), containers use
     ``{HERMES_HOME}/home``; ``real``: always real HOME; ``profile``: always the profile home.
     """
-    env = env or {}
-    profile_home = _profile_home_path(env)
-    mode = _env_get(env, "TERMINAL_HOME_MODE", "auto").lower() or "auto"
+    effective_env = {} if env is None else env
+    profile_home = _profile_home_path(None if env is None else effective_env)
+    mode = _env_get(effective_env, "TERMINAL_HOME_MODE", "auto").lower() or "auto"
     mode = _HOME_MODE_ALIASES.get(mode, mode)
 
     if mode == "profile":
         return profile_home
-    real_home = get_real_home(env)
-    current_home = _env_get(env, "HOME")
+    real_home = get_real_home(None if env is None else effective_env)
+    current_home = _env_get(effective_env, "HOME", fallback_process=env is None)
     repaired = real_home if _norm_home_path(real_home) != _norm_home_path(current_home) else None
     if mode == "real":
         return repaired
@@ -857,6 +947,13 @@ def get_subprocess_home(env: dict[str, str] | None = None) -> str | None:
         return profile_home
     if _is_profile_home(current_home, profile_home):
         return repaired
+    # A parent process may have selected a different profile. Do not leave that managed
+    # sibling home attached to a child whose HERMES_HOME now names the target profile.
+    if profile_home and _named_profile_tool_home(
+        current_home,
+        env=None if env is None else effective_env,
+    ):
+        return profile_home
     return None
 
 
@@ -868,6 +965,13 @@ def apply_subprocess_home_env(env: dict[str, str]) -> None:
     home = get_subprocess_home(env)
     if home:
         env["HOME"] = home
+    elif real_home and _named_profile_tool_home(
+        _env_get(env, "HOME", fallback_process=False),
+        env=env,
+    ):
+        # The selected profile has no managed home directory. A managed parent/sibling HOME is
+        # still unsafe, so repair to the proven real home instead of inheriting it.
+        env["HOME"] = real_home
 
 
 VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max", "ultra")

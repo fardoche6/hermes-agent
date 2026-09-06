@@ -211,12 +211,15 @@ _detached_ws_transport = _DropTransport()
 
 def _prepend_tool_paths(env: dict[str, str]) -> dict[str, str]:
     """Prepend managed bin (first: managed-first policy for the Browser Use CLI), venv bin and
-    ~/.local/bin to PATH so slash_worker children resolve Hermes-managed CLIs under the Desktop's minimal PATH."""
+    the selected child's ``HOME/.local/bin`` to PATH so slash_worker children
+    resolve Hermes-managed CLIs under the Desktop's minimal PATH."""
     managed_bin = ""
     with contextlib.suppress(Exception):
-        managed_bin = str(Path(get_hermes_home()) / "bin")
+        managed_bin = str(Path(env.get("HERMES_HOME") or get_hermes_home()) / "bin")
     venv_bin = str(Path(sys.executable).parent)  # <venv>/bin (POSIX) or <venv>/Scripts (Windows)
-    parts = [p for p in (managed_bin, venv_bin, str(Path.home() / ".local" / "bin"), env.get("PATH") or "") if p]
+    child_home = env.get("HOME") or env.get("HERMES_REAL_HOME")
+    user_bin = str(Path(child_home) / ".local" / "bin") if child_home else ""
+    parts = [p for p in (managed_bin, venv_bin, user_bin, env.get("PATH") or "") if p]
     env["PATH"] = os.pathsep.join(parts)
     return env
 
@@ -235,16 +238,18 @@ class _SlashWorker:
         # slash_worker runs the Hermes agent → needs provider credentials. Tier-1 secrets
         # (gateway/GitHub/infra) are still stripped (#29157). Global-remote / multi-profile sessions: the
         # worker must resolve config/skills/state against the session's profile home, not the gateway's
-        # launch HERMES_HOME (#40677). The override goes through the build_subprocess_env factory's `extra`
-        # (applied last, always wins) instead of a hand-rolled env["HERMES_HOME"] assignment.
-        from tools.environments.local import build_subprocess_env
+        # launch HERMES_HOME (#40677). The complete profile launch builder binds all home keys together.
+        from hermes_cli.profiles import build_profile_launch_env
 
         # The worker runs the agent → needs provider credentials; tier-1 secrets (gateway/GitHub/
-        # infra) are still stripped. Multi-profile sessions resolve against the session's profile
-        # home via `extra` (applied last, always wins); the base already carries the HOME contract.
-        env = _prepend_tool_paths(build_subprocess_env(
-            hermes_subprocess_env(inherit_credentials=True), scrub_secrets=False,
-            inherit_profile_home=False, extra={"HERMES_HOME": str(profile_home)} if profile_home else None))
+        # infra) are still stripped. A scoped session uses the same copied-base builder as the CLI
+        # and dashboard, so no late HERMES_HOME-only override can retain a sibling HOME.
+        base_env = hermes_subprocess_env(inherit_credentials=True)
+        # Always pass through the complete builder. An unscoped worker binds to
+        # the gateway's current home; a scoped worker replaces it atomically.
+        target_home = profile_home or get_hermes_home()
+        env = build_profile_launch_env(target_home, base_env=base_env)
+        env = _prepend_tool_paths(env)
         # start_new_session: otherwise the worker inherits the gateway's pgid and mcp_tool's orphan
         # sweep, racing the spawn, killpg()s the TUI parent itself. errors="replace": bytes invalid
         # in the system locale (GBK Windows) must not raise UnicodeDecodeError in the drain threads.
