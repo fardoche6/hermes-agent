@@ -694,6 +694,9 @@ class FileOperations(ABC):
     ) -> WriteResult:
         return WriteResult(error="Protected final symlink writes are not implemented")
 
+    def supports_protected_final_symlink_write(self) -> bool:
+        return False
+
     @abstractmethod
     def patch_replace(self, path: str, old_string: str, new_string: str,
                       replace_all: bool = False) -> PatchResult:
@@ -1568,25 +1571,60 @@ class ShellFileOperations(FileOperations):
             os.rename(temp_name, final_name,
                       src_dir_fd=plan.parent_fd, dst_dir_fd=plan.parent_fd)
         except Exception as exc:
+            cleanup_error = None
             if temp_fd is not None:
-                os.close(temp_fd)
+                try:
+                    os.close(temp_fd)
+                except OSError as close_exc:
+                    cleanup_error = close_exc
             try:
                 os.unlink(temp_name, dir_fd=plan.parent_fd)
-            except OSError:
-                pass
+            except OSError as cleanup_exc:
+                cleanup_error = cleanup_error or cleanup_exc
+            if cleanup_error is not None:
+                return WriteResult(error=(
+                    f"UNCERTAIN STATE: atomic protected write failed: {exc}; "
+                    f"temporary-file cleanup failed: {cleanup_error}; "
+                    "rollback=not_attempted"
+                ))
             return WriteResult(error=str(exc))
 
         try:
-            installed = os.lstat(final_name, dir_fd=plan.parent_fd)
-            if not stat.S_ISREG(installed.st_mode):
+            installed_fd = os.open(
+                final_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=plan.parent_fd,
+            )
+            try:
+                installed = os.fstat(installed_fd)
+                if not stat.S_ISREG(installed.st_mode):
+                    raise OSError("installed entry is not regular")
+                digest = hashlib.sha256()
+                while True:
+                    chunk = os.read(installed_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                installed_hash = digest.hexdigest()
+            finally:
+                os.close(installed_fd)
+            if installed_hash != plan.candidate_sha256:
                 raise OSError("installed entry is not regular")
-            with os.fdopen(os.open(final_name, os.O_RDONLY, dir_fd=plan.parent_fd), "rb") as stream:
-                installed_hash = hashlib.sha256(stream.read()).hexdigest()
             if installed_hash != plan.candidate_sha256:
                 raise OSError("installed candidate hash mismatch")
         except Exception as exc:
-            return WriteResult(error=f"UNCERTAIN STATE: {exc}")
+            return WriteResult(error=f"UNCERTAIN STATE: {exc}; rollback=not_attempted")
         return WriteResult(bytes_written=len(plan.candidate), verified=True)
+
+    def supports_protected_final_symlink_write(self) -> bool:
+        env_name = getattr(self.env, "_hermes_backend_name", None)
+        if env_name is None:
+            env_name = getattr(getattr(self.env, "config", None), "env_type", None)
+        if env_name is None:
+            env_name = getattr(self.env, "env_type", "local")
+        return (
+            str(env_name).lower() == "local"
+            and all(hasattr(os, name) for name in ("open", "close", "fstat", "readlink", "rename"))
+            and all(hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW"))
+        )
 
     def _detect_file_line_ending(self, path: str, pre_content: Optional[str] = None) -> Optional[str]:
         """Detect the dominant line ending of a file on disk.

@@ -1,7 +1,7 @@
 """Behavior contract for protected final-file symlink writes.
 
-These tests exercise public file-tool boundaries and intentionally remain red
-until protected lexical-final-symlink handling is implemented.
+The contract is intentionally adversarial: every case crosses the public file
+tool boundary and records both the reached primitive and the complete tree.
 """
 
 from __future__ import annotations
@@ -604,3 +604,264 @@ def test_regular_protected_multifile_v4a_remains_single_atomic_approval(tmp_path
     assert len(calls) == 1
     assert protected.read_text() == "old\n"
     assert innocent.read_text() == "safe\n"
+
+
+def test_non_local_backend_fails_closed_without_host_namespace_mutation(
+    tmp_path: Path, symlink_capability, monkeypatch,
+):
+    link, _target = _protected_link(tmp_path)
+    before = _state(tmp_path)
+    events = []
+    set_approval_callback(lambda *args, **kwargs: events.append("approval") or "once")
+
+    from tools.environments.local import LocalEnvironment
+    from tools.file_operations import ShellFileOperations
+
+    backend = LocalEnvironment(cwd=str(tmp_path))
+    backend._hermes_backend_name = "docker"
+    monkeypatch.setattr(
+        "tools.file_tools._get_file_ops",
+        lambda task_id="default": ShellFileOperations(backend),
+    )
+    result = _result(write_file_tool(str(link), "must not land\n"))
+
+    assert result.get("error")
+    assert "host-local" in result["error"]
+    assert events == []
+    assert _state(tmp_path) == before
+
+
+@pytest.mark.parametrize(
+    ("primitive", "remove_attribute"),
+    [
+        ("O_DIRECTORY", "O_DIRECTORY"),
+        ("O_NOFOLLOW", "O_NOFOLLOW"),
+        ("descriptor hashing", "fstat"),
+    ],
+)
+def test_missing_required_capability_fails_before_approval_without_mutation(
+    tmp_path: Path, symlink_capability, monkeypatch, primitive: str, remove_attribute: str,
+):
+    link, _target = _protected_link(tmp_path)
+    before = _state(tmp_path)
+    events = []
+    set_approval_callback(lambda *args, **kwargs: events.append("approval") or "once")
+    monkeypatch.delattr("tools.file_tools.os." + remove_attribute, raising=False)
+
+    result = _result(write_file_tool(str(link), "must not land\n"))
+
+    assert result.get("error")
+    assert "raw" not in result["error"].lower()
+    assert "host-local" in result["error"].lower() or "unavailable" in result["error"].lower()
+    assert events == []
+    assert _state(tmp_path) == before
+
+
+def test_missing_dir_fd_capability_is_structured_and_preapproval(
+    tmp_path: Path, symlink_capability, monkeypatch,
+):
+    link, _target = _protected_link(tmp_path)
+    before = _state(tmp_path)
+    events = []
+    set_approval_callback(lambda *args, **kwargs: events.append("approval") or "once")
+    original_open = os.open
+
+    def reject_dir_fd(path, flags, *args, **kwargs):
+        if kwargs.get("dir_fd") is not None:
+            raise TypeError("dir_fd is unsupported")
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr("tools.file_tools.os.open", reject_dir_fd)
+    result = _result(write_file_tool(str(link), "must not land\n"))
+
+    assert result.get("error")
+    assert "dir_fd" in result["error"]
+    assert events == []
+    assert _state(tmp_path) == before
+
+
+@pytest.mark.parametrize("race", ["final", "target"])
+def test_inter_syscall_identity_race_aborts_before_candidate_landing(
+    tmp_path: Path, symlink_capability, monkeypatch, race: str,
+):
+    link, target = _protected_link(tmp_path)
+    before = _state(tmp_path)
+    events = []
+    set_approval_callback(lambda *args, **kwargs: events.append("approval") or "once")
+    original_readlink = os.readlink
+    original_stat = os.stat
+    tripped = False
+
+    def race_readlink(path, *args, **kwargs):
+        nonlocal tripped
+        value = original_readlink(path, *args, **kwargs)
+        if race == "final" and kwargs.get("dir_fd") is not None and not tripped:
+            tripped = True
+            link.unlink()
+            link.symlink_to("external-target.txt")
+        return value
+
+    def race_stat(path, *args, **kwargs):
+        nonlocal tripped
+        value = original_stat(path, *args, **kwargs)
+        if race == "target" and kwargs.get("dir_fd") is not None and not tripped:
+            tripped = True
+            target.rename(tmp_path / "old-target")
+            target.write_bytes(b"new target\n")
+        return value
+
+    monkeypatch.setattr("tools.file_tools.os.readlink", race_readlink)
+    monkeypatch.setattr("tools.file_tools.os.stat", race_stat)
+    result = _result(write_file_tool(str(link), "must not land\n"))
+
+    assert result.get("error")
+    assert tripped is True
+    assert events == []
+    assert not any(
+        path.is_file() and path.read_bytes() == b"must not land\n"
+        for path in tmp_path.rglob("*")
+    )
+    assert _state(tmp_path) != before
+
+
+def test_commit_and_cleanup_failure_reports_residual_uncertainty(
+    tmp_path: Path, symlink_capability, monkeypatch,
+):
+    link, _target = _protected_link(tmp_path)
+    events = []
+    set_approval_callback(lambda *args, **kwargs: events.append("approval") or "once")
+
+    def fail_commit(*args, **kwargs):
+        events.append("commit")
+        raise OSError("commit failed")
+
+    def fail_cleanup(*args, **kwargs):
+        events.append("cleanup")
+        raise OSError("cleanup failed")
+
+    monkeypatch.setattr("tools.file_operations.os.rename", fail_commit)
+    monkeypatch.setattr("tools.file_operations.os.unlink", fail_cleanup)
+    result = _result(write_file_tool(str(link), "candidate\n"))
+
+    assert events == ["approval", "commit", "cleanup"]
+    _assert_no_affirmative_rollback(result)
+    assert "commit failed" in result["error"]
+    assert "cleanup failed" in result["error"]
+    residue = [p for p in tmp_path.iterdir() if p.name.startswith(".hermes-protected-")]
+    assert len(residue) == 1
+    assert residue[0].read_bytes() == b"candidate\n"
+
+
+def test_post_commit_verification_is_relative_nofollow_and_uncertain(
+    tmp_path: Path, symlink_capability, monkeypatch,
+):
+    link, target = _protected_link(tmp_path)
+    events = []
+    set_approval_callback(lambda *args, **kwargs: events.append("approval") or "once")
+    original_rename = os.rename
+    original_open = os.open
+    committed = False
+    opened = []
+
+    def record_commit(*args, **kwargs):
+        nonlocal committed
+        result = original_rename(*args, **kwargs)
+        committed = True
+        events.append("commit")
+        return result
+
+    def fault_verification(path, flags, *args, **kwargs):
+        if committed and path == "AGENTS.md":
+            opened.append((path, flags, kwargs.get("dir_fd")))
+            raise OSError("verification fault")
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr("tools.file_operations.os.rename", record_commit)
+    monkeypatch.setattr("tools.file_tools.os.open", fault_verification)
+    result = _result(write_file_tool(str(link), "candidate\n"))
+
+    assert events == ["approval", "commit"]
+    _assert_no_affirmative_rollback(result)
+    assert opened
+    assert opened[-1][0] == "AGENTS.md"
+    assert opened[-1][1] & os.O_NOFOLLOW
+    assert opened[-1][2] is not None
+    assert not link.is_symlink()
+    assert link.read_bytes() == b"candidate\n"
+    assert target.read_bytes() == b"external\n"
+
+
+def test_parent_identity_race_between_revalidation_syscalls_aborts_before_landing(
+    tmp_path: Path, symlink_capability, monkeypatch,
+):
+    link, target = _protected_link(tmp_path / "parent")
+    before = _state(tmp_path)
+    events = []
+    armed = False
+    fstat_calls = 0
+    original_fstat = os.fstat
+
+    def approve(*args, **kwargs):
+        nonlocal armed
+        events.append("approval")
+        armed = True
+        return "once"
+
+    def race_fstat(fd):
+        nonlocal fstat_calls
+        value = original_fstat(fd)
+        fstat_calls += 1
+        if armed and fstat_calls == 3:
+            moved = tmp_path / "parent-moved"
+            link.parent.rename(moved)
+            link.parent.mkdir()
+            os.rename(moved / link.name, link.parent / link.name)
+            os.rename(moved / target.name, link.parent / target.name)
+        return value
+
+    set_approval_callback(approve)
+    monkeypatch.setattr("tools.file_tools.os.fstat", race_fstat)
+    result = _result(write_file_tool(str(link), "must not land\n"))
+
+    assert result.get("error")
+    assert events == ["approval"]
+    assert fstat_calls >= 3
+    assert not any(
+        path.is_file() and path.read_bytes() == b"must not land\n"
+        for path in tmp_path.rglob("*")
+    )
+    assert (tmp_path / "parent" / "AGENTS.md").is_symlink()
+    assert _state(tmp_path) != before
+
+
+def test_descriptor_failure_after_parent_substitution_has_no_path_fallback(
+    tmp_path: Path, symlink_capability, monkeypatch,
+):
+    link, _target = _protected_link(tmp_path)
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    decoy_link = decoy / "AGENTS.md"
+    decoy_link.write_bytes(b"decoy original\n")
+    before = _state(tmp_path)
+    events = []
+    original_rename = os.rename
+
+    set_approval_callback(lambda *args, **kwargs: events.append("approval") or "once")
+
+    def fail_descriptor(src, dst, *args, **kwargs):
+        if kwargs.get("src_dir_fd") is not None:
+            events.append("descriptor-attempt")
+            moved = tmp_path / "approved-parent-moved"
+            original_rename(link.parent, moved)
+            original_rename(moved, link.parent)
+            raise OSError("descriptor commit unavailable")
+        events.append("path-fallback")
+        return original_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr("tools.file_operations.os.rename", fail_descriptor)
+    result = _result(write_file_tool(str(link), "must not land\n"))
+
+    assert result.get("error")
+    assert events == ["approval", "descriptor-attempt"]
+    assert _state(tmp_path) == before
+    assert decoy_link.read_bytes() == b"decoy original\n"

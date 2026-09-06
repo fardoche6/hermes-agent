@@ -22,6 +22,7 @@ from tools.binary_extensions import (
 from tools.file_operations import (
     ProtectedFinalSymlinkPlan,
     ShellFileOperations,
+    WriteResult,
     normalize_read_pagination,
     normalize_search_pagination,
 )
@@ -851,7 +852,10 @@ def _build_protected_final_symlink_plan(
     filepath: str, candidate: bytes, task_id: str = "default",
 ) -> ProtectedFinalSymlinkPlan | None:
     """Inspect a protected lexical final symlink without following its final entry."""
-    if os.path.basename(os.path.normpath(filepath)).lower() not in _PROTECTED_INSTRUCTION_BASENAMES:
+    enabled, extra_patterns = _protected_instruction_config()
+    if _protected_instruction_reason(
+        filepath, task_id, enabled=enabled, extra_patterns=extra_patterns,
+    ) is None:
         return None
     expanded = _expand_tilde(filepath)
     if os.path.isabs(expanded):
@@ -873,7 +877,11 @@ def _build_protected_final_symlink_plan(
     try:
         parent_stat = os.fstat(parent_fd)
         final_name = os.path.basename(lexical)
-        final_stat = os.lstat(final_name, dir_fd=parent_fd)
+        try:
+            final_stat = os.lstat(final_name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            os.close(parent_fd)
+            return None
         if stat.S_ISDIR(final_stat.st_mode):
             raise ValueError("protected final symlink final entry is a directory")
         if not stat.S_ISLNK(final_stat.st_mode):
@@ -886,8 +894,24 @@ def _build_protected_final_symlink_plan(
         target_stat = os.stat(raw_target, dir_fd=parent_fd, follow_symlinks=False)
         if not stat.S_ISREG(target_stat.st_mode):
             raise ValueError("protected final symlink target is not regular")
-        with os.fdopen(os.open(raw_target, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd), "rb") as stream:
-            target_hash = hashlib.sha256(stream.read()).hexdigest()
+        target_fd = os.open(raw_target, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        try:
+            stable_target = os.fstat(target_fd)
+            if (stable_target.st_dev, stable_target.st_ino) != (target_stat.st_dev, target_stat.st_ino):
+                raise ValueError("protected final symlink target changed during inspection")
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(target_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            target_hash = digest.hexdigest()
+        finally:
+            os.close(target_fd)
+        final_after = os.lstat(final_name, dir_fd=parent_fd)
+        if ((final_after.st_dev, final_after.st_ino) != (final_stat.st_dev, final_stat.st_ino)
+                or os.readlink(final_name, dir_fd=parent_fd) != raw_target):
+            raise ValueError("protected final symlink changed during inspection")
         return ProtectedFinalSymlinkPlan(
             lexical_path=lexical, lexical_parent=parent, parent_fd=parent_fd,
             parent_dev=parent_stat.st_dev, parent_ino=parent_stat.st_ino,
@@ -948,7 +972,7 @@ def _request_protected_final_symlink_approval(plan: ProtectedFinalSymlinkPlan) -
 
 def _revalidate_protected_final_symlink_plan(plan: ProtectedFinalSymlinkPlan) -> None:
     """Recheck every object binding after approval, using the retained parent fd."""
-    current_parent = os.stat(plan.lexical_parent, follow_symlinks=False)
+    current_parent = os.fstat(plan.parent_fd)
     if (current_parent.st_dev, current_parent.st_ino) != (plan.parent_dev, plan.parent_ino):
         raise ValueError("protected final symlink parent changed")
     final_name = os.path.basename(plan.lexical_path)
@@ -962,8 +986,20 @@ def _revalidate_protected_final_symlink_plan(plan: ProtectedFinalSymlinkPlan) ->
     target_stat = os.stat(plan.final_raw_target, dir_fd=plan.parent_fd, follow_symlinks=False)
     if (target_stat.st_dev, target_stat.st_ino) != (plan.target_dev, plan.target_ino):
         raise ValueError("protected final symlink target identity changed")
-    with os.fdopen(os.open(plan.final_raw_target, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=plan.parent_fd), "rb") as stream:
-        target_hash = hashlib.sha256(stream.read()).hexdigest()
+    target_fd = os.open(plan.final_raw_target, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=plan.parent_fd)
+    try:
+        stable_target = os.fstat(target_fd)
+        if (stable_target.st_dev, stable_target.st_ino) != (plan.target_dev, plan.target_ino):
+            raise ValueError("protected final symlink target identity changed")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(target_fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        target_hash = digest.hexdigest()
+    finally:
+        os.close(target_fd)
     if target_hash != plan.target_sha256:
         raise ValueError("protected final symlink target preimage changed")
 
@@ -2413,36 +2449,6 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     binary_doc_err = _check_binary_document_write(path, task_id)
     if binary_doc_err:
         return tool_error(binary_doc_err)
-    try:
-        protected_plan = _build_protected_final_symlink_plan(
-            path, content.encode("utf-8"), task_id
-        )
-    except (OSError, ValueError, UnicodeError) as exc:
-        return tool_error(str(exc))
-    if protected_plan is not None:
-        try:
-            protected_err = _request_protected_final_symlink_approval(protected_plan)
-            if protected_err:
-                return tool_error(protected_err)
-            _revalidate_protected_final_symlink_plan(protected_plan)
-            result = _get_file_ops(task_id).protected_final_symlink_write(protected_plan)
-            if result.error and result.error.startswith("UNCERTAIN STATE:"):
-                return json.dumps({
-                    "error": result.error,
-                    "uncertain": True,
-                    "rollback": "not_attempted",
-                }, ensure_ascii=False)
-            return json.dumps(result.to_dict(), ensure_ascii=False)
-        except Exception as exc:
-            return tool_error(str(exc))
-        finally:
-            try:
-                os.close(protected_plan.parent_fd)
-            except OSError:
-                pass
-    protected_err = _check_protected_instruction_write([path], task_id)
-    if protected_err:
-        return tool_error(protected_err)
     approval_err = _check_approval_required_write([path], task_id)
     if approval_err:
         return tool_error(approval_err)
@@ -2489,15 +2495,86 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             # terminal's cwd (the worktree-cwd bug). Lowest priority of the three.
             cwd_warning = _path_resolution_warning(path, Path(_resolved), task_id)
             file_ops = _get_file_ops(task_id)
-            result = file_ops.write_file(_resolved, content)
+            protected_plan = None
+            protected_reason = _protected_instruction_reason(path, task_id)
+            if protected_reason:
+                if not file_ops.supports_protected_final_symlink_write():
+                    return tool_error(
+                        "Protected instruction writes require a host-local backend "
+                        "with descriptor-relative atomic replacement support."
+                    )
+                try:
+                    protected_plan = _build_protected_final_symlink_plan(
+                        path, content.encode("utf-8"), task_id,
+                    )
+                except (AttributeError, NotImplementedError, OSError, ValueError, UnicodeError) as exc:
+                    return tool_error(f"BLOCKED: protected instruction write unavailable: {exc}")
+            if protected_plan is not None:
+                try:
+                    protected_err = _request_protected_final_symlink_approval(protected_plan)
+                    if protected_err:
+                        result = WriteResult(error=protected_err)
+                    else:
+                        _revalidate_protected_final_symlink_plan(protected_plan)
+                        result = file_ops.protected_final_symlink_write(protected_plan)
+                        if not result.error:
+                            try:
+                                final_name = os.path.basename(protected_plan.lexical_path)
+                                installed_lstat = os.lstat(
+                                    final_name, dir_fd=protected_plan.parent_fd,
+                                )
+                                if not stat.S_ISREG(installed_lstat.st_mode):
+                                    raise OSError("installed entry is not regular")
+                                installed_fd = os.open(
+                                    final_name, os.O_RDONLY | os.O_NOFOLLOW,
+                                    dir_fd=protected_plan.parent_fd,
+                                )
+                                try:
+                                    installed = os.fstat(installed_fd)
+                                    if not stat.S_ISREG(installed.st_mode):
+                                        raise OSError("installed entry is not regular")
+                                    digest = hashlib.sha256()
+                                    while True:
+                                        chunk = os.read(installed_fd, 1024 * 1024)
+                                        if not chunk:
+                                            break
+                                        digest.update(chunk)
+                                    if digest.hexdigest() != protected_plan.candidate_sha256:
+                                        raise OSError("installed candidate hash mismatch")
+                                finally:
+                                    os.close(installed_fd)
+                            except Exception as exc:
+                                result = WriteResult(
+                                    error=f"UNCERTAIN STATE: {exc}; rollback=not_attempted",
+                                )
+                finally:
+                    try:
+                        os.close(protected_plan.parent_fd)
+                    except OSError:
+                        pass
+            else:
+                protected_err = _check_protected_instruction_write([path], task_id)
+                if protected_err:
+                    return tool_error(protected_err)
+                result = file_ops.write_file(_resolved, content)
             result_dict = result.to_dict()
+            if result_dict.get("error", "").startswith("UNCERTAIN STATE:"):
+                result_dict = {
+                    "error": result_dict["error"],
+                    "uncertain": True,
+                    "rollback": "not_attempted",
+                }
+            uncertain = result_dict.get("uncertain") is True
             effective_warning = cross_warning or stale_warning or cwd_warning
-            if effective_warning:
+            if effective_warning and not uncertain:
                 result_dict["_warning"] = effective_warning
             # Always report the ABSOLUTE path actually written, so a wrong-cwd
             # mismatch is visible in the response instead of silently routing
-            # the edit to the wrong checkout.
-            result_dict["resolved_path"] = _resolved
+            # the edit to the wrong checkout.  Uncertain post-commit state has
+            # an intentionally closed schema: callers must not infer success
+            # from bookkeeping fields.
+            if not uncertain:
+                result_dict["resolved_path"] = _resolved
             if not result_dict.get("error"):
                 result_dict["files_modified"] = [_resolved]
                 _mark_verification_stale(task_id, [_resolved], session_id=session_id)
