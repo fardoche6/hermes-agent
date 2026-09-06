@@ -1,38 +1,42 @@
 """Tests for TUI gateway slash_worker profile_home propagation (#40677)."""
 
-from pathlib import Path
+import os
 from unittest.mock import MagicMock, patch
 
 
-def test_slash_worker_accepts_profile_home():
-    """_SlashWorker.__init__ accepts profile_home parameter."""
-    # hermes_state evaluates get_hermes_home() / "state.db" at import time, so
-    # the mock must return a Path (a bare str raises TypeError under per-file
-    # subprocess isolation).
-    with patch.dict("sys.modules", {
-        "hermes_constants": MagicMock(
-            get_hermes_home=MagicMock(return_value=Path("/tmp/hermes_test")),
-        ),
-    }):
-        with patch("subprocess.Popen") as mock_popen:
-            mock_popen.return_value.stdout = MagicMock()
-            mock_popen.return_value.stderr = MagicMock()
+def test_slash_worker_accepts_profile_home(tmp_path, monkeypatch):
+    """The real slash-worker launch boundary binds all three home keys to the target."""
+    root = tmp_path / ".hermes"
+    parent = root / "profiles" / "parent"
+    target = root / "profiles" / "work"
+    (parent / "home").mkdir(parents=True)
+    (target / "home").mkdir(parents=True)
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(parent))
+    monkeypatch.setenv("HOME", str(parent / "home"))
+    monkeypatch.setenv("HERMES_REAL_HOME", str(real_home))
 
-            from tui_gateway.server import _SlashWorker
+    with patch("subprocess.Popen") as mock_popen:
+        mock_popen.return_value.stdout = MagicMock()
+        mock_popen.return_value.stderr = MagicMock()
 
-            # Test initialization with profile_home
-            worker = _SlashWorker(
-                session_key="test_key",
-                model="test-model",
-                profile_home="/home/luke/.hermes/profiles/work"
-            )
+        from tui_gateway.server import _SlashWorker
 
-            # Verify Popen was called
-            assert mock_popen.called
+        worker = _SlashWorker(
+            session_key="test_key",
+            model="test-model",
+            profile_home=str(target),
+        )
 
-            # Check that HERMES_HOME was set in the environment
-            call_kwargs = mock_popen.call_args[1]
-            assert "env" in call_kwargs
-            assert call_kwargs["env"]["HERMES_HOME"] == "/home/luke/.hermes/profiles/work"
+        assert mock_popen.called
+        call_kwargs = mock_popen.call_args[1]
+        env = call_kwargs["env"]
+        assert env["HERMES_HOME"] == str(target)
+        assert env["HOME"] == str(target / "home")
+        assert env["HERMES_REAL_HOME"] == str(real_home)
+        assert str(target / "home" / ".local" / "bin") in env["PATH"].split(os.pathsep)
+        assert str(parent / "home" / ".local" / "bin") not in env["PATH"].split(os.pathsep)
+        worker.close()
 
 

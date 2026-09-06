@@ -210,20 +210,21 @@ def _set_process_title() -> None:
 
 
 # Cheap read of `display.interface` for the earliest hot-path decisions
-# (mouse-residue suppression, Termux fast launch) that run before
-# hermes_cli.config is importable. Cached so early callers don't re-parse YAML.
-_EARLY_INTERFACE_CACHE: "list | None" = None
+# (mouse-residue suppression, Termux fast launch) after profile binding.
+# Cache by selected HERMES_HOME so a long-lived imported module cannot reuse a
+# parent profile's answer for a later target scope.
+_EARLY_INTERFACE_CACHE: "tuple[str, str] | None" = None
 
 
 def _config_default_interface_early() -> str:
     """Return the configured default interface ("cli"/"tui") via a minimal
     YAML read. Best-effort: any error falls back to "cli" (legacy behavior)."""
     global _EARLY_INTERFACE_CACHE
-    if _EARLY_INTERFACE_CACHE is not None:
-        return _EARLY_INTERFACE_CACHE[0]
+    home = os.environ.get("HERMES_HOME", "").strip()
+    if _EARLY_INTERFACE_CACHE is not None and _EARLY_INTERFACE_CACHE[0] == home:
+        return _EARLY_INTERFACE_CACHE[1]
     value = "cli"
     try:
-        home = os.environ.get("HERMES_HOME")
         if home:
             cfg_path = os.path.join(home, "config.yaml")
         else:
@@ -242,7 +243,7 @@ def _config_default_interface_early() -> str:
                     value = "tui"
     except Exception:
         value = "cli"  # best-effort — default to classic REPL on any error
-    _EARLY_INTERFACE_CACHE = [value]
+    _EARLY_INTERFACE_CACHE = (home, value)
     return value
 
 
@@ -294,9 +295,6 @@ def _suppress_mouse_residue_early() -> None:
         pass
 
 
-_suppress_mouse_residue_early()
-
-
 _startup_fast.ensure_project_root_on_path()
 
 # ``hermes --version`` is answered before config/logging imports.
@@ -310,67 +308,6 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Optional
-
-
-from hermes_cli.subcommands.cron import build_cron_parser
-from hermes_cli.subcommands.sync import build_sync_parser
-from hermes_cli.subcommands.gateway import build_gateway_parser
-from hermes_cli.subcommands.profile import build_profile_parser
-from hermes_cli.subcommands.model import build_model_parser
-from hermes_cli.subcommands.setup import build_setup_parser
-
-from hermes_cli.subcommands.whatsapp import build_whatsapp_parser, build_whatsapp_cloud_parser
-from hermes_cli.subcommands.slack import build_slack_parser
-from hermes_cli.subcommands.login import build_login_parser
-from hermes_cli.subcommands.logout import build_logout_parser
-from hermes_cli.subcommands.auth import build_auth_parser
-from hermes_cli.subcommands.status import build_status_parser
-from hermes_cli.subcommands.pause import build_pause_parser
-from hermes_cli.subcommands.webhook import build_webhook_parser
-from hermes_cli.subcommands.hooks import build_hooks_parser
-from hermes_cli.subcommands.doctor import build_doctor_parser
-from hermes_cli.subcommands.verify import build_verify_parser
-from hermes_cli.subcommands.security import build_security_parser
-from hermes_cli.subcommands.approvals import build_approvals_parser
-from hermes_cli.subcommands.dump import build_dump_parser
-from hermes_cli.subcommands.debug import build_debug_parser
-from hermes_cli.subcommands.backup import build_backup_parser
-from hermes_cli.subcommands.import_cmd import build_import_cmd_parser
-from hermes_cli.subcommands.import_agent import build_import_agent_parser
-from hermes_cli.subcommands.config import build_config_parser
-from hermes_cli.subcommands.skin import build_skin_parser
-from hermes_cli.subcommands.console import build_console_parser
-from hermes_cli.subcommands.update import build_update_parser
-from hermes_cli.subcommands.uninstall import build_uninstall_parser
-from hermes_cli.subcommands.dashboard import build_dashboard_parser, build_serve_parser
-from hermes_cli.subcommands.gui import build_gui_parser
-from hermes_cli.subcommands.logs import build_logs_parser
-from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
-from hermes_cli.subcommands.memory import build_memory_parser
-from hermes_cli.subcommands.acp import build_acp_parser
-from hermes_cli.subcommands.tools import build_tools_parser
-from hermes_cli.subcommands.insights import build_insights_parser
-from hermes_cli.subcommands.monitoring import build_monitoring_parser
-from hermes_cli.subcommands.skills import build_skills_parser
-from hermes_cli.subcommands.pairing import build_pairing_parser
-from hermes_cli.subcommands.plugins import build_plugins_parser
-from hermes_cli.subcommands.mcp import build_mcp_parser
-from hermes_cli.subcommands.claw import build_claw_parser
-from hermes_cli.subcommands.moa import build_moa_parser
-from hermes_cli.subcommands.fallback import build_fallback_parser
-from hermes_cli.subcommands.worktree import build_worktree_parser
-from hermes_cli.subcommands.browser import build_browser_parser
-from hermes_cli.subcommands.secrets import build_secrets_parser
-from hermes_cli.subcommands.egress import build_egress_parser
-from hermes_cli.subcommands.migrate import build_migrate_parser
-from hermes_cli.subcommands.checkpoints import build_checkpoints_parser
-from hermes_cli.subcommands.bundles import build_bundles_parser
-from hermes_cli.subcommands.curator import build_curator_parser
-from hermes_cli.subcommands.pets import build_pets_parser
-from hermes_cli.subcommands.journey import build_journey_parser
-from hermes_cli.subcommands.computer_use import build_computer_use_parser
-from hermes_cli.subcommands.sessions import build_sessions_parser
-from hermes_cli.subcommands.completion import build_completion_parser
 
 
 def _require_tty(command_name: str) -> None:
@@ -500,10 +437,26 @@ def _apply_profile_override() -> None:
     # HERMES_HOME already set with no explicit flag: trust it only when it
     # points at a specific profile dir ("profiles" as immediate parent). If it
     # points at the hermes root (systemd hardcodes HERMES_HOME=/root/.hermes)
-    # we must still read active_profile — the user may have run
+    # still read active_profile — the user may have run
     # `hermes profile use` and the gateway should honour it (#22502).
     hermes_home_env = os.environ.get("HERMES_HOME", "")
+    if hermes_home_env:
+        try:
+            from hermes_cli.profiles import _profile_root_from_home
+
+            _profile_root_from_home(hermes_home_env)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
     if profile_name is None and hermes_home_env and Path(hermes_home_env).parent.name == "profiles":
+        from hermes_cli.profiles import build_profile_launch_env
+
+        try:
+            launch_env = build_profile_launch_env(Path(hermes_home_env), base_env=os.environ)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        os.environ.update({key: launch_env[key] for key in ("HERMES_HOME", "HOME", "HERMES_REAL_HOME")})
         return
 
     if profile_name is None and not _under_gateway_supervisor(argv):
@@ -519,24 +472,38 @@ def _apply_profile_override() -> None:
             pass  # corrupted file, skip
 
     if profile_name is None:
+        if hermes_home_env:
+            try:
+                from hermes_cli.profiles import build_profile_launch_env
+
+                launch_env = build_profile_launch_env("default", base_env=os.environ)
+            except (FileNotFoundError, ValueError) as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(1)
+            os.environ.update({key: launch_env[key] for key in ("HERMES_HOME", "HOME", "HERMES_REAL_HOME")})
         return
     try:
-        from hermes_cli.profiles import resolve_profile_env
+        from hermes_cli.profiles import build_profile_launch_env
 
-        hermes_home = resolve_profile_env(profile_name)
+        launch_env = build_profile_launch_env(profile_name, base_env=os.environ)
     except FileNotFoundError as exc:
-        hermes_home = _resolve_sudo_user_profile_env(profile_name)
-        if not hermes_home:
+        sudo_home = _resolve_sudo_user_profile_env(profile_name)
+        if not sudo_home:
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)
+        from hermes_cli.profiles import build_profile_launch_env
+
+        launch_env = build_profile_launch_env(Path(sudo_home), base_env=os.environ)
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
     except Exception as exc:
-        # A bug in profiles.py must NEVER prevent hermes from starting
-        print(f"Warning: profile override failed ({exc}), using default", file=sys.stderr)
-        return
-    os.environ["HERMES_HOME"] = hermes_home
+        # Profile selection is a security/isolation boundary: never fall back
+        # to the caller's profile after an unexpected resolver failure.
+        print(f"Error: profile override failed closed ({exc})", file=sys.stderr)
+        sys.exit(1)
+    # Commit the three derived home keys only after the complete copied environment is valid.
+    os.environ.update({key: launch_env[key] for key in ("HERMES_HOME", "HOME", "HERMES_REAL_HOME")})
     # Strip the flag from argv so argparse doesn't choke
     if consume > 0 and profile_index is not None:
         start = profile_index + 1  # +1 because argv is sys.argv[1:]
@@ -544,6 +511,73 @@ def _apply_profile_override() -> None:
 
 
 _apply_profile_override()
+
+# The early interface probe is still before heavy command/config imports, but
+# must follow selected-profile binding so it cannot cache a parent profile's
+# display settings.
+_suppress_mouse_residue_early()
+
+# Heavy subcommand imports intentionally follow profile environment binding. Several
+# command modules import config, plugins, MCP, or Path.home() at module scope.
+from hermes_cli.subcommands.cron import build_cron_parser
+from hermes_cli.subcommands.sync import build_sync_parser
+from hermes_cli.subcommands.gateway import build_gateway_parser
+from hermes_cli.subcommands.profile import build_profile_parser
+from hermes_cli.subcommands.model import build_model_parser
+from hermes_cli.subcommands.setup import build_setup_parser
+
+from hermes_cli.subcommands.whatsapp import build_whatsapp_parser, build_whatsapp_cloud_parser
+from hermes_cli.subcommands.slack import build_slack_parser
+from hermes_cli.subcommands.login import build_login_parser
+from hermes_cli.subcommands.logout import build_logout_parser
+from hermes_cli.subcommands.auth import build_auth_parser
+from hermes_cli.subcommands.status import build_status_parser
+from hermes_cli.subcommands.pause import build_pause_parser
+from hermes_cli.subcommands.webhook import build_webhook_parser
+from hermes_cli.subcommands.hooks import build_hooks_parser
+from hermes_cli.subcommands.doctor import build_doctor_parser
+from hermes_cli.subcommands.verify import build_verify_parser
+from hermes_cli.subcommands.security import build_security_parser
+from hermes_cli.subcommands.approvals import build_approvals_parser
+from hermes_cli.subcommands.dump import build_dump_parser
+from hermes_cli.subcommands.debug import build_debug_parser
+from hermes_cli.subcommands.backup import build_backup_parser
+from hermes_cli.subcommands.import_cmd import build_import_cmd_parser
+from hermes_cli.subcommands.import_agent import build_import_agent_parser
+from hermes_cli.subcommands.config import build_config_parser
+from hermes_cli.subcommands.skin import build_skin_parser
+from hermes_cli.subcommands.console import build_console_parser
+from hermes_cli.subcommands.update import build_update_parser
+from hermes_cli.subcommands.uninstall import build_uninstall_parser
+from hermes_cli.subcommands.dashboard import build_dashboard_parser, build_serve_parser
+from hermes_cli.subcommands.gui import build_gui_parser
+from hermes_cli.subcommands.logs import build_logs_parser
+from hermes_cli.subcommands.prompt_size import build_prompt_size_parser
+from hermes_cli.subcommands.memory import build_memory_parser
+from hermes_cli.subcommands.acp import build_acp_parser
+from hermes_cli.subcommands.tools import build_tools_parser
+from hermes_cli.subcommands.insights import build_insights_parser
+from hermes_cli.subcommands.monitoring import build_monitoring_parser
+from hermes_cli.subcommands.skills import build_skills_parser
+from hermes_cli.subcommands.pairing import build_pairing_parser
+from hermes_cli.subcommands.plugins import build_plugins_parser
+from hermes_cli.subcommands.mcp import build_mcp_parser
+from hermes_cli.subcommands.claw import build_claw_parser
+from hermes_cli.subcommands.moa import build_moa_parser
+from hermes_cli.subcommands.fallback import build_fallback_parser
+from hermes_cli.subcommands.worktree import build_worktree_parser
+from hermes_cli.subcommands.browser import build_browser_parser
+from hermes_cli.subcommands.secrets import build_secrets_parser
+from hermes_cli.subcommands.egress import build_egress_parser
+from hermes_cli.subcommands.migrate import build_migrate_parser
+from hermes_cli.subcommands.checkpoints import build_checkpoints_parser
+from hermes_cli.subcommands.bundles import build_bundles_parser
+from hermes_cli.subcommands.curator import build_curator_parser
+from hermes_cli.subcommands.pets import build_pets_parser
+from hermes_cli.subcommands.journey import build_journey_parser
+from hermes_cli.subcommands.computer_use import build_computer_use_parser
+from hermes_cli.subcommands.sessions import build_sessions_parser
+from hermes_cli.subcommands.completion import build_completion_parser
 
 # Windows launcher self-heal — the ``hermes`` command is a COPY of the venv
 # console script staged into the managed bin dir (outside the checkout, since

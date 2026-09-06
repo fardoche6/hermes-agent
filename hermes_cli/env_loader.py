@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 import threading
+from collections.abc import Mapping
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -44,6 +45,115 @@ _PROFILE_MANAGED_ENV_KEYS: frozenset[str] = frozenset({
     "HERMES_ACP_AUTH_METHOD", "HERMES_ACP_AUTO_APPROVE", "HERMES_COPILOT_ACP_COMMAND",
     "HERMES_COPILOT_ACP_ARGS", "COPILOT_CLI_PATH", "COPILOT_ACP_BASE_URL",
 })
+
+_IDENTITY_ENV_KEYS: tuple[str, ...] = ("HERMES_HOME", "HOME", "HERMES_REAL_HOME")
+
+
+def _identity_env_values(home_path: Path) -> dict[str, str]:
+    """Snapshot the validated launch identity that dotenv must not replace."""
+    protected = {
+        key: os.environ[key]
+        for key in _IDENTITY_ENV_KEYS
+        if key in os.environ
+    }
+    # An explicit home argument is authoritative even for callers that have not
+    # mirrored it into the process environment yet.
+    protected["HERMES_HOME"] = str(home_path)
+    return protected
+
+
+def _restore_identity_env(protected: Mapping[str, str]) -> None:
+    """Restore identity keys after a dotenv or managed-env load."""
+    for key, value in protected.items():
+        os.environ[key] = value
+
+
+def _dotenv_disabled() -> bool:
+    value = os.environ.get("PYTHON_DOTENV_DISABLED", "")
+    return value.casefold() in {"1", "true", "t", "yes", "y"}
+
+
+def _protected_dotenv_values(
+    path: Path,
+    *,
+    override: bool,
+    protected: Mapping[str, str],
+    encoding: str,
+) -> dict[str, str | None]:
+    """Parse dotenv with protected identity values participating in interpolation.
+
+    ``python-dotenv``'s ``override=True`` gives file values precedence while
+    resolving variables. Parsing into a private mapping lets ordinary profile
+    values keep that behavior without allowing a file's HOME keys to become the
+    interpolation source for subsequent values.
+    """
+    from dotenv.main import DotEnv
+    from dotenv.variables import parse_variables
+
+    try:
+        raw_values = list(
+            DotEnv(
+                dotenv_path=path,
+                interpolate=False,
+                override=override,
+                encoding=encoding,
+            ).parse()
+        )
+    except UnicodeDecodeError:
+        raw = path.read_bytes()
+        if raw.startswith(codecs.BOM_UTF8):
+            raw = raw[len(codecs.BOM_UTF8) :]
+        raw_values = list(
+            DotEnv(
+                dotenv_path=None,
+                stream=io.StringIO(raw.decode("latin-1")),
+                interpolate=False,
+                override=override,
+                encoding=None,
+            ).parse()
+        )
+
+    resolved: dict[str, str | None] = {}
+    for name, raw_value in raw_values:
+        if name in protected:
+            resolved[name] = protected[name]
+            continue
+        if raw_value is None:
+            resolved[name] = None
+            continue
+        if override:
+            interpolation_env: dict[str, str | None] = dict(os.environ)
+            interpolation_env.update(resolved)
+        else:
+            interpolation_env = dict(resolved)
+            interpolation_env.update(os.environ)
+        interpolation_env.update(protected)
+        resolved[name] = "".join(
+            atom.resolve(interpolation_env) for atom in parse_variables(raw_value)
+        )
+    return resolved
+
+
+def _apply_protected_dotenv(
+    path: Path,
+    *,
+    override: bool,
+    protected: Mapping[str, str],
+) -> None:
+    if _dotenv_disabled():
+        return
+    values = _protected_dotenv_values(
+        path,
+        override=override,
+        protected=protected,
+        encoding="utf-8-sig",
+    )
+    for key, value in values.items():
+        if key in protected or value is None:
+            continue
+        if override or key not in os.environ:
+            os.environ[key] = value
+    _restore_identity_env(protected)
 
 
 def _env_keys_defined_in_dotenv(path: Path) -> set[str]:
@@ -224,7 +334,16 @@ def _sanitize_loaded_credentials() -> None:
         )
 
 
-def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
+def _load_dotenv_with_fallback(
+    path: Path,
+    *,
+    override: bool,
+    protected_identity: Mapping[str, str] | None = None,
+) -> None:
+    if protected_identity is not None:
+        _apply_protected_dotenv(path, override=override, protected=protected_identity)
+        _sanitize_loaded_credentials()  # httpx encodes headers as ASCII
+        return
     try:
         # utf-8-sig strips a leading BOM (PowerShell 5.1 / Notepad); plain utf-8 would keep U+FEFF on the
         # first key name and silently drop it from os.environ under its canonical name.
@@ -317,6 +436,7 @@ def load_hermes_dotenv(
     """Load Hermes env files: ``~/.hermes/.env`` overrides stale shell exports; project ``.env`` is a dev
     fallback that only fills gaps when the user env exists (and overrides shell vars when it does not)."""
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+    protected_identity = _identity_env_values(home_path)
 
     # Multiplex gateway: while a routed profile-home override is active, copying that profile's .env
     # into os.environ would expose its credentials to sibling turns and every spawned child. Unscoped
@@ -347,7 +467,11 @@ def load_hermes_dotenv(
         _sanitize_env_file_if_needed(project_env_path)
 
     if user_env.exists():
-        _load_dotenv_with_fallback(user_env, override=True)
+        _load_dotenv_with_fallback(
+            user_env,
+            override=True,
+            protected_identity=protected_identity,
+        )
         loaded.append(user_env)
         _clear_known_keys_missing_from_dotenv(user_env)  # mirrors reload_env(): inherited keys must not leak
 
@@ -356,10 +480,18 @@ def load_hermes_dotenv(
     # the committed .env. override=False lets a systemd `EnvironmentFile=-…/.op.env` token win.
     op_env = home_path / ".op.env"
     if op_env.exists() and not os.environ.get("OP_SERVICE_ACCOUNT_TOKEN"):
-        _load_dotenv_with_fallback(op_env, override=False)
+        _load_dotenv_with_fallback(
+            op_env,
+            override=False,
+            protected_identity=protected_identity,
+        )
 
     if project_env_path and project_env_path.exists():
-        _load_dotenv_with_fallback(project_env_path, override=not loaded)
+        _load_dotenv_with_fallback(
+            project_env_path,
+            override=not loaded,
+            protected_identity=protected_identity,
+        )
         loaded.append(project_env_path)
 
     # External sources are skipped for the updater (dotenv + managed env still load): ``update`` must not
@@ -377,7 +509,8 @@ def load_hermes_dotenv(
     # managed env still load in both cases; only external source resolution is unnecessary for the updater.
     if load_external_secrets and not _early_recovery._should_skip_external_secret_sources():
         _apply_external_secret_sources(home_path)
-    _apply_managed_env()
+    _apply_managed_env(protected_identity)
+    _restore_identity_env(protected_identity)
 
     # config.yaml owns terminal.*, but the override=True loads above let a stale TERMINAL_ENV=docker in
     # ~/.hermes/.env win on every reload and flip the backend mid-session in long-lived processes.
@@ -407,9 +540,12 @@ def _reapply_terminal_config_bridge(home_path: Path) -> None:
         pass
 
 
-def _apply_managed_env() -> None:
-    """Apply the managed-scope .env last, with override, so it beats user/shell. Does NOT stop the agent
-    from later mutating os.environ (v1 relies on filesystem permissions). Fail-open: never blocks startup."""
+def _apply_managed_env(protected_identity: Mapping[str, str]) -> None:
+    """Apply the managed-scope .env last, with override, so it beats user/shell.
+
+    Identity keys remain owned by the selected launch environment even when the
+    managed overlay contains stale values.
+    """
     try:
         from hermes_cli import managed_scope
 
@@ -422,7 +558,11 @@ def _apply_managed_env() -> None:
     if not managed_env.exists():
         return
     _sanitize_env_file_if_needed(managed_env)
-    _load_dotenv_with_fallback(managed_env, override=True)
+    _load_dotenv_with_fallback(
+        managed_env,
+        override=True,
+        protected_identity=protected_identity,
+    )
 
 
 def _apply_external_secret_sources(home_path: Path) -> None:

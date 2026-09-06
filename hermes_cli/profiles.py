@@ -13,11 +13,17 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
 from hermes_cli.archive_safe import archive_root_dirs, make_targz, normalize_archive_parts, safe_extract_targz
-from hermes_constants import clear_named_profile_deleted, mark_named_profile_deleted, named_profile_is_deleted
+from hermes_constants import (
+    _windows_hermes_home,
+    clear_named_profile_deleted,
+    mark_named_profile_deleted,
+    named_profile_home,
+    named_profile_is_deleted,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1677,31 +1683,237 @@ def rename_profile(old_name: str, new_name: str) -> Path:
 
 # Profile env resolution (called from _apply_profile_override)
 
-def resolve_profile_env(profile_name: str) -> str:
+def _require_absolute_home(raw_home: str | Path) -> Path:
+    """Return an absolute configured home, rejecting ambiguous relative input."""
+    raw = os.fspath(raw_home).strip()
+    if not raw:
+        raise ValueError("HERMES_HOME cannot be empty when explicitly configured")
+    expanded = Path(raw).expanduser()
+    if not expanded.is_absolute():
+        raise ValueError(f"HERMES_HOME must be an absolute path, got {raw!r}")
+    return expanded
+
+
+def _platform_profile_root(env: Mapping[str, str] | None = None) -> Path:
+    """Return the platform default root without consulting inherited ``HERMES_HOME``."""
+    from hermes_constants import _get_platform_default_hermes_home
+
+    if env is None:
+        return _require_absolute_home(_get_platform_default_hermes_home())
+    if sys.platform == "win32":
+        local_appdata = str(env.get("LOCALAPPDATA", "")).strip()
+        if local_appdata:
+            return _require_absolute_home(Path(local_appdata) / "hermes")
+    raw_home = str(
+        env.get("HOME") or env.get("HERMES_REAL_HOME") or env.get("USERPROFILE") or ""
+    ).strip()
+    if raw_home:
+        home = _require_absolute_home(raw_home)
+        if sys.platform == "win32":
+            return _require_absolute_home(_windows_hermes_home(env.get("LOCALAPPDATA"), home))
+        return _require_absolute_home(home / ".hermes")
+    return _require_absolute_home(_get_platform_default_hermes_home())
+
+
+def _is_canonical_profiles_root(root: str | Path) -> bool:
+    """Return whether *root* has an independently provable Hermes profile anchor.
+
+    A lexical ``profiles`` segment is not proof: ``/srv/profiles/cache`` is just as
+    plausible as ``<hermes-root>/profiles/<name>``.  Accept the platform default,
+    the conventional ``.hermes`` root, or a custom root carrying one of Hermes'
+    own markers.  The caller may still use an explicitly configured root-shaped
+    ``HERMES_HOME``; this predicate is for re-anchoring profile-shaped values.
+    """
+    root_path = _require_absolute_home(root)
+    if root_path.name == ".hermes":
+        return True
+    try:
+        if root_path.resolve(strict=False) == _platform_profile_root().resolve(strict=False):
+            return True
+    except OSError:
+        pass
+    try:
+        return bool(
+            (root_path / "profiles" / ".deleted").is_dir()
+            or any((root_path / marker).exists() for marker in ("config.yaml", ".env", "state.db"))
+        )
+    except OSError:
+        return False
+
+
+def _explicit_managed_profile_home(path: str | Path) -> Path | None:
+    """Find a live profile owner from its own managed ``home/`` marker.
+
+    Custom deployment roots may be intentionally markerless. An explicit
+    profile path or copied ``HOME=<profile>/home`` still carries enough
+    evidence when that profile home exists; a bare ``profiles/<name>`` path
+    without the marker remains rejected by the canonical resolver.
+    """
+    current = Path(path)
+    for possible_owner in (current, *current.parents):
+        if (
+            possible_owner.parent.name == "profiles"
+            and not possible_owner.name.startswith(".")
+            and possible_owner.is_dir()
+            and (possible_owner / "home").is_dir()
+        ):
+            return possible_owner
+    return None
+
+
+def _canonical_named_profile_home(path: str | Path) -> Path | None:
+    """Return a named profile home only after independently proving its root."""
+    owner = named_profile_home(path) or _explicit_managed_profile_home(path)
+    if owner is None:
+        return None
+    root = owner.parent.parent
+    if _is_canonical_profiles_root(root):
+        return owner
+    # For markerless custom roots, the profile's managed home is the explicit
+    # anchor. Do not broaden this to arbitrary profiles/<name> directories.
+    return owner if (owner / "home").is_dir() else None
+
+
+def _profile_root_from_home(home: str | Path | None) -> Path:
+    """Resolve the canonical root represented by an inherited Hermes home.
+
+    A named profile (or its managed ``home/`` descendant) is re-anchored only
+    after its root has an independent Hermes anchor. A path that merely happens
+    to have ``profiles`` as its parent is rejected rather than silently
+    reinterpreted as a different root.
+    """
+    if home is None or not str(home).strip():
+        return _platform_profile_root()
+
+    candidate = _require_absolute_home(home)
+    owner = _canonical_named_profile_home(candidate)
+    if owner is not None:
+        return _require_absolute_home(owner.parent.parent)
+
+    # ``<root>/profiles/<name>`` is meaningful only when the profiles directory is
+    # anchored to a real Hermes root. Do not guess for an unrelated path such as
+    # ``/srv/profiles/buildcache``.
+    if candidate.parent.name == "profiles":
+        raise ValueError(
+            f"HERMES_HOME is not anchored to a Hermes profiles root: {candidate}"
+        )
+
+    # Explicit custom roots are valid when they are root-shaped rather than a
+    # profile-shaped path. Keep the configured spelling for junction/symlink users.
+    return candidate
+
+
+def _profile_root_from_env(env: Mapping[str, str], *, use_process_home: bool = False) -> Path:
+    """Resolve the profile root represented by a copied launch environment."""
+    configured = _configured_hermes_home(env)
+    if configured:
+        return _profile_root_from_home(configured)
+
+    inherited_home = str(env.get("HOME", "")).strip()
+    owner = _canonical_named_profile_home(inherited_home) if inherited_home else None
+    if owner is not None:
+        return _require_absolute_home(owner.parent.parent)
+    if inherited_home:
+        candidate = _require_absolute_home(inherited_home)
+        if candidate.parent.name == "profiles" or (
+            candidate.name == "home" and candidate.parent.parent.parent.name == "profiles"
+        ):
+            raise ValueError(f"HOME is not anchored to a Hermes profiles root: {candidate}")
+    return _platform_profile_root(None if use_process_home else env)
+
+
+def _configured_hermes_home(env: Mapping[str, str] | None = None) -> str:
+    """Read HERMES_HOME from *env*, or from the process when no mapping is supplied."""
+    if env is not None:
+        return str(env.get("HERMES_HOME", "")).strip()
+    return os.environ.get("HERMES_HOME", "").strip()
+
+
+def _target_profile_home(
+    profile_name: str | Path,
+    *,
+    env: Mapping[str, str],
+    use_process_home: bool = False,
+) -> Path:
+    """Resolve a profile id or validate an already-resolved profile home."""
+    raw = os.fspath(profile_name)
+    if Path(raw).expanduser().is_absolute():
+        target = _require_absolute_home(raw)
+        default_home = _profile_root_from_env(env, use_process_home=use_process_home)
+        if target == default_home:
+            return target
+
+        owner = _canonical_named_profile_home(target)
+        if owner == target:
+            if not target.is_dir() or named_profile_is_deleted(target):
+                raise _missing_profile_error(target.name)
+            return target
+
+        # Dashboard/TUI callers pass an already-resolved absolute target. A
+        # root-shaped inherited HERMES_HOME is an explicit custom-root anchor,
+        # even when that custom root has not yet acquired a marker file.
+        configured_root = _profile_root_from_env(env, use_process_home=use_process_home)
+        expected = configured_root / "profiles" / target.name
+        if target == expected:
+            validate_profile_name(target.name)
+            if not target.is_dir() or named_profile_is_deleted(target):
+                raise _missing_profile_error(target.name)
+            return target
+        raise ValueError(f"Target profile home is not a canonical Hermes profile: {target}")
+    return Path(resolve_profile_env(str(profile_name), env=env, _use_process_home=use_process_home))
+
+
+def resolve_profile_env(
+    profile_name: str,
+    *,
+    env: Mapping[str, str] | None = None,
+    _use_process_home: bool = False,
+) -> str:
     """Resolve a profile name to a HERMES_HOME path string. Called early in the CLI entry
     point, before hermes modules are imported, to set HERMES_HOME.
 
-    When HERMES_HOME is already set, the configured spelling IS the launch root (it may be a
-    junction/symlink alias of the platform default). Keep that spelling so profile re-home does not destroy
-    the launcher's lexical provenance -- the subprocess sanitizer needs it to match Hermes-owned PYTHONPATH
-    entries written in the same spelling (#82581 junction follow-up). Physically the paths are identical
-    (junction-transparent); only the spelling is preserved.
+    When HERMES_HOME is already set, distinguish a root-shaped value from a canonical named-profile
+    value or managed-home descendant. Relative and unanchored profile-shaped values fail before any
+    environment mutation or child spawn.
     """
     canon = _canon_valid(profile_name)
-    env_home = os.environ.get("HERMES_HOME", "").strip()
-    if env_home:
-        env_path = Path(env_home)
-        # A profile-shaped env value means the root is the grandparent (mirrors
-        # get_default_hermes_root()).
-        root = env_path.parent.parent if env_path.parent.name == "profiles" else env_path
-    else:
-        root = _get_default_hermes_home()
+    root = _profile_root_from_env(
+        os.environ if env is None else env,
+        use_process_home=env is None or _use_process_home,
+    )
     if canon == "default":
         return str(root)
     profile_dir = root / "profiles" / canon
     if not profile_dir.is_dir() or named_profile_is_deleted(profile_dir):
         raise _missing_profile_error(canon)
     return str(profile_dir)
+
+
+def build_profile_launch_env(
+    profile_name: str | Path,
+    *,
+    base_env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Return a copied environment atomically bound to one profile.
+
+    The returned mapping derives ``HERMES_HOME``, ``HOME``, and
+    ``HERMES_REAL_HOME`` together. The caller's mapping is never mutated. ``profile_name`` may
+    also be the already-resolved canonical profile directory for dashboard/TUI callers.
+    """
+    use_process_home = base_env is None or base_env is os.environ
+    env = dict(os.environ if base_env is None else base_env)
+    target_home = _target_profile_home(profile_name, env=env, use_process_home=use_process_home)
+
+    from hermes_constants import get_real_home
+
+    # Resolve the account home before replacing HERMES_HOME; otherwise a parent managed HOME can
+    # be mistaken for the target's real home.
+    real_home = get_real_home(env)
+    env["HERMES_HOME"] = str(target_home)
+    env["HERMES_REAL_HOME"] = real_home
+    target_tool_home = target_home / "home"
+    env["HOME"] = str(target_tool_home) if target_tool_home.is_dir() else real_home
+    return env
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

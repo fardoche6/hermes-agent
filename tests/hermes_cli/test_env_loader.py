@@ -195,6 +195,37 @@ def test_latin1_fallback_stream_preserves_interpolation(tmp_path, monkeypatch):
     assert os.getenv("BAR") == "bar"
     assert os.getenv("LATIN1_VALUE") == "café"
 
+
+def test_selected_identity_wins_over_profile_dotenv_and_interpolation(tmp_path, monkeypatch):
+    """A target .env cannot retarget the launch identity or its references."""
+    home = tmp_path / "root" / "profiles" / "target"
+    home.mkdir(parents=True)
+    target_tool_home = home / "home"
+    target_tool_home.mkdir()
+    selected_real = tmp_path / "real-home"
+    selected_real.mkdir()
+    parent = tmp_path / "root" / "profiles" / "parent"
+    (home / ".env").write_text(
+        f"HERMES_HOME={parent}\n"
+        f"HOME={parent / 'home'}\n"
+        f"HERMES_REAL_HOME={parent / 'real-home'}\n"
+        "TARGET_PROFILE_ROOT=${HERMES_HOME}\n"
+        "TARGET_PROFILE_HOME=${HOME}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HOME", str(target_tool_home))
+    monkeypatch.setenv("HERMES_REAL_HOME", str(selected_real))
+
+    loaded = load_hermes_dotenv(hermes_home=home)
+
+    assert loaded == [home / ".env"]
+    assert os.environ["HERMES_HOME"] == str(home)
+    assert os.environ["HOME"] == str(target_tool_home)
+    assert os.environ["HERMES_REAL_HOME"] == str(selected_real)
+    assert os.environ["TARGET_PROFILE_ROOT"] == str(home)
+    assert os.environ["TARGET_PROFILE_HOME"] == str(target_tool_home)
+
 # ---------------------------------------------------------------------------
 # UTF-16 / UTF-32 .env sanitizer coverage
 #
