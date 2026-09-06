@@ -17,6 +17,7 @@ import httpx
 import pytest
 
 from run_agent import AIAgent
+from agent.api_error_summary import ApiErrorSummaryMixin
 
 
 def _make_empty_body_error(response_text: str, status_code: int = 400) -> Exception:
@@ -96,3 +97,183 @@ def test_unread_streaming_response_does_not_crash_and_falls_back_to_exception_me
     summary = AIAgent._summarize_api_error(err)
     assert "HTTP 429" in summary
     assert "Gemini HTTP 429: quota exceeded" in summary
+
+
+def _summary_error_cases():
+    body_error = Exception("body error")
+    body_error.status_code = 400
+    body_error.body = {
+        "error": {
+            "message": (
+                "GET https://api.example.test/v1?token=SYN_SUMMARY_BODY&view=public "
+                "status=400"
+            ),
+            "type": "invalid_request_error",
+        }
+    }
+
+    response_error = Exception("response error")
+    response_error.status_code = 502
+    response_error.body = {}
+    response_error.response = SimpleNamespace(
+        text="proxy echoed https://api.example.test/v1?key=SYN_SUMMARY_RESPONSE&safe=ok"
+    )
+
+    fallback_error = Exception(
+        "provider failed at https://api.example.test/v1?token=SYN_SUMMARY_FALLBACK&safe=ok"
+    )
+    fallback_error.status_code = 500
+
+    return (
+        (body_error, "SYN_SUMMARY_BODY"),
+        (response_error, "SYN_SUMMARY_RESPONSE"),
+        (fallback_error, "SYN_SUMMARY_FALLBACK"),
+    )
+
+
+@pytest.mark.parametrize("error, synthetic_secret", _summary_error_cases())
+def test_api_error_summary_redacts_query_credentials_on_all_summary_paths(error, synthetic_secret):
+    summary = AIAgent._summarize_api_error(error)
+
+    assert synthetic_secret not in summary
+    assert "api.example.test" in summary
+
+
+def test_clean_error_message_redacts_query_credentials_for_display():
+    message = "provider returned https://api.example.test/v1?token=SYN_CLEAN_MESSAGE&safe=ok"
+
+    cleaned = ApiErrorSummaryMixin()._clean_error_message(message)
+
+    assert "SYN_CLEAN_MESSAGE" not in cleaned
+    assert "api.example.test" in cleaned
+
+
+def test_deep_json_parser_failure_is_contained_and_bounded():
+    marker = "SYN_DEEP_JSON_QUERY"
+    error = Exception("provider failed at https://api.example.test/?token=" + marker)
+    error.status_code = 502
+    error.body = {}
+    error.response = SimpleNamespace(
+        text="[" * 1200 + '"' + marker + '"' + "]" * 1200,
+    )
+
+    summary = AIAgent._summarize_api_error(error)
+
+    assert marker not in summary
+    assert len(summary) <= 500
+    assert summary.startswith("HTTP 502:")
+
+
+def test_cyclic_structured_detail_fails_closed():
+    marker = "SYN_CYCLIC_DETAIL"
+    cyclic = {}
+    cyclic["detail"] = cyclic
+    error = Exception("provider failed " + marker)
+    error.status_code = 400
+    error.body = {"error": {"message": cyclic}}
+
+    summary = AIAgent._summarize_api_error(error)
+
+    assert marker not in summary
+    assert len(summary) <= 300
+
+
+def test_deep_structured_detail_is_bounded_by_depth():
+    marker = "SYN_DEEP_STRUCTURED_DETAIL"
+    nested = marker
+    for _ in range(32):
+        nested = {"detail": nested}
+    error = Exception("provider returned structured detail")
+    error.status_code = 400
+    error.body = {"error": {"message": nested}}
+
+    summary = AIAgent._summarize_api_error(error)
+
+    assert marker not in summary
+    assert len(summary) <= 300
+
+
+def test_fallback_preserves_the_prior_500_character_limit():
+    marker = "SYN_FALLBACK_BOUND_QUERY"
+    error = Exception(
+        "provider failed at https://api.example.test/?token=" + marker + " " + ("safe " * 300)
+    )
+    error.status_code = 500
+
+    summary = AIAgent._summarize_api_error(error)
+
+    assert marker not in summary
+    assert len(summary) <= 500
+
+
+def test_exception_string_failure_never_escapes_raw_text():
+    class _UnstringableError(Exception):
+        def __str__(self):
+            raise RuntimeError("SYN_STRING_COERCION_FAILURE")
+
+    summary = AIAgent._summarize_api_error(_UnstringableError())
+
+    assert "SYN_STRING_COERCION_FAILURE" not in summary
+    assert len(summary) <= 500
+
+
+def test_auxiliary_warning_does_not_emit_raw_parser_input(monkeypatch):
+    marker = "SYN_WARNING_QUERY"
+    error = Exception("provider failed at https://api.example.test/?token=" + marker)
+    error.status_code = 502
+    error.body = {}
+    error.response = SimpleNamespace(text="[" * 1200 + '"' + marker + '"' + "]" * 1200)
+    warnings = []
+    agent = object.__new__(AIAgent)
+    monkeypatch.setattr(agent, "_emit_warning", warnings.append)
+
+    AIAgent._emit_auxiliary_failure(agent, "summary", error)
+
+    assert warnings
+    assert marker not in warnings[0]
+
+
+def test_api_error_summary_redacts_non_ascii_prefixed_structured_body():
+    message = (
+        "synthetic prefix İ before fields "
+        '{"Authorization": "Bearer SYN_NONASCII_SUMMARY_AUTH", '
+        '"X-Api-Key": "SYN_NONASCII_SUMMARY_API", '
+        '"Cookie": "sid=SYN_NONASCII_SUMMARY_COOKIE", '
+        '"Set-Cookie": "sid=SYN_NONASCII_SUMMARY_SET; Path=/; Secure; HttpOnly", '
+        '"safe": "public"}'
+    )
+    error = Exception("synthetic provider failure")
+    error.status_code = 500
+    error.body = {"error": {"message": message}}
+
+    summary = AIAgent._summarize_api_error(error)
+
+    for marker in (
+        "SYN_NONASCII_SUMMARY_AUTH", "SYN_NONASCII_SUMMARY_API",
+        "SYN_NONASCII_SUMMARY_COOKIE", "SYN_NONASCII_SUMMARY_SET",
+    ):
+        assert marker not in summary
+    assert "synthetic prefix İ" in summary
+    assert '"safe": "public"' in summary
+
+
+def test_pathological_status_metadata_uses_total_safe_summary_and_warning():
+    marker = "SYN_PATHOLOGICAL_STATUS"
+
+    class _PathologicalStatus(int):
+        def __format__(self, _spec):
+            raise ValueError(marker)
+
+    error = Exception(marker)
+    error.status_code = _PathologicalStatus(500)
+
+    summary = AIAgent._summarize_api_error(error)
+    warnings = []
+    agent = object.__new__(AIAgent)
+    agent._emit_warning = warnings.append
+    AIAgent._emit_auxiliary_failure(agent, "summary", error)
+
+    assert summary == "Provider returned an error."
+    assert warnings == ["⚠ Auxiliary summary failed: Provider returned an error."]
+    assert marker not in summary
+    assert marker not in warnings[0]

@@ -9,6 +9,7 @@ import os
 import re
 import shlex
 import threading
+from typing import Optional
 from urllib.parse import unquote_plus
 
 # Shared with agent/file_safety's read-block list so the two defenses can't
@@ -339,7 +340,19 @@ _STRICT_URL_PARAM_RE = re.compile(r"([?#&;])([A-Za-z0-9_.~+%\-]+)=([^#&;\s\"'<>]
 # authority stops at path/query/fragment delimiters. Anchored on the mandatory
 # ``//`` — an optional-scheme prefix backtracked O(n²) on long alphanumeric runs
 # (~55s per sub() on a 320KB compaction payload).
-_STRICT_URL_USERINFO_RE = re.compile(r"(//)([^/\s?#@]+)@")
+_STRICT_URL_USERINFO_RE = re.compile(r"(//)([^/\s?#]*@)([^/\s?#]+)")
+
+# Header names handled by the persisted-diagnostic policy. Ordinary tool-flow
+# redaction deliberately does not use this list: structured credential policy
+# belongs at the persistence/display boundary only.
+_PERSISTED_AUTH_HEADER_NAMES = (
+    "proxy-authorization", "authorization", "x-api-key", "x-goog-api-key",
+    "api-key", "apikey", "x-api-token", "x-auth-token", "x-access-token",
+)
+_COOKIE_NAME_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+_COOKIE_SAFE_ATTRIBUTES = frozenset({
+    "path", "domain", "expires", "max-age", "samesite", "secure", "httponly",
+})
 
 # Form-urlencoded body: only when the ENTIRE text is a k=v&k=v string.
 _FORM_BODY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*=[^&\s]*(?:&[A-Za-z_][A-Za-z0-9_.-]*=[^&\s]*)+$")
@@ -447,9 +460,14 @@ def _redact_strict_url_credentials(text: str) -> str:
     text = _STRICT_URL_PARAM_RE.sub(
         lambda m: f"{m.group(1)}{m.group(2)}=***"
         if _canonical_url_param_name(m.group(2)) in _SENSITIVE_QUERY_PARAMS else m.group(0), text)
-    return _STRICT_URL_USERINFO_RE.sub(
-        lambda m: f"{m.group(1)}{m.group(2).partition(':')[0]}:***@" if ":" in m.group(2) else f"{m.group(1)}***@",
-        text)
+
+    def _redact_userinfo(match: re.Match) -> str:
+        userinfo = match.group(2)[:-1]
+        if ":" in userinfo:
+            return f"{match.group(1)}{userinfo.partition(':')[0]}:***@{match.group(3)}"
+        return f"{match.group(1)}***@{match.group(3)}"
+
+    return _STRICT_URL_USERINFO_RE.sub(_redact_userinfo, text)
 
 
 def redact_cdp_url(value: object) -> str:
@@ -640,6 +658,490 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
         text = _SIGNAL_PHONE_RE.sub(_redact_phone, text)
 
     return text
+
+
+_PERSISTED_DIAGNOSTIC_DEFAULT_LIMIT = 8192
+_PERSISTED_DIAGNOSTIC_FAILURE = "[redaction-unavailable]"
+_PERSISTED_DIAGNOSTIC_TRUNCATION = "…[truncated]…"
+
+
+def _ascii_lower(value: str) -> str:
+    """Lower only ASCII letters; unlike ``casefold`` this never changes string length."""
+    return "".join(chr(ord(char) + 32) if "A" <= char <= "Z" else char for char in value)
+
+
+def _ascii_startswith(text: str, start: int, name: str) -> bool:
+    """ASCII-case-insensitive ``startswith`` against the original text."""
+    end = start + len(name)
+    if start < 0 or end > len(text):
+        return False
+    return all(
+        (chr(ord(actual) + 32) if "A" <= actual <= "Z" else actual) == expected
+        for actual, expected in zip(text[start:end], name)
+    )
+
+
+def _escaped_quote_at(text: str, start: int) -> Optional[tuple[int, int, int]]:
+    """Return ``(backslash_start, quote_index, escape_depth)`` at ``start``."""
+    if start >= len(text):
+        return None
+    quote_index = start
+    while quote_index < len(text) and text[quote_index] == "\\":
+        quote_index += 1
+    if quote_index >= len(text) or text[quote_index] not in "\"'":
+        return None
+    return start, quote_index, quote_index - start
+
+
+def _matching_escaped_quote(text: str, quote_index: int, quote: str, escape_depth: int) -> Optional[int]:
+    """Find a closing quote at the opener's escape layer.
+
+    Extra pairs of backslashes immediately before a quote are content, not a
+    new escape layer.  Thus a JSON string ending in an escaped backslash has
+    ``escape_depth + 2`` backslashes before its closing quote and is valid.
+    """
+    position = quote_index + 1
+    while position < len(text):
+        if text[position] == quote:
+            backslashes = 0
+            before = position - 1
+            while before >= 0 and text[before] == "\\":
+                backslashes += 1
+                before -= 1
+            if backslashes >= escape_depth and (backslashes - escape_depth) % 2 == 0:
+                return position
+        position += 1
+    return None
+
+
+def _find_balanced_container_end(text: str, start: int) -> tuple[int, bool]:
+    """Find a JSON-like container end and report whether its structure is complete."""
+    closing = {"[": "]", "{": "}"}
+    if start >= len(text) or text[start] not in closing:
+        return start, False
+    stack = [closing[text[start]]]
+    position = start + 1
+    while position < len(text):
+        quoted = _escaped_quote_at(text, position)
+        if quoted is not None:
+            _, quote_index, escape_depth = quoted
+            end_quote = _matching_escaped_quote(text, quote_index, text[quote_index], escape_depth)
+            if end_quote is None:
+                return len(text), False
+            position = end_quote + 1
+            continue
+        if text[position] in closing:
+            stack.append(closing[text[position]])
+        elif text[position] in closing.values():
+            if not stack or text[position] != stack[-1]:
+                return len(text), False
+            stack.pop()
+            if not stack:
+                return position + 1, True
+        position += 1
+    return len(text), False
+
+
+def _quoted_context_map(text: str) -> list[bool]:
+    """Record whether each source position is inside an unescaped quote layer."""
+    context = [False] * (len(text) + 1)
+    quote = None
+    backslashes = 0
+    for position, char in enumerate(text):
+        context[position] = quote is not None
+        if char in "\"'" and backslashes % 2 == 0:
+            if quote is None:
+                quote = char
+            elif quote == char:
+                quote = None
+        backslashes = backslashes + 1 if char == "\\" else 0
+    context[len(text)] = quote is not None
+    return context
+
+
+def _find_header_value_span(
+    text: str, start: int, *, inside_quote: bool = False, quote_context: Optional[list[bool]] = None,
+) -> tuple[int, int, Optional[int], Optional[int], bool]:
+    """Return a field value span, inner content span, and structured-parse status."""
+    if start >= len(text):
+        return start, start, None, None, True
+    quoted = _escaped_quote_at(text, start)
+    if quoted is not None:
+        _, quote_index, escape_depth = quoted
+        end_quote = _matching_escaped_quote(text, quote_index, text[quote_index], escape_depth)
+        if end_quote is not None:
+            return start, end_quote + 1, quote_index + 1, end_quote - escape_depth, True
+        line_end = len(text)
+        for delimiter in ("\r", "\n"):
+            candidate = text.find(delimiter, start)
+            if candidate != -1:
+                line_end = min(line_end, candidate)
+        return start, line_end, None, None, False
+    if text[start:start + 1] in {"[", "{"}:
+        value_end, complete = _find_balanced_container_end(text, start)
+        return start, value_end, None, None, complete
+    end = start
+    while end < len(text) and text[end] not in "\r\n":
+        if (
+            inside_quote
+            and text[end] in "\"'"
+            and quote_context is not None
+            and not quote_context[end + 1]
+        ):
+            break
+        if text[end] == "\\":
+            escaped_end = end + 1
+            while escaped_end < len(text) and text[escaped_end] == "\\":
+                escaped_end += 1
+            if escaped_end < len(text) and text[escaped_end] in "nNrR":
+                break
+        end += 1
+    return start, end, None, None, True
+
+
+def _is_header_name_boundary(text: str, start: int, end: int) -> bool:
+    before = text[start - 1] if start else ""
+    after = text[end] if end < len(text) else ""
+    escaped_line_start = (
+        start >= 2 and text[start - 2] == "\\" and before in "nNrR"
+    )
+    return ((not before or (not before.isalnum() and before not in "_-")
+             or escaped_line_start)
+            and (not after or (not after.isalnum() and after not in "_-")))
+
+
+def _next_persisted_header_name(text: str, start: int, names: tuple[str, ...]):
+    """Find the next field name in original-text coordinates.
+
+    The field names are ASCII protocol tokens.  Comparing them in place
+    avoids Unicode case-fold expansions shifting spans for every later field.
+    """
+    normalized = tuple(_ascii_lower(name) for name in names)
+    position = start
+    while position < len(text):
+        candidate = None
+        for name in normalized:
+            end = position + len(name)
+            if _ascii_startswith(text, position, name) and _is_header_name_boundary(text, position, end):
+                if candidate is None or len(name) > len(candidate[2]):
+                    candidate = (position, end, name)
+        if candidate is not None:
+            return candidate
+        position += 1
+    return None
+
+
+def _persisted_header_spans(text: str, names: tuple[str, ...]):
+    """Yield original-text spans for quoted, escaped, container, and plain fields."""
+    quote_context = _quoted_context_map(text)
+    position = 0
+    while position < len(text):
+        candidate = _next_persisted_header_name(text, position, names)
+        if candidate is None:
+            return
+        found, end_name, name = candidate
+        separator = end_name
+        while separator < len(text) and text[separator].isspace():
+            separator += 1
+        closing_key_quote = _escaped_quote_at(text, separator)
+        if closing_key_quote is not None:
+            _, quote_index, _ = closing_key_quote
+            separator = quote_index + 1
+            while separator < len(text) and text[separator].isspace():
+                separator += 1
+        if separator >= len(text) or text[separator] not in ":=":
+            position = found + 1
+            continue
+        value_start = separator + 1
+        while value_start < len(text) and text[value_start].isspace():
+            value_start += 1
+        value_start, value_end, content_start, content_end, structured_ok = _find_header_value_span(
+            text, value_start, inside_quote=quote_context[value_start], quote_context=quote_context
+        )
+        yield found, name, value_start, value_end, content_start, content_end, structured_ok
+        position = max(value_end, found + 1)
+
+
+def _persisted_field_start(text: str, name_start: int) -> int:
+    """Include a quoted/escaped field prefix when protecting it from ordinary redaction."""
+    start = name_start
+    if start and text[start - 1] in "\"'":
+        start -= 1
+        while start and text[start - 1] == "\\":
+            start -= 1
+    return start
+
+
+def _assemble_span_replacements(text: str, replacements) -> str:
+    """Apply ordered, non-overlapping spans in one source-to-output pass."""
+    output = []
+    cursor = 0
+    for start, end, replacement in replacements:
+        if start < cursor or end < start:
+            continue
+        output.append(text[cursor:start])
+        output.append(replacement)
+        cursor = end
+    output.append(text[cursor:])
+    return "".join(output)
+
+
+def _redact_quoted_scalars(value: str, transform, field_name: str) -> tuple[str, bool]:
+    """Apply a transform to every escaped quoted scalar, or fail closed."""
+    output = []
+    source_start = 0
+    position = 0
+    while position < len(value):
+        quoted = _escaped_quote_at(value, position)
+        if quoted is None:
+            position += 1
+            continue
+        _, quote_index, escape_depth = quoted
+        end_quote = _matching_escaped_quote(value, quote_index, value[quote_index], escape_depth)
+        if end_quote is None:
+            return "***", False
+        content_end = end_quote - escape_depth
+        output.append(value[source_start:quote_index + 1])
+        output.append(transform(value[quote_index + 1:content_end], field_name))
+        output.append(value[content_end:end_quote + 1])
+        source_start = end_quote + 1
+        position = end_quote + 1
+    output.append(value[source_start:])
+    return "".join(output), True
+
+
+def _sanitized_persisted_field(text: str, record, transform) -> tuple[int, int, str]:
+    """Build one safe replacement without ever returning an unprocessed field."""
+    name_start, field_name, value_start, value_end, content_start, content_end, structured_ok = record
+    field_start = _persisted_field_start(text, name_start)
+    prefix = text[field_start:value_start]
+    try:
+        if not structured_ok:
+            return field_start, value_end, prefix + "***"
+        if content_start is not None and content_end is not None:
+            replacement = transform(text[content_start:content_end], field_name)
+            return field_start, value_end, text[field_start:content_start] + replacement + text[content_end:value_end]
+        original = text[value_start:value_end]
+        if original[:1] in "[{":
+            replacement, complete = _redact_quoted_scalars(original, transform, field_name)
+            return field_start, value_end, prefix + (replacement if complete else "***")
+        return field_start, value_end, prefix + (transform(original, field_name) or "***")
+    except Exception:
+        return field_start, value_end, prefix + "***"
+
+
+def _persisted_structured_replacements(text: str):
+    """Select all structured credential spans once, then assemble them in one pass.
+
+    A field containing another serialized field is treated as one security boundary:
+    the outer span wins, so an inner parser cannot restore text the outer transform
+    rejected.  There are no sentinels to survive generic redaction and no per-field
+    whole-string rebuilds.
+    """
+    policies = (
+        (_PERSISTED_AUTH_HEADER_NAMES, _redact_persisted_auth_value),
+        (("cookie",), lambda value, _kind: _redact_cookie_pairs(value, set_cookie=False)),
+        (("set-cookie",), lambda value, _kind: _redact_cookie_pairs(value, set_cookie=True)),
+    )
+    candidates = []
+    for policy_order, (names, transform) in enumerate(policies):
+        for record in _persisted_header_spans(text, names):
+            if not record[-1]:
+                return [(0, len(text), _PERSISTED_DIAGNOSTIC_FAILURE)]
+            start, end, replacement = _sanitized_persisted_field(text, record, transform)
+            candidates.append((start, end, policy_order, replacement))
+    candidates.sort(key=lambda item: (item[0], -item[1], item[2]))
+    selected = []
+    occupied_end = -1
+    for start, end, _policy_order, replacement in candidates:
+        if start < occupied_end:
+            continue
+        selected.append((start, end, replacement))
+        occupied_end = end
+    return selected
+
+
+def _redact_persisted_auth_value(value: str, field_name: str) -> str:
+    """Mask API-key fields fully; preserve Authorization's scheme only with credentials."""
+    kind = _ascii_lower(field_name)
+    if kind not in {"authorization", "proxy-authorization"}:
+        return "***"
+    candidate = value.strip()
+    if not candidate:
+        return "***"
+    scheme = re.match(r"([A-Za-z][A-Za-z0-9._+\-]*)([ \t]+)(\S.*)$", candidate)
+    if scheme and scheme.group(3).strip():
+        return f"{scheme.group(1)}{scheme.group(2)}***"
+    return "***"
+
+
+def _cookie_pair_starts_at(value: str, start: int) -> bool:
+    position = start
+    while position < len(value) and value[position] in " \t":
+        position += 1
+    match = _COOKIE_NAME_RE.match(value, position)
+    if match is None:
+        return False
+    position = match.end()
+    while position < len(value) and value[position] in " \t":
+        position += 1
+    return position < len(value) and value[position] == "="
+
+
+def _cookie_value_end(
+    value: str, start: int, *, allow_comma: bool = False,
+) -> tuple[int, Optional[int], int, bool]:
+    quoted = _escaped_quote_at(value, start)
+    if quoted is not None:
+        _, quote_index, escape_depth = quoted
+        end_quote = _matching_escaped_quote(value, quote_index, value[quote_index], escape_depth)
+        if end_quote is None:
+            return len(value), quote_index, escape_depth, False
+        return end_quote + 1, end_quote, escape_depth, True
+    end = start
+    while end < len(value):
+        char = value[end]
+        if char in ";\r\n]}\"'" or (char == "," and not allow_comma) or char.isspace():
+            break
+        end += 1
+    return end, None, 0, True
+
+
+def _cookie_attribute_value_end(value: str, start: int, attribute: str) -> tuple[int, Optional[int], int, bool]:
+    if attribute != "expires":
+        return _cookie_value_end(value, start)
+    quoted = _escaped_quote_at(value, start)
+    if quoted is not None:
+        return _cookie_value_end(value, start)
+    end = start
+    while end < len(value):
+        char = value[end]
+        if char in ";\r\n]}\"'":
+            break
+        if char == "," and _cookie_pair_starts_at(value, end + 1):
+            break
+        end += 1
+    return end, None, 0, True
+
+
+def _redact_cookie_pairs(value: str, *, set_cookie: bool) -> str:
+    """Redact cookie data; Set-Cookie attributes are accepted only positionally."""
+    output = []
+    position = 0
+    cookie_position = True
+    while position < len(value):
+        if value[position] == ",":
+            output.append(",")
+            position += 1
+            cookie_position = _cookie_pair_starts_at(value, position)
+            continue
+        if value[position] == ";":
+            output.append(";")
+            position += 1
+            cookie_position = False
+            continue
+        match = _COOKIE_NAME_RE.match(value, position)
+        if match is None:
+            output.append(value[position])
+            position += 1
+            continue
+        name_end = match.end()
+        equals = name_end
+        while equals < len(value) and value[equals] in " \t":
+            equals += 1
+        if equals >= len(value) or value[equals] != "=":
+            output.append(value[position:name_end])
+            position = name_end
+            cookie_position = False
+            continue
+        value_start = equals + 1
+        while value_start < len(value) and value[value_start] in " \t":
+            value_start += 1
+        name = _ascii_lower(match.group(0))
+        is_safe_value = set_cookie and not cookie_position and name in (
+            _COOKIE_SAFE_ATTRIBUTES - {"secure", "httponly"}
+        )
+        value_end, closing_quote, escape_depth, complete = (
+            _cookie_attribute_value_end(value, value_start, name)
+            if is_safe_value else _cookie_value_end(value, value_start)
+        )
+        output.append(value[position:value_start])
+        if is_safe_value and complete:
+            output.append(value[value_start:value_end])
+        else:
+            opening = _escaped_quote_at(value, value_start)
+            if opening is None:
+                output.append("***")
+            else:
+                _, quote_index, _ = opening
+                output.append(value[value_start:quote_index + 1])
+                output.append("***")
+                if closing_quote is not None and complete:
+                    closing_start = closing_quote - escape_depth
+                    output.append(value[closing_start:closing_quote + 1])
+        position = value_end
+        cookie_position = False
+    return "".join(output)
+
+
+def _safe_truncation_fragment(fragment: str) -> str:
+    """Keep ordinary labels readable while neutralizing query/assignment delimiters."""
+    return fragment.replace("=", "~").replace("/", "|")
+
+
+def _contains_persisted_field_name(text: str) -> bool:
+    names = _PERSISTED_AUTH_HEADER_NAMES + ("cookie", "set-cookie")
+    return _next_persisted_header_name(text, 0, names) is not None
+
+
+def _truncate_persisted_diagnostic(text: str, limit: int) -> str:
+    """Bound redacted text with a second-pass-stable, syntax-neutral context split."""
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    if limit <= len(_PERSISTED_DIAGNOSTIC_TRUNCATION):
+        return _PERSISTED_DIAGNOSTIC_TRUNCATION[:limit]
+    remaining = limit - len(_PERSISTED_DIAGNOSTIC_TRUNCATION)
+    head = (remaining + 1) // 2
+    tail = remaining - head
+    suffix = text[-tail:] if tail else ""
+    candidate = (
+        _safe_truncation_fragment(text[:head])
+        + _PERSISTED_DIAGNOSTIC_TRUNCATION
+        + _safe_truncation_fragment(suffix)
+    )
+    if _contains_persisted_field_name(candidate):
+        return _PERSISTED_DIAGNOSTIC_FAILURE[:limit]
+    return candidate
+
+
+def redact_persisted_diagnostic(
+    text: str, *, limit: Optional[int] = _PERSISTED_DIAGNOSTIC_DEFAULT_LIMIT
+) -> str:
+    """Redact a diagnostic for durable storage or display, always failing closed.
+
+    This is intentionally stricter than :func:`redact_sensitive_text`: persistence and
+    provider-error display must treat URL query parameters and userinfo as credentials.
+    Structured fields are protected and restored through monotonic span passes, then
+    the deterministic output bound is applied.
+    """
+    if limit is None:
+        bounded_limit = None
+    else:
+        try:
+            bounded_limit = max(0, int(limit))
+        except Exception:
+            bounded_limit = _PERSISTED_DIAGNOSTIC_DEFAULT_LIMIT
+
+    try:
+        structured = _persisted_structured_replacements(text)
+        protected = _assemble_span_replacements(text, structured)
+        redacted = redact_sensitive_text(protected, force=True, redact_url_credentials=True)
+        redacted = "" if redacted is None else redacted
+    except Exception:
+        redacted = _PERSISTED_DIAGNOSTIC_FAILURE
+    return redacted if bounded_limit is None else _truncate_persisted_diagnostic(redacted, bounded_limit)
 
 
 # Commands whose stdout is an env-var dump: terminal redaction runs the
@@ -878,4 +1380,4 @@ class RedactingFormatter(logging.Formatter):
     """Log formatter that redacts secrets from all log messages."""
 
     def format(self, record: logging.LogRecord) -> str:
-        return redact_sensitive_text(super().format(record))
+        return redact_persisted_diagnostic(super().format(record))

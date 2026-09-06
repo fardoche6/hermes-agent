@@ -1,10 +1,17 @@
 """Tests for agent.redact -- secret masking in logs and output."""
 
+import json
 import logging
 
 import pytest
 
-from agent.redact import mask_secret, redact_cdp_url, redact_sensitive_text, RedactingFormatter
+from agent.redact import (
+    RedactingFormatter,
+    mask_secret,
+    redact_cdp_url,
+    redact_persisted_diagnostic,
+    redact_sensitive_text,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -369,6 +376,23 @@ class TestRedactingFormatter:
         assert "abc123def456" not in result
         assert "sk-pro" in result
 
+    def test_formats_strict_persisted_diagnostic(self):
+        formatter = RedactingFormatter("%(message)s")
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg="GET https://api.example.test/x?token=SYN_FORMAT_QUERY&view=public",
+            args=(),
+            exc_info=None,
+        )
+
+        result = formatter.format(record)
+
+        assert "SYN_FORMAT_QUERY" not in result
+        assert "https://api.example.test/x?token=***&view=public" in result
+
 
 class TestPrintenvSimulation:
     """Simulate what happens when the agent runs `env` or `printenv`."""
@@ -548,6 +572,112 @@ class TestStrictUrlCredentialRedaction:
     def test_similarly_named_public_params_remain_unchanged(self):
         text = "/metrics?token_count=17&session_id=public"
         assert redact_sensitive_text(text, redact_url_credentials=True) == text
+
+
+_SYN_BARE_USER = "SYN_" + "BARE_USER"
+_SYN_AUTH_HEADER = "SYN_" + "AUTH_HEADER"
+_SYN_API_HEADER = "SYN_" + "API_HEADER"
+
+
+class TestPersistedDiagnosticRedaction:
+    @pytest.mark.parametrize(
+        ("text", "secrets", "expected"),
+        [
+            (
+                "https://api.example.test/x?token=SYN_QUERY_A&token=SYN_QUERY_B&view=public",
+                ("SYN_QUERY_A", "SYN_QUERY_B"),
+                "https://api.example.test/x?token=***&token=***&view=public",
+            ),
+            (
+                "/x?key=SYN_SEMICOLON_A;key=SYN_SEMICOLON_B&state=ok",
+                ("SYN_SEMICOLON_A", "SYN_SEMICOLON_B"),
+                "/x?key=***;key=***&state=ok",
+            ),
+            (
+                "https://api.example.test/cb?client%5Fsecret=SYN_PERCENT&view=public",
+                ("SYN_PERCENT",),
+                "https://api.example.test/cb?client%5Fsecret=***&view=public",
+            ),
+            (
+                "https://api.example.test/cb?client%255Fsecret=SYN_DOUBLE_PERCENT",
+                ("SYN_DOUBLE_PERCENT",),
+                "https://api.example.test/cb?client%255Fsecret=***",
+            ),
+            (
+                "https://api.example.test/cb?token=SYN%5FENCODED_VALUE&view=public",
+                ("SYN%5FENCODED_VALUE",),
+                "https://api.example.test/cb?token=***&view=public",
+            ),
+            (
+                "https://user:SYN_USERINFO@api.example.test/path?view=public",
+                ("SYN_USERINFO",),
+                "https://user:***@api.example.test/path?view=public",
+            ),
+            (
+                "https://" + _SYN_BARE_USER + "@api.example.test/path?view=public",
+                (_SYN_BARE_USER,),
+                "https://***@api.example.test/path?view=public",
+            ),
+            (
+                "GET /x Authorization: Bearer " + _SYN_AUTH_HEADER,
+                (_SYN_AUTH_HEADER,),
+                "GET /x Authorization: Bearer ***",
+            ),
+            (
+                "GET /x X-Api-Key: " + _SYN_API_HEADER,
+                (_SYN_API_HEADER,),
+                "GET /x X-Api-Key: ***",
+            ),
+            (
+                "Cookie: session=SYN_COOKIE_SESSION; csrf=SYN_COOKIE_CSRF",
+                ("SYN_COOKIE_SESSION", "SYN_COOKIE_CSRF"),
+                "Cookie: session=***; csrf=***",
+            ),
+            (
+                "Set-Cookie: sid=SYN_SET_COOKIE; Path=/; HttpOnly; Secure; SameSite=Lax",
+                ("SYN_SET_COOKIE",),
+                "Set-Cookie: sid=***; Path=/; HttpOnly; Secure; SameSite=Lax",
+            ),
+        ],
+    )
+    def test_redacts_http_credentials_and_preserves_safe_context(self, text, secrets, expected):
+        result = redact_persisted_diagnostic(text)
+
+        assert result == expected
+        for secret in secrets:
+            assert secret not in result
+
+    def test_preserves_ordinary_web_url_query_semantics(self):
+        text = "https://api.example.test/callback?token=SYN_ORDINARY_QUERY&view=public"
+        assert redact_sensitive_text(text) == text
+        assert "SYN_ORDINARY_QUERY" not in redact_persisted_diagnostic(text)
+
+    def test_redacts_before_truncating_and_enforces_bound(self):
+        text = (
+            "status=429 https://api.example.test/v1/items?token=SYN_BOUND&limit=20 "
+            + ("safe-context " * 30)
+            + "tail-context"
+        )
+
+        result = redact_persisted_diagnostic(text, limit=96)
+
+        assert len(result) <= 96
+        assert "SYN_BOUND" not in result
+        assert "api.example.test" in result
+        assert "tail-context" in result
+
+    def test_redaction_failure_returns_fixed_safe_marker(self, monkeypatch):
+        def _fail(*_args, **_kwargs):
+            raise RuntimeError("SYN_REDACTOR_ERROR")
+
+        monkeypatch.setattr("agent.redact.redact_sensitive_text", _fail)
+        raw = "https://api.example.test/x?token=SYN_FAILURE"
+
+        result = redact_persisted_diagnostic(raw)
+
+        assert result == "[redaction-unavailable]"
+        assert "SYN_FAILURE" not in result
+        assert "SYN_REDACTOR_ERROR" not in result
 
 
 class TestBareTokenUserinfoRedaction:
@@ -1178,3 +1308,191 @@ class TestValueAwareGatingCorpus:
         result = redact_sensitive_text(block, force=True)
         assert prose_line in result
         assert "A9f3kZq7Lm2Xw8Rt4Yv6" not in result
+
+
+class TestPersistedHttpCredentialCorrection:
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            (
+                "Authorization: Bearer " + "SYN_STRUCT_AUTH_PLAIN",
+                "Authorization: Bearer ***",
+            ),
+            (
+                '{"Authorization": "Bearer ' + "SYN_STRUCT_AUTH_JSON" + '"}',
+                '{"Authorization": "Bearer ***"}',
+            ),
+            (
+                "{'authorization': 'Bearer " + "SYN_STRUCT_AUTH_SINGLE" + "'}",
+                "{'authorization': 'Bearer ***'}",
+            ),
+            (
+                '{\\"Authorization\\": \\"Bearer '
+                + "SYN_STRUCT_AUTH_ESCAPED"
+                + '\\"}',
+                '{\\"Authorization\\": \\"Bearer ***\\"}',
+            ),
+            (
+                '{\\\\\\"x-api-key\\\\\\": \\\\\\"'
+                + "SYN_STRUCT_API_ESCAPED"
+                + '\\\\\\"}',
+                '{\\\\\\"x-api-key\\\\\\": \\\\\\"***\\\\\\"}',
+            ),
+            (
+                '"X-Api-Key": "' + "SYN_STRUCT_API_JSON" + '"',
+                '"X-Api-Key": "***"',
+            ),
+        ],
+    )
+    def test_persisted_structured_authorization_and_api_keys(self, text, expected):
+        result = redact_persisted_diagnostic(text)
+        assert result == expected
+
+    def test_ordinary_authorization_and_api_key_keep_parent_backslash_semantics(self):
+        text = (
+            "Authorization: Bearer ***\\SYN_ORDINARY_AUTH_SUFFIX "
+            "X-Api-Key: ***\\SYN_ORDINARY_API_SUFFIX"
+        )
+        assert redact_sensitive_text(text, force=True, code_file=True) == (
+            "Authorization: Bearer ***\\SY...FFIX X-Api-Key: ***\\SY...FFIX"
+        )
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Cookie: session=SYN_COOKIE_ONE; csrf=SYN_COOKIE_TWO; refresh=SYN_COOKIE_THREE",
+            "Cookie: session=\"SYN_COOKIE_QUOTED\"; csrf=SYN_COOKIE_QUOTED_TWO",
+            "Set-Cookie: sid=SYN_SET_ONE; refresh=SYN_SET_TWO; Path=/; Domain=example.test; "
+            "Expires=Wed, 21 Oct 2015 07:28:00 GMT; Max-Age=3600; SameSite=Lax; Secure; HttpOnly",
+            "Set-Cookie: sid=SYN_SET_COMBINED_ONE; Path=/, refresh=SYN_SET_COMBINED_TWO; Secure",
+            "Set-Cookie: sid=SYN_SET_UNSAFE_ONE; Priority=SYN_SET_UNSAFE_ATTRIBUTE; Path=/",
+            '{"Cookie": ["a=SYN_COOKIE_ARRAY_ONE; b=SYN_COOKIE_ARRAY_TWO", '
+            '"c=SYN_COOKIE_ARRAY_THREE"], "Set-Cookie": ["sid=SYN_SET_ARRAY"]}',
+            "{\\\"Cookie\\\": \\\"session=SYN_COOKIE_ESCAPED; csrf=SYN_CSRF_ESCAPED\\\"}",
+        ],
+    )
+    def test_persisted_cookie_values_are_all_redacted(self, text):
+        result = redact_persisted_diagnostic(text)
+        for marker in (
+            "SYN_COOKIE_ONE", "SYN_COOKIE_TWO", "SYN_COOKIE_THREE",
+            "SYN_COOKIE_QUOTED", "SYN_COOKIE_QUOTED_TWO",
+            "SYN_SET_ONE", "SYN_SET_TWO", "SYN_SET_COMBINED_ONE", "SYN_SET_COMBINED_TWO",
+            "SYN_SET_UNSAFE_ONE", "SYN_SET_UNSAFE_ATTRIBUTE",
+            "SYN_COOKIE_ARRAY_ONE", "SYN_COOKIE_ARRAY_TWO", "SYN_COOKIE_ARRAY_THREE",
+            "SYN_SET_ARRAY", "SYN_COOKIE_ESCAPED", "SYN_CSRF_ESCAPED",
+        ):
+            assert marker not in result
+        for safe in ("Path=/", "Domain=example.test", "Expires=Wed, 21 Oct 2015 07:28:00 GMT",
+                     "Max-Age=3600", "SameSite=Lax", "Secure", "HttpOnly"):
+            if safe in text:
+                assert safe in result
+
+    def test_strict_userinfo_masks_through_last_authority_at(self):
+        text = "https://user:SYN_USERINFO_LEFT@SYN_USERINFO_RIGHT@api.example.test/path?view=public"
+        result = redact_sensitive_text(text, force=True, redact_url_credentials=True)
+        assert "SYN_USERINFO_LEFT" not in result
+        assert "SYN_USERINFO_RIGHT" not in result
+        assert result == "https://user:***@api.example.test/path?view=public"
+
+    def test_persisted_redaction_is_idempotent(self):
+        text = (
+            '{"Authorization": "Bearer SYN_IDEMPOTENT_AUTH", '
+            '"Cookie": ["sid=SYN_IDEMPOTENT_COOKIE; csrf=SYN_IDEMPOTENT_CSRF"], '
+            '"url": "https://api.example.test/x?token=SYN_IDEMPOTENT_QUERY"}'
+        )
+        first = redact_persisted_diagnostic(text)
+        assert redact_persisted_diagnostic(first) == first
+
+    def test_non_ascii_prefix_keeps_structured_spans_aligned_on_helper_and_formatter(self):
+        text = (
+            "synthetic prefix İ before fields "
+            + json.dumps({
+                "Authorization": "Bearer SYN_NONASCII_AUTH",
+                "X-Api-Key": "SYN_NONASCII_API",
+                "Cookie": "sid=SYN_NONASCII_COOKIE",
+                "Set-Cookie": "sid=SYN_NONASCII_SET; Path=/; Secure; HttpOnly",
+                "safe": "public",
+            }, ensure_ascii=False)
+        )
+
+        result = redact_persisted_diagnostic(text, limit=None)
+        formatted = RedactingFormatter().format(logging.makeLogRecord({"msg": text}))
+
+        for marker in (
+            "SYN_NONASCII_AUTH", "SYN_NONASCII_API", "SYN_NONASCII_COOKIE", "SYN_NONASCII_SET",
+        ):
+            assert marker not in result
+            assert marker not in formatted
+        assert '"safe": "public"' in result
+        assert '"Set-Cookie": "sid=***; Path=/; Secure; HttpOnly"' in result
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("X-Api-Key:   SYN_KIND_API   ", "X-Api-Key:   ***"),
+            ("Authorization:\tBearer SYN_KIND_AUTH   ", "Authorization:\tBearer ***"),
+            ("Authorization:\tSYN_KIND_BARE   ", "Authorization:\t***"),
+        ],
+    )
+    def test_structured_field_kind_controls_masking_and_scheme_preservation(self, text, expected):
+        assert redact_persisted_diagnostic(text, limit=None) == expected
+
+    @pytest.mark.parametrize(
+        ("field_name", "value", "marker"),
+        [
+            ("Authorization", ["Bearer SYN_ESCAPED_AUTH\\"], "SYN_ESCAPED_AUTH"),
+            ("X-Api-Key", ["SYN_ESCAPED_API\\"], "SYN_ESCAPED_API"),
+            ("Cookie", ["sid=SYN_ESCAPED_COOKIE\\"], "SYN_ESCAPED_COOKIE"),
+            ("Set-Cookie", ["sid=SYN_ESCAPED_SET\\"], "SYN_ESCAPED_SET"),
+        ],
+    )
+    def test_structured_lists_ending_in_escaped_backslashes_are_redacted(self, field_name, value, marker):
+        text = json.dumps({field_name: value}, ensure_ascii=False)
+        result = redact_persisted_diagnostic(text, limit=None)
+        assert marker not in result
+        assert "***" in result
+
+    def test_set_cookie_first_pair_and_valued_flags_are_not_allowlisted(self):
+        text = (
+            "Set-Cookie: Path=SYN_COOKIE_NAME; Secure=SYN_SECURE_VALUE; "
+            "HttpOnly=SYN_HTTPONLY_VALUE; SameSite=Lax; Secure; HttpOnly"
+        )
+
+        result = redact_persisted_diagnostic(text, limit=None)
+
+        assert result == "Set-Cookie: Path=***; Secure=***; HttpOnly=***; SameSite=Lax; Secure; HttpOnly"
+
+    def test_uncertain_structured_boundaries_fail_closed_for_the_whole_diagnostic(self):
+        text = '{"Authorization": ["Bearer SYN_MALFORMED_AUTH", "tail": "SYN_MALFORMED_TAIL"}'
+
+        result = redact_persisted_diagnostic(text, limit=None)
+
+        assert result == "[redaction-unavailable]"
+        assert "SYN_MALFORMED_AUTH" not in result
+        assert "SYN_MALFORMED_TAIL" not in result
+
+    def test_repeated_structured_fields_have_a_deterministic_bound_without_timing_assumptions(self):
+        text = "\n".join(
+            "Authorization: Bearer SYN_REPEAT_%04d" % index for index in range(600)
+        )
+
+        result = redact_persisted_diagnostic(text, limit=128)
+
+        assert len(result) <= 128
+        assert "SYN_REPEAT_0000" not in result
+        assert "SYN_REPEAT_0599" not in result
+        assert redact_persisted_diagnostic(result, limit=128) == result
+
+    def test_truncated_structured_output_is_stable_on_a_second_pass(self):
+        text = (
+            '{"Authorization": "Bearer SYN_TRUNCATED_AUTH", '
+            '"Cookie": ["sid=SYN_TRUNCATED_COOKIE"], '
+            '"padding": "' + ("x" * 100) + '"}'
+        )
+
+        first = redact_persisted_diagnostic(text, limit=46)
+
+        assert len(first) <= 46
+        assert "SYN_TRUNCATED_AUTH" not in first
+        assert "SYN_TRUNCATED_COOKIE" not in first
+        assert redact_persisted_diagnostic(first, limit=46) == first

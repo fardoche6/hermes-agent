@@ -1,3 +1,4 @@
+import json
 import sys
 import types
 from types import SimpleNamespace
@@ -2152,6 +2153,161 @@ def test_dump_api_request_debug_uses_chat_completions_url(monkeypatch, tmp_path)
     assert payload["request"]["url"] == "http://127.0.0.1:9208/v1/chat/completions"
 
 
+def test_dump_api_request_debug_redacts_persisted_json_and_stdout(monkeypatch, tmp_path, capsys):
+    """Request-debug persistence and optional stdout share the strict boundary."""
+    import json
+
+    agent = _build_agent(monkeypatch)
+    agent.base_url = "https://api.example.test/v1?token=SYN_DUMP_BASE_QUERY&view=public"
+    agent.logs_dir = tmp_path
+    dump_auth = "SYN_" + "DUMP_AUTH"
+    dump_api = "SYN_" + "DUMP_API"
+    dump_session = "SYN_" + "DUMP_SESSION"
+    dump_csrf = "SYN_" + "DUMP_CSRF"
+    dump_set = "SYN_" + "DUMP_SET"
+    request = _codex_request_kwargs()
+    request["input"] = [{
+        "role": "user",
+        "content": (
+            "GET https://api.example.test/v1/items?client%255Fsecret=SYN_DUMP_DOUBLE&limit=20\n"
+            + "Authorization: Bearer " + dump_auth + "\n"
+            + "X-Api-Key: " + dump_api + "\n"
+            + "Cookie: session=" + dump_session + "; csrf=" + dump_csrf + "\n"
+            + "Set-Cookie: sid=" + dump_set + "; Path=/; HttpOnly"
+        ),
+    }]
+    monkeypatch.setenv("HERMES_DUMP_REQUEST_STDOUT", "1")
+
+    dump_file = agent._dump_api_request_debug(request, reason="preflight")
+
+    persisted = dump_file.read_text()
+    stdout = capsys.readouterr().out
+    payload = json.loads(persisted)
+    synthetic_secrets = (
+        "SYN_DUMP_BASE_QUERY",
+        "SYN_DUMP_DOUBLE",
+        "SYN_DUMP_AUTH",
+        "SYN_DUMP_API",
+        "SYN_DUMP_SESSION",
+        "SYN_DUMP_CSRF",
+        "SYN_DUMP_SET",
+    )
+    for secret in synthetic_secrets:
+        assert secret not in persisted
+        assert secret not in stdout
+    assert payload["request"]["url"].startswith("https://api.example.test/v1")
+    assert "limit=20" in persisted
+    assert "Path=/" in persisted
+
+
+def test_dump_api_request_debug_redacts_structured_headers_in_file_and_stdout(monkeypatch, tmp_path, capsys):
+    agent = _build_agent(monkeypatch)
+    agent.base_url = "https://api.example.test/v1?token=SYN_STRUCTURED_DUMP_QUERY&view=public"
+    agent.logs_dir = tmp_path
+    request = _codex_request_kwargs()
+    request["input"] = [{
+        "headers": {
+            "Authorization": "Bearer SYN_STRUCTURED_DUMP_AUTH",
+            "X-Api-Key": "SYN_STRUCTURED_DUMP_API",
+            "Cookie": [
+                "session=SYN_STRUCTURED_DUMP_COOKIE; csrf=SYN_STRUCTURED_DUMP_CSRF",
+                "refresh=SYN_STRUCTURED_DUMP_REFRESH",
+            ],
+            "Set-Cookie": [
+                "sid=SYN_STRUCTURED_DUMP_SET; Path=/; HttpOnly",
+                "other=SYN_STRUCTURED_DUMP_SET_TWO; Secure; SameSite=Lax",
+            ],
+        },
+        "body": {
+            "safe_context": "public-value",
+            "nested": {"authorization": "Bearer SYN_STRUCTURED_DUMP_NESTED"},
+        },
+    }]
+    monkeypatch.setenv("HERMES_DUMP_REQUEST_STDOUT", "1")
+
+    dump_file = agent._dump_api_request_debug(request, reason="structured-preflight")
+
+    persisted = dump_file.read_text()
+    stdout = capsys.readouterr().out
+    for marker in (
+        "SYN_STRUCTURED_DUMP_QUERY", "SYN_STRUCTURED_DUMP_AUTH", "SYN_STRUCTURED_DUMP_API",
+        "SYN_STRUCTURED_DUMP_COOKIE", "SYN_STRUCTURED_DUMP_CSRF", "SYN_STRUCTURED_DUMP_REFRESH",
+        "SYN_STRUCTURED_DUMP_SET", "SYN_STRUCTURED_DUMP_SET_TWO", "SYN_STRUCTURED_DUMP_NESTED",
+    ):
+        assert marker not in persisted
+        assert marker not in stdout
+    assert "public-value" in persisted
+    assert "Path=/" in persisted
+    assert "HttpOnly" in persisted
+    assert "Secure" in persisted
+    assert len(persisted) <= 8192
+
+
+def test_dump_api_request_debug_redacts_non_ascii_prefixed_nested_fields_in_file_and_stdout(
+    monkeypatch, tmp_path, capsys,
+):
+    from agent.redact import redact_persisted_diagnostic
+
+    agent = _build_agent(monkeypatch)
+    agent.base_url = "https://api.example.test/v1?token=SYN_NONASCII_DUMP_QUERY&view=public"
+    agent.logs_dir = tmp_path
+    nested = (
+        "synthetic prefix İ before fields "
+        + '{"Authorization": "Bearer SYN_NONASCII_DUMP_AUTH", '
+        + '"X-Api-Key": "SYN_NONASCII_DUMP_API", '
+        + '"Cookie": "sid=SYN_NONASCII_DUMP_COOKIE", '
+        + '"Set-Cookie": "sid=SYN_NONASCII_DUMP_SET; Path=/; Secure; HttpOnly"}'
+    )
+    request = _codex_request_kwargs()
+    request["input"] = [{"role": "user", "content": nested}]
+    monkeypatch.setenv("HERMES_DUMP_REQUEST_STDOUT", "1")
+
+    dump_file = agent._dump_api_request_debug(request, reason="nonascii-preflight")
+
+    persisted = dump_file.read_text(encoding="utf-8")
+    stdout = capsys.readouterr().out
+    for marker in (
+        "SYN_NONASCII_DUMP_QUERY", "SYN_NONASCII_DUMP_AUTH", "SYN_NONASCII_DUMP_API",
+        "SYN_NONASCII_DUMP_COOKIE", "SYN_NONASCII_DUMP_SET",
+    ):
+        assert marker not in persisted
+        assert marker not in stdout
+    assert json.loads(persisted)["request"]["body"]["input"][0]["content"].startswith(
+        "synthetic prefix İ"
+    )
+    stdout_representation = stdout[stdout.find("{"):]
+    assert stdout_representation == persisted
+    assert redact_persisted_diagnostic(persisted, limit=None) == persisted
+
+
+def test_dump_api_request_debug_bounds_final_utf8_file_and_stdout_and_is_idempotent(
+    monkeypatch, tmp_path, capsys,
+):
+    from agent.redact import redact_persisted_diagnostic
+
+    agent = _build_agent(monkeypatch)
+    agent.base_url = "https://api.example.test/v1?token=SYN_OVERSIZED_DUMP_QUERY"
+    agent.logs_dir = tmp_path
+    request = _codex_request_kwargs()
+    request["input"] = [{
+        "role": "user",
+        "content": "public \"quoted\" \\slashes\\ and SYN_OVERSIZED_DUMP_BODY",
+    }]
+    request["padding"] = "é\\\"/=" * 5000
+    monkeypatch.setenv("HERMES_DUMP_REQUEST_STDOUT", "1")
+
+    dump_file = agent._dump_api_request_debug(request, reason="oversized-preflight")
+
+    persisted = dump_file.read_text(encoding="utf-8")
+    stdout = capsys.readouterr().out
+    stdout_representation = stdout[stdout.find("{"):]
+    assert len(persisted.encode("utf-8")) <= 8192
+    assert len(stdout_representation.encode("utf-8")) <= 8192
+    assert stdout_representation == persisted
+    assert json.loads(persisted)
+    assert "SYN_OVERSIZED_DUMP_QUERY" not in persisted
+    assert "SYN_OVERSIZED_DUMP_BODY" not in persisted
+    assert redact_persisted_diagnostic(persisted, limit=None) == persisted
 
 
 # --- Reasoning-only response tests (fix for empty content retry loop) ---
