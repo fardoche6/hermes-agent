@@ -277,3 +277,67 @@ def test_pathological_status_metadata_uses_total_safe_summary_and_warning():
     assert warnings == ["⚠ Auxiliary summary failed: Provider returned an error."]
     assert marker not in summary
     assert marker not in warnings[0]
+
+
+def test_summary_and_auxiliary_warning_redact_non_scalar_aliases():
+    marker = "SYN_R4_SUMMARY_API"
+    error = Exception("synthetic provider failure")
+    error.status_code = 502
+    error.body = {
+        "error": {
+            "message": 'provider detail {"X-Api-Key": [8462057319, "SYN_R4_SUMMARY_API"], "safe": "public"}',
+        },
+    }
+
+    summary = AIAgent._summarize_api_error(error)
+    warnings = []
+    agent = object.__new__(AIAgent)
+    agent._emit_warning = warnings.append
+    AIAgent._emit_auxiliary_failure(agent, "summary", error)
+
+    assert marker not in summary
+    assert "8462057319" not in summary
+    assert '"safe": "public"' in summary
+    assert warnings and marker not in warnings[0]
+    assert "8462057319" not in warnings[0]
+
+
+def test_summary_fails_closed_for_malformed_outer_cookie_with_nested_credentials():
+    markers = ("SYN_R4_SUMMARY_COOKIE", "SYN_R4_SUMMARY_HIDDEN")
+    error = Exception("synthetic provider failure")
+    error.status_code = 500
+    error.body = {
+        "error": {
+            "message": (
+                '{"Cookie": ["sid=' + markers[0] + '", '
+                '"Authorization": "Bearer ' + markers[1] + '"}'
+            ),
+        },
+    }
+
+    summary = AIAgent._summarize_api_error(error)
+    assert all(marker not in summary for marker in markers)
+    assert summary == "[redaction-unavailable]"
+
+
+def test_entitlement_hint_is_complete_after_detail_redaction_and_second_pass():
+    from agent.redact import redact_persisted_diagnostic
+
+    error = Exception("synthetic provider failure")
+    error.status_code = 403
+    error.body = {
+        "error": {
+            "message": (
+                'You have either run out of available resources or do not have an active '
+                'Grok subscription. Echo {"X-Api-Key": "SYN_R4_ENTITLEMENT_API"}'
+            ),
+        },
+    }
+
+    summary = AIAgent._summarize_api_error(error)
+
+    assert "SYN_R4_ENTITLEMENT_API" not in summary
+    assert summary.count("X Premium+ does NOT include") == 1
+    assert "https://grok.com/?_s=usage" in summary
+    assert "/model" in summary
+    assert redact_persisted_diagnostic(summary, limit=None) == summary

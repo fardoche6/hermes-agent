@@ -353,6 +353,13 @@ _COOKIE_NAME_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
 _COOKIE_SAFE_ATTRIBUTES = frozenset({
     "path", "domain", "expires", "max-age", "samesite", "secure", "httponly",
 })
+_COOKIE_NESTED_CREDENTIAL_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])(?:proxy-authorization|authorization|"
+    r"x-api-key|x-goog-api-key|api-key|apikey|x-api-token|x-auth-token|"
+    r"x-access-token|access-token|refresh-token|id-token|token|api_key|"
+    r"password|passwd|secret|credential|auth|bearer|signature)\s*[:=]",
+    re.IGNORECASE,
+)
 
 # Form-urlencoded body: only when the ENTIRE text is a k=v&k=v string.
 _FORM_BODY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*=[^&\s]*(?:&[A-Za-z_][A-Za-z0-9_.-]*=[^&\s]*)+$")
@@ -665,6 +672,11 @@ _PERSISTED_DIAGNOSTIC_FAILURE = "[redaction-unavailable]"
 _PERSISTED_DIAGNOSTIC_TRUNCATION = "…[truncated]…"
 
 
+def _valid_utf8_text(value: str) -> str:
+    """Replace lone surrogates so persisted/display output is always UTF-8 encodable."""
+    return value.encode("utf-8", errors="replace").decode("utf-8")
+
+
 def _ascii_lower(value: str) -> str:
     """Lower only ASCII letters; unlike ``casefold`` this never changes string length."""
     return "".join(chr(ord(char) + 32) if "A" <= char <= "Z" else char for char in value)
@@ -681,51 +693,108 @@ def _ascii_startswith(text: str, start: int, name: str) -> bool:
     )
 
 
+def _backslash_run_end(text: str, start: int) -> int:
+    """Return the first position after the backslash run beginning at ``start``."""
+    end = start
+    while end < len(text) and text[end] == "\\":
+        end += 1
+    return end
+
+
 def _escaped_quote_at(text: str, start: int) -> Optional[tuple[int, int, int]]:
-    """Return ``(backslash_start, quote_index, escape_depth)`` at ``start``."""
+    """Return ``(backslash_start, quote_index, escape_depth)`` at ``start``.
+
+    Callers that get ``None`` for a backslash start must advance to
+    ``_backslash_run_end``; otherwise a long non-quote run is rescanned at
+    every backslash and becomes quadratic.
+    """
     if start >= len(text):
         return None
-    quote_index = start
-    while quote_index < len(text) and text[quote_index] == "\\":
-        quote_index += 1
+    if text[start] in "\"'":
+        return start, start, 0
+    if text[start] != "\\":
+        return None
+    quote_index = _backslash_run_end(text, start)
     if quote_index >= len(text) or text[quote_index] not in "\"'":
         return None
     return start, quote_index, quote_index - start
 
 
 def _matching_escaped_quote(text: str, quote_index: int, quote: str, escape_depth: int) -> Optional[int]:
-    """Find a closing quote at the opener's escape layer.
+    """Find a closing quote at the opener's serialization layer in one pass.
 
-    Extra pairs of backslashes immediately before a quote are content, not a
-    new escape layer.  Thus a JSON string ending in an escaped backslash has
-    ``escape_depth + 2`` backslashes before its closing quote and is valid.
+    A nested JSON serialization represents one source backslash with a power of
+    two raw backslashes and adds ``escape_depth`` backslashes for the delimiter.
+    At depth one, for example, three raw backslashes before a quote are an
+    embedded escaped quote, while five can terminate a value ending in one
+    backslash.  The previous parity-only rule confused those two cases.
     """
     position = quote_index + 1
     while position < len(text):
-        if text[position] == quote:
-            backslashes = 0
-            before = position - 1
-            while before >= 0 and text[before] == "\\":
-                backslashes += 1
-                before -= 1
-            if backslashes >= escape_depth and (backslashes - escape_depth) % 2 == 0:
-                return position
+        if text[position] == "\\":
+            run_start = position
+            run_end = _backslash_run_end(text, position)
+            if run_end < len(text) and text[run_end] == quote:
+                run_length = run_end - run_start
+                if _quote_closes_at_layer(run_length, escape_depth):
+                    return run_end
+                position = run_end + 1
+            else:
+                position = run_end
+            continue
+        if text[position] == quote and _quote_closes_at_layer(0, escape_depth):
+            return position
         position += 1
     return None
 
 
-def _find_balanced_container_end(text: str, start: int) -> tuple[int, bool]:
-    """Find a JSON-like container end and report whether its structure is complete."""
+def _quote_closes_at_layer(run_length: int, escape_depth: int) -> bool:
+    """Whether a quote preceded by ``run_length`` slashes closes ``escape_depth``.
+
+    For an unencoded string, a quote closes after an even direct backslash run.
+    For ``n`` JSON encoding layers, the delimiter has ``2**n - 1`` slashes and
+    each source backslash contributes ``2**n`` more.  A source odd run is an
+    embedded quote; an even run is a delimiter.  Unknown depths accept only the
+    exact delimiter shape, conservatively avoiding a false close.
+    """
+    if escape_depth == 0:
+        return run_length % 2 == 0
+    unit = escape_depth + 1
+    if unit & (unit - 1):
+        return run_length == escape_depth
+    extra = run_length - escape_depth
+    if extra < 0 or extra % unit:
+        return False
+    return (extra // unit) % 2 == 0
+
+
+def _scan_balanced_container(text: str, start: int, escape_depth: int = 0) -> tuple[int, bool]:
+    """Find a balanced JSON-like container without rescanning backslash runs."""
     closing = {"[": "]", "{": "}"}
     if start >= len(text) or text[start] not in closing:
         return start, False
     stack = [closing[text[start]]]
     position = start + 1
     while position < len(text):
-        quoted = _escaped_quote_at(text, position)
-        if quoted is not None:
-            _, quote_index, escape_depth = quoted
-            end_quote = _matching_escaped_quote(text, quote_index, text[quote_index], escape_depth)
+        if text[position] == "\\":
+            run_end = _backslash_run_end(text, position)
+            if run_end < len(text) and text[run_end] in "\"'":
+                layer = run_end - position
+                if layer != escape_depth:
+                    return len(text), False
+                end_quote = _matching_escaped_quote(
+                    text, run_end, text[run_end], escape_depth
+                )
+                if end_quote is None:
+                    return len(text), False
+                position = end_quote + 1
+            else:
+                position = run_end
+            continue
+        if text[position] in "\"'":
+            if escape_depth != 0:
+                return len(text), False
+            end_quote = _matching_escaped_quote(text, position, text[position], 0)
             if end_quote is None:
                 return len(text), False
             position = end_quote + 1
@@ -740,6 +809,13 @@ def _find_balanced_container_end(text: str, start: int) -> tuple[int, bool]:
                 return position + 1, True
         position += 1
     return len(text), False
+
+
+def _find_balanced_container_end(
+    text: str, start: int, escape_depth: int = 0
+) -> tuple[int, bool]:
+    """Compatibility wrapper for the linear balanced-container scanner."""
+    return _scan_balanced_container(text, start, escape_depth)
 
 
 def _quoted_context_map(text: str) -> list[bool]:
@@ -760,17 +836,23 @@ def _quoted_context_map(text: str) -> list[bool]:
 
 
 def _find_header_value_span(
-    text: str, start: int, *, inside_quote: bool = False, quote_context: Optional[list[bool]] = None,
+    text: str, start: int, *, inside_quote: bool = False,
+    quote_context: Optional[list[bool]] = None, escape_depth: int = 0,
 ) -> tuple[int, int, Optional[int], Optional[int], bool]:
     """Return a field value span, inner content span, and structured-parse status."""
     if start >= len(text):
         return start, start, None, None, True
     quoted = _escaped_quote_at(text, start)
     if quoted is not None:
-        _, quote_index, escape_depth = quoted
-        end_quote = _matching_escaped_quote(text, quote_index, text[quote_index], escape_depth)
+        _, quote_index, quote_escape_depth = quoted
+        end_quote = _matching_escaped_quote(
+            text, quote_index, text[quote_index], quote_escape_depth
+        )
         if end_quote is not None:
-            return start, end_quote + 1, quote_index + 1, end_quote - escape_depth, True
+            return (
+                start, end_quote + 1, quote_index + 1,
+                end_quote - quote_escape_depth, True,
+            )
         line_end = len(text)
         for delimiter in ("\r", "\n"):
             candidate = text.find(delimiter, start)
@@ -778,7 +860,9 @@ def _find_header_value_span(
                 line_end = min(line_end, candidate)
         return start, line_end, None, None, False
     if text[start:start + 1] in {"[", "{"}:
-        value_end, complete = _find_balanced_container_end(text, start)
+        value_end, complete = _find_balanced_container_end(
+            text, start, escape_depth=escape_depth
+        )
         return start, value_end, None, None, complete
     end = start
     while end < len(text) and text[end] not in "\r\n":
@@ -790,11 +874,11 @@ def _find_header_value_span(
         ):
             break
         if text[end] == "\\":
-            escaped_end = end + 1
-            while escaped_end < len(text) and text[escaped_end] == "\\":
-                escaped_end += 1
+            escaped_end = _backslash_run_end(text, end)
             if escaped_end < len(text) and text[escaped_end] in "nNrR":
                 break
+            end = escaped_end
+            continue
         end += 1
     return start, end, None, None, True
 
@@ -856,7 +940,10 @@ def _persisted_header_spans(text: str, names: tuple[str, ...]):
         while value_start < len(text) and text[value_start].isspace():
             value_start += 1
         value_start, value_end, content_start, content_end, structured_ok = _find_header_value_span(
-            text, value_start, inside_quote=quote_context[value_start], quote_context=quote_context
+            text, value_start,
+            inside_quote=quote_context[value_start],
+            quote_context=quote_context,
+            escape_depth=_persisted_field_escape_depth(text, found),
         )
         yield found, name, value_start, value_end, content_start, content_end, structured_ok
         position = max(value_end, found + 1)
@@ -870,6 +957,17 @@ def _persisted_field_start(text: str, name_start: int) -> int:
         while start and text[start - 1] == "\\":
             start -= 1
     return start
+
+
+def _persisted_field_escape_depth(text: str, name_start: int) -> int:
+    """Return the raw delimiter depth of a quoted field name, or zero for plain headers."""
+    if name_start <= 0 or text[name_start - 1] not in "\"'":
+        return 0
+    quote_index = name_start - 1
+    start = quote_index
+    while start and text[start - 1] == "\\":
+        start -= 1
+    return quote_index - start
 
 
 def _assemble_span_replacements(text: str, replacements) -> str:
@@ -886,28 +984,26 @@ def _assemble_span_replacements(text: str, replacements) -> str:
     return "".join(output)
 
 
-def _redact_quoted_scalars(value: str, transform, field_name: str) -> tuple[str, bool]:
-    """Apply a transform to every escaped quoted scalar, or fail closed."""
-    output = []
-    source_start = 0
-    position = 0
-    while position < len(value):
-        quoted = _escaped_quote_at(value, position)
-        if quoted is None:
-            position += 1
-            continue
-        _, quote_index, escape_depth = quoted
-        end_quote = _matching_escaped_quote(value, quote_index, value[quote_index], escape_depth)
-        if end_quote is None:
-            return "***", False
-        content_end = end_quote - escape_depth
-        output.append(value[source_start:quote_index + 1])
-        output.append(transform(value[quote_index + 1:content_end], field_name))
-        output.append(value[content_end:end_quote + 1])
-        source_start = end_quote + 1
-        position = end_quote + 1
-    output.append(value[source_start:])
-    return "".join(output), True
+def _masked_container_value(value: str, escape_depth: int) -> str:
+    """Return a valid redaction-shaped container at the source encoding depth."""
+    quote = "\\" * escape_depth + '"'
+    if value.startswith("["):
+        return f"[{quote}***{quote}]"
+    return f"{{{quote}redacted{quote}:{quote}***{quote}}}"
+
+
+def _is_masked_container_value(value: str, escape_depth: int) -> bool:
+    """Recognize the container emitted by ``_masked_container_value``."""
+    stripped = value.strip()
+    quote = re.escape("\\" * escape_depth + '"')
+    return bool(
+        re.fullmatch(rf"\[\s*{quote}\*\*\*{quote}\s*\]", stripped)
+        or re.fullmatch(
+            rf"\{{\s*{quote}redacted{quote}\s*:\s*{quote}\*\*\*{quote}\s*\}}",
+            stripped,
+        )
+        or stripped in {"[***]", "{***}"}
+    )
 
 
 def _sanitized_persisted_field(text: str, record, transform) -> tuple[int, int, str]:
@@ -918,13 +1014,26 @@ def _sanitized_persisted_field(text: str, record, transform) -> tuple[int, int, 
     try:
         if not structured_ok:
             return field_start, value_end, prefix + "***"
+        original = text[value_start:value_end]
+        if original[:1] in "[{":
+            escape_depth = _persisted_field_escape_depth(text, name_start)
+            if _is_masked_container_value(original, escape_depth):
+                return field_start, value_end, text[field_start:value_end]
+            kind = _ascii_lower(field_name)
+            if kind in {"authorization", "proxy-authorization"}:
+                # A credential-bearing container has no safe scalar boundary to preserve.
+                return field_start, value_end, prefix + _masked_container_value(original, escape_depth)
+            replacement, complete = _redact_cookie_container(
+                original,
+                transform,
+                escape_depth,
+            )
+            if not complete:
+                replacement = _masked_container_value(original, escape_depth)
+            return field_start, value_end, prefix + replacement
         if content_start is not None and content_end is not None:
             replacement = transform(text[content_start:content_end], field_name)
             return field_start, value_end, text[field_start:content_start] + replacement + text[content_end:value_end]
-        original = text[value_start:value_end]
-        if original[:1] in "[{":
-            replacement, complete = _redact_quoted_scalars(original, transform, field_name)
-            return field_start, value_end, prefix + (replacement if complete else "***")
         return field_start, value_end, prefix + (transform(original, field_name) or "***")
     except Exception:
         return field_start, value_end, prefix + "***"
@@ -994,7 +1103,9 @@ def _cookie_value_end(
     quoted = _escaped_quote_at(value, start)
     if quoted is not None:
         _, quote_index, escape_depth = quoted
-        end_quote = _matching_escaped_quote(value, quote_index, value[quote_index], escape_depth)
+        end_quote = _matching_escaped_quote(
+            value, quote_index, value[quote_index], escape_depth
+        )
         if end_quote is None:
             return len(value), quote_index, escape_depth, False
         return end_quote + 1, end_quote, escape_depth, True
@@ -1003,6 +1114,9 @@ def _cookie_value_end(
         char = value[end]
         if char in ";\r\n]}\"'" or (char == "," and not allow_comma) or char.isspace():
             break
+        if char == "\\":
+            end = _backslash_run_end(value, end)
+            continue
         end += 1
     return end, None, 0, True
 
@@ -1020,68 +1134,204 @@ def _cookie_attribute_value_end(value: str, start: int, attribute: str) -> tuple
             break
         if char == "," and _cookie_pair_starts_at(value, end + 1):
             break
+        if char == "\\":
+            end = _backslash_run_end(value, end)
+            continue
         end += 1
     return end, None, 0, True
 
 
+def _redact_cookie_attribute_content(content: str) -> str:
+    """Keep ordinary allowlisted attribute values, but stop nested secrets."""
+    if not content:
+        return "***"
+    if _COOKIE_NESTED_CREDENTIAL_RE.search(content):
+        return "***"
+    sanitized = redact_sensitive_text(content, force=True, redact_url_credentials=True)
+    return sanitized or "***"
+
+
+def _render_cookie_attribute_value(
+    value: str, value_start: int, value_end: int,
+    closing_quote: Optional[int], escape_depth: int,
+) -> str:
+    """Render an allowlisted cookie attribute while preserving its quote layer."""
+    if closing_quote is None:
+        return _redact_cookie_attribute_content(value[value_start:value_end])
+    opening = _escaped_quote_at(value, value_start)
+    if opening is None:
+        return "***"
+    _, quote_index, _ = opening
+    content_end = closing_quote - escape_depth
+    content = _redact_cookie_attribute_content(value[quote_index + 1:content_end])
+    return value[value_start:quote_index + 1] + content + value[content_end:value_end]
+
+
+def _is_redaction_token(value: str) -> bool:
+    stripped = value.strip()
+    return (
+        stripped == "***"
+        or (len(stripped) >= 3 and set(stripped) == {"*"})
+        or stripped == "«redacted-secret»"
+        or stripped.startswith("«redacted:")
+    )
+
+
 def _redact_cookie_pairs(value: str, *, set_cookie: bool) -> str:
-    """Redact cookie data; Set-Cookie attributes are accepted only positionally."""
+    """Consume cookie syntax; mask values and redact every unallowlisted token."""
+    if not value or _is_redaction_token(value):
+        return value or "***"
     output = []
     position = 0
     cookie_position = True
     while position < len(value):
-        if value[position] == ",":
-            output.append(",")
+        if value[position] in " \t":
+            output.append(value[position])
             position += 1
-            cookie_position = _cookie_pair_starts_at(value, position)
             continue
         if value[position] == ";":
             output.append(";")
             position += 1
             cookie_position = False
             continue
+        if set_cookie and value[position] == ",":
+            output.append(",")
+            position += 1
+            cookie_position = _cookie_pair_starts_at(value, position)
+            continue
+
         match = _COOKIE_NAME_RE.match(value, position)
         if match is None:
-            output.append(value[position])
-            position += 1
+            token_end = position + 1
+            while (
+                token_end < len(value)
+                and value[token_end] not in ";,\r\n"
+                and not value[token_end].isspace()
+            ):
+                token_end += 1
+            token = value[position:token_end]
+            output.append(token if _is_redaction_token(token) else "***")
+            position = token_end
+            cookie_position = False
             continue
+
         name_end = match.end()
         equals = name_end
         while equals < len(value) and value[equals] in " \t":
             equals += 1
+        name = _ascii_lower(match.group(0))
         if equals >= len(value) or value[equals] != "=":
-            output.append(value[position:name_end])
+            if set_cookie and not cookie_position and name in {"secure", "httponly"}:
+                output.append(value[position:name_end])
+            else:
+                token = value[position:name_end]
+                output.append(token if _is_redaction_token(token) else "***")
             position = name_end
             cookie_position = False
             continue
+
         value_start = equals + 1
         while value_start < len(value) and value[value_start] in " \t":
             value_start += 1
-        name = _ascii_lower(match.group(0))
         is_safe_value = set_cookie and not cookie_position and name in (
             _COOKIE_SAFE_ATTRIBUTES - {"secure", "httponly"}
         )
-        value_end, closing_quote, escape_depth, complete = (
-            _cookie_attribute_value_end(value, value_start, name)
-            if is_safe_value else _cookie_value_end(value, value_start)
-        )
-        output.append(value[position:value_start])
-        if is_safe_value and complete:
-            output.append(value[value_start:value_end])
+        if is_safe_value:
+            value_end, closing_quote, escape_depth, complete = _cookie_attribute_value_end(
+                value, value_start, name
+            )
         else:
-            opening = _escaped_quote_at(value, value_start)
-            if opening is None:
+            value_end, closing_quote, escape_depth, complete = _cookie_value_end(
+                value, value_start
+            )
+
+        preserve_name = not set_cookie or cookie_position or name in {"secure", "httponly"}
+        if not complete:
+            output.append(value[position:value_start] if preserve_name else "***")
+            if preserve_name:
+                output.append("***")
+            position = value_end
+            cookie_position = False
+            continue
+        if is_safe_value:
+            output.append(value[position:value_start])
+            if value_start < value_end:
+                output.append(
+                    _render_cookie_attribute_value(
+                        value,
+                        value_start,
+                        value_end,
+                        closing_quote,
+                        escape_depth,
+                    )
+                )
+            else:
+                output.append("***")
+        elif preserve_name:
+            output.append(value[position:value_start])
+            if closing_quote is None:
                 output.append("***")
             else:
-                _, quote_index, _ = opening
+                _, quote_index, _ = _escaped_quote_at(value, value_start) or (
+                    value_start, value_start, 0
+                )
                 output.append(value[value_start:quote_index + 1])
                 output.append("***")
-                if closing_quote is not None and complete:
-                    closing_start = closing_quote - escape_depth
-                    output.append(value[closing_start:closing_quote + 1])
+                closing_start = closing_quote - escape_depth
+                output.append(value[closing_start:value_end])
+        else:
+            output.append("***")
         position = value_end
         cookie_position = False
     return "".join(output)
+
+
+def _redact_cookie_container(value: str, transform, escape_depth: int) -> tuple[str, bool]:
+    """Redact a cookie list only when every item is a complete quoted scalar."""
+    if not value.startswith("[") or not value.endswith("]"):
+        return "***", False
+    output = ["["]
+    position = 1
+    item_count = 0
+    expect_item = True
+    while position < len(value) - 1:
+        if value[position].isspace():
+            output.append(value[position])
+            position += 1
+            continue
+        if value[position] == ",":
+            if expect_item:
+                return "***", False
+            output.append(",")
+            position += 1
+            expect_item = True
+            continue
+        if not expect_item:
+            return "***", False
+        quoted = _escaped_quote_at(value, position)
+        if quoted is None:
+            return "***", False
+        _, quote_index, item_escape_depth = quoted
+        if item_escape_depth != escape_depth:
+            return "***", False
+        end_quote = _matching_escaped_quote(
+            value, quote_index, value[quote_index], item_escape_depth
+        )
+        if end_quote is None:
+            return "***", False
+        content_end = end_quote - item_escape_depth
+        output.append(value[position:quote_index + 1])
+        output.append(transform(value[quote_index + 1:content_end], "cookie"))
+        output.append(value[content_end:end_quote + 1])
+        position = end_quote + 1
+        item_count += 1
+        expect_item = False
+    if expect_item and item_count:
+        return "***", False
+    if not item_count:
+        return value, True
+    output.append(value[position:])
+    return "".join(output), True
 
 
 def _safe_truncation_fragment(fragment: str) -> str:
@@ -1135,10 +1385,11 @@ def redact_persisted_diagnostic(
             bounded_limit = _PERSISTED_DIAGNOSTIC_DEFAULT_LIMIT
 
     try:
+        text = _valid_utf8_text(text)
         structured = _persisted_structured_replacements(text)
         protected = _assemble_span_replacements(text, structured)
         redacted = redact_sensitive_text(protected, force=True, redact_url_credentials=True)
-        redacted = "" if redacted is None else redacted
+        redacted = _valid_utf8_text("" if redacted is None else redacted)
     except Exception:
         redacted = _PERSISTED_DIAGNOSTIC_FAILURE
     return redacted if bounded_limit is None else _truncate_persisted_diagnostic(redacted, bounded_limit)

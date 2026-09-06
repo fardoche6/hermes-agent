@@ -1496,3 +1496,119 @@ class TestPersistedHttpCredentialCorrection:
         assert "SYN_TRUNCATED_AUTH" not in first
         assert "SYN_TRUNCATED_COOKIE" not in first
         assert redact_persisted_diagnostic(first, limit=46) == first
+
+    @pytest.mark.parametrize(
+        "field_name",
+        [
+            "authorization", "Proxy-Authorization", "x-api-key", "X-Goog-Api-Key",
+            "api-key", "Apikey", "X-Api-Token", "X-Auth-Token", "X-Access-Token",
+        ],
+    )
+    def test_all_persisted_credential_aliases_mask_scalar_and_non_scalar_values(self, field_name):
+        scalar_marker = "SYN_R4_ALIAS_SCALAR_" + field_name.replace("-", "_")
+        object_marker = "SYN_R4_ALIAS_OBJECT_" + field_name.replace("-", "_")
+
+        scalar_result = redact_persisted_diagnostic(
+            json.dumps({field_name: scalar_marker}), limit=None
+        )
+        non_scalar_result = redact_persisted_diagnostic(
+            json.dumps({field_name: {"nested": object_marker}}), limit=None
+        )
+        numeric_result = redact_persisted_diagnostic(
+            json.dumps({field_name: [8462057319]}), limit=None
+        )
+
+        assert scalar_marker not in scalar_result
+        assert object_marker not in non_scalar_result
+        assert "8462057319" not in numeric_result
+        assert redact_persisted_diagnostic(non_scalar_result, limit=None) == non_scalar_result
+
+    def test_digest_quoted_parameters_are_scanned_at_each_encoding_depth(self):
+        value = {"Authorization": 'Digest realm="SYN_R4_REALM", token=SYN_R4_DIGEST'}
+        for _depth in range(5):
+            serialized = json.dumps(value, ensure_ascii=False)
+            result = redact_persisted_diagnostic(serialized, limit=None)
+            assert "SYN_R4_REALM" not in result
+            assert "SYN_R4_DIGEST" not in result
+            value = serialized
+
+    @pytest.mark.parametrize(
+        ("text", "markers"),
+        [
+            ('{"Authorization": [SYN_R4_RAW_AUTH]}', ("SYN_R4_RAW_AUTH",)),
+            ('{"X-Api-Key": {"nested": SYN_R4_RAW_API}}', ("SYN_R4_RAW_API",)),
+            (
+                '{"Cookie": ["sid=SYN_R4_OUTER_COOKIE", '
+                '"Authorization": "Bearer SYN_R4_HIDDEN_AUTH"}',
+                ("SYN_R4_OUTER_COOKIE", "SYN_R4_HIDDEN_AUTH"),
+            ),
+            (
+                'Set-Cookie: ["sid=SYN_R4_OUTER_SET"; '
+                '"X-Api-Key": "SYN_R4_HIDDEN_API"]',
+                ("SYN_R4_OUTER_SET", "SYN_R4_HIDDEN_API"),
+            ),
+        ],
+    )
+    def test_balanced_invalid_and_malformed_structured_fields_fail_closed(self, text, markers):
+        result = redact_persisted_diagnostic(text, limit=None)
+        assert all(marker not in result for marker in markers)
+        if "Cookie" in text and "[" in text and "}" in text:
+            assert result == "[redaction-unavailable]"
+
+    @pytest.mark.parametrize(
+        ("text", "markers"),
+        [
+            (
+                "Cookie: sid=SYN_R4_COOKIE; extension=SYN_R4_EXTENSION; SYN_R4_TRAILER",
+                ("SYN_R4_COOKIE", "SYN_R4_EXTENSION", "SYN_R4_TRAILER"),
+            ),
+            (
+                "Set-Cookie: sid=SYN_R4_SET; UnknownFlag; Priority=SYN_R4_PRIORITY; Path=/",
+                ("SYN_R4_SET", "UnknownFlag", "SYN_R4_PRIORITY"),
+            ),
+            (
+                "Set-Cookie: sid=SYN_R4_SAFE; Path=/SYN_R4_PATH=token=SYN_R4_NESTED; Secure",
+                ("SYN_R4_SAFE", "SYN_R4_PATH", "SYN_R4_NESTED"),
+            ),
+        ],
+    )
+    def test_cookie_parser_consumes_unknown_and_nested_syntax(self, text, markers):
+        result = redact_persisted_diagnostic(text, limit=None)
+        assert all(marker not in result for marker in markers)
+        assert redact_persisted_diagnostic(result, limit=None) == result
+
+    def test_backslash_run_work_is_linear_under_a_deterministic_budget(self, monkeypatch):
+        import agent.redact as redact_module
+
+        original = redact_module._backslash_run_end
+        scanned = []
+
+        def counted(text, start):
+            end = original(text, start)
+            scanned.append(end - start)
+            return end
+
+        monkeypatch.setattr(redact_module, "_backslash_run_end", counted)
+        work = []
+        for length in (32, 64, 128, 256):
+            before = len(scanned)
+            text = 'Authorization: "' + ("\\" * length) + "SYN_R4_UNCLOSED"
+            result = redact_persisted_diagnostic(text, limit=None)
+            assert "SYN_R4_UNCLOSED" not in result
+            work.append(sum(scanned[before:]))
+
+        assert all(value > 0 for value in work)
+        assert work[1] <= work[0] * 3 + 64
+        assert work[2] <= work[1] * 3 + 128
+        assert work[3] <= work[2] * 3 + 256
+        assert work[3] <= work[0] * 12 + 512
+
+    def test_persisted_output_is_valid_utf8_for_lone_surrogates(self):
+        marker = "SYN_R4_" + "SURROGATE"
+        result = redact_persisted_diagnostic(
+            "synthetic prefix \ud800 Authorization: Bearer " + marker,
+            limit=None,
+        )
+
+        assert result.encode("utf-8").decode("utf-8") == result
+        assert marker not in result
