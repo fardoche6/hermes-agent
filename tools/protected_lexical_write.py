@@ -76,7 +76,7 @@ class BackendAdmission:
 
 @dataclass
 class ProtectedLexicalCandidate:
-    """Preimage retained from one lexical parent and its final symlink."""
+    """Preimage retained from one lexical parent and its final entry."""
 
     path: str
     parent_path: str
@@ -84,11 +84,13 @@ class ProtectedLexicalCandidate:
     parent_fd: int
     parent_identity: dict
     final_identity: dict
-    link_text: str
-    target_path: str
-    target_identity: dict
-    target_sha256: str
-    candidate_mode: int
+    link_text: str | None
+    target_path: str | None
+    target_identity: dict | None
+    target_sha256: str | None
+    candidate_mode: int | None
+    initial_kind: str = "symlink"
+    original_bytes: bytes = b""
     candidate_bytes: bytes = b""
     candidate_sha256: str = ""
     closed: bool = False
@@ -169,6 +171,25 @@ def _read_fd(fd: int) -> bytes:
         chunks.append(chunk)
 
 
+def _read_final_regular(
+    parent_fd: int,
+    final_name: str,
+    expected_identity: dict | None = None,
+) -> tuple[bytes, dict]:
+    """Read a lexical regular entry through its retained parent descriptor."""
+    fd = os.open(final_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    try:
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ProtectedLexicalError("protected final entry is not a regular file")
+        identity = _identity(file_stat)
+        if expected_identity is not None and not _same_identity(expected_identity, identity):
+            raise ProtectedLexicalError("protected final regular file changed after approval")
+        return _read_fd(fd), identity
+    finally:
+        os.close(fd)
+
+
 def _read_regular(path: str) -> tuple[bytes, dict]:
     parent_fd = _open_directory(os.path.dirname(path))
     fd = -1
@@ -222,7 +243,7 @@ def prepare_candidate(
     cwd: str | None,
     admission: BackendAdmission | None = None,
 ) -> ProtectedLexicalCandidate | None:
-    """Capture a regular-file final symlink, or return None when not applicable."""
+    """Capture the parent and no-follow state of every protected final entry."""
     admission = admission or BackendAdmission.for_environment(_LocalCapabilityMarker())
     if not admission.supported:
         raise ProtectedLexicalError(admission.error or "protected lexical capability unavailable")
@@ -243,15 +264,47 @@ def prepare_candidate(
         try:
             parent_fd = _open_directory(parent_path)
         except FileNotFoundError:
-            raise ProtectedLexicalNotApplicable(absolute) from None
+            raise ProtectedLexicalError("protected destination parent is missing") from None
         parent_identity = _identity(os.fstat(parent_fd))
         try:
             final_stat = os.stat(final_name, dir_fd=parent_fd, follow_symlinks=False)
         except FileNotFoundError:
-            raise ProtectedLexicalNotApplicable(absolute) from None
+            return ProtectedLexicalCandidate(
+                path=absolute,
+                parent_path=parent_path,
+                final_name=final_name,
+                parent_fd=parent_fd,
+                parent_identity=parent_identity,
+                final_identity={"kind": "absent"},
+                link_text=None,
+                target_path=None,
+                target_identity=None,
+                target_sha256=None,
+                candidate_mode=None,
+                initial_kind="absent",
+            )
         if not stat.S_ISLNK(final_stat.st_mode):
             if stat.S_ISREG(final_stat.st_mode):
-                raise ProtectedLexicalNotApplicable(absolute)
+                original_bytes, final_identity = _read_final_regular(
+                    parent_fd,
+                    final_name,
+                    expected_identity=_identity(final_stat),
+                )
+                return ProtectedLexicalCandidate(
+                    path=absolute,
+                    parent_path=parent_path,
+                    final_name=final_name,
+                    parent_fd=parent_fd,
+                    parent_identity=parent_identity,
+                    final_identity={"kind": "regular", **final_identity},
+                    link_text=None,
+                    target_path=None,
+                    target_identity=None,
+                    target_sha256=None,
+                    candidate_mode=stat.S_IMODE(final_stat.st_mode),
+                    initial_kind="regular",
+                    original_bytes=original_bytes,
+                )
             raise ProtectedLexicalError("protected final entry is not a regular-file symlink")
         link_text = os.readlink(final_name, dir_fd=parent_fd)
         target = _target_path(parent_path, link_text)
@@ -271,6 +324,7 @@ def prepare_candidate(
             target_identity=target_identity,
             target_sha256=hashlib.sha256(target_bytes).hexdigest(),
             candidate_mode=stat.S_IMODE(target_identity["st_mode"]),
+            initial_kind="symlink",
         )
     except Exception:
         if parent_fd >= 0:
@@ -299,7 +353,21 @@ def _check_parent(candidate: ProtectedLexicalCandidate) -> None:
 
 def _revalidate(candidate: ProtectedLexicalCandidate) -> None:
     _check_parent(candidate)
-    final_stat = os.stat(candidate.final_name, dir_fd=candidate.parent_fd, follow_symlinks=False)
+    try:
+        final_stat = os.stat(candidate.final_name, dir_fd=candidate.parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        if candidate.initial_kind == "absent":
+            return
+        raise ProtectedLexicalError("protected final entry changed after approval") from None
+    if candidate.initial_kind == "absent":
+        raise ProtectedLexicalError("protected final entry changed after approval")
+    if candidate.initial_kind == "regular":
+        if not stat.S_ISREG(final_stat.st_mode) or not _same_identity(
+            candidate.final_identity,
+            {"kind": "regular", **_identity(final_stat)},
+        ):
+            raise ProtectedLexicalError("protected final regular file changed after approval")
+        return
     if not stat.S_ISLNK(final_stat.st_mode):
         raise ProtectedLexicalError("protected final symlink changed after approval")
     link_text = os.readlink(candidate.final_name, dir_fd=candidate.parent_fd)
@@ -311,10 +379,36 @@ def _revalidate(candidate: ProtectedLexicalCandidate) -> None:
     if target != candidate.target_path:
         raise ProtectedLexicalError("protected external target path changed after approval")
     target_bytes, target_identity = _read_regular(target)
+    if candidate.target_identity is None or not _same_identity(candidate.target_identity, target_identity):
+        raise ProtectedLexicalError("protected external target identity changed after approval")
+    if candidate.target_sha256 is None or hashlib.sha256(target_bytes).hexdigest() != candidate.target_sha256:
+        raise ProtectedLexicalError("protected external target changed after approval")
+
+
+def read_candidate(candidate: ProtectedLexicalCandidate) -> bytes:
+    """Read an admitted protected entry without following its final leaf."""
+    _revalidate(candidate)
+    if candidate.initial_kind == "absent":
+        raise FileNotFoundError(candidate.path)
+    if candidate.initial_kind == "regular":
+        data, _ = _read_final_regular(
+            candidate.parent_fd,
+            candidate.final_name,
+            expected_identity=candidate.final_identity,
+        )
+        return data
+    if (
+        candidate.target_path is None
+        or candidate.target_identity is None
+        or candidate.target_sha256 is None
+    ):
+        raise ProtectedLexicalError("protected symlink token is incomplete")
+    target_bytes, target_identity = _read_regular(candidate.target_path)
     if not _same_identity(candidate.target_identity, target_identity):
         raise ProtectedLexicalError("protected external target identity changed after approval")
     if hashlib.sha256(target_bytes).hexdigest() != candidate.target_sha256:
         raise ProtectedLexicalError("protected external target changed after approval")
+    return target_bytes
 
 
 def _write_temp(candidate: ProtectedLexicalCandidate) -> str:
@@ -324,7 +418,7 @@ def _write_temp(candidate: ProtectedLexicalCandidate) -> str:
         fd = os.open(
             name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            0o600,
+            0o600 if candidate.candidate_mode is not None else 0o666,
             dir_fd=candidate.parent_fd,
         )
         view = memoryview(candidate.candidate_bytes)
@@ -333,7 +427,8 @@ def _write_temp(candidate: ProtectedLexicalCandidate) -> str:
             if written <= 0:
                 raise ProtectedLexicalError("protected temporary write made no progress")
             view = view[written:]
-        os.fchmod(fd, candidate.candidate_mode & 0o7777)
+        if candidate.candidate_mode is not None:
+            os.fchmod(fd, candidate.candidate_mode & 0o7777)
         os.fsync(fd)
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ProtectedLexicalError("protected temporary is not regular")
@@ -369,12 +464,56 @@ def _final_is_candidate(candidate: ProtectedLexicalCandidate) -> bool:
 
 
 def _rollback(candidate: ProtectedLexicalCandidate) -> None:
-    """Restore the symlink only while the retained parent still names the same directory."""
+    """Restore the original lexical state through the retained parent descriptor."""
     _check_parent(candidate)
     if not _final_is_candidate(candidate):
         raise ProtectedLexicalError("protected destination changed before rollback")
+    if candidate.initial_kind == "absent":
+        _unlink(candidate.parent_fd, candidate.final_name)
+        os.fsync(candidate.parent_fd)
+        try:
+            os.stat(candidate.final_name, dir_fd=candidate.parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        raise ProtectedLexicalError("protected absent entry rollback verification failed")
+    if candidate.initial_kind == "regular":
+        restore_name = _random_name(candidate.parent_fd)
+        restore_fd = -1
+        try:
+            restore_fd = os.open(
+                restore_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=candidate.parent_fd,
+            )
+            view = memoryview(candidate.original_bytes)
+            while view:
+                written = os.write(restore_fd, view)
+                if written <= 0:
+                    raise ProtectedLexicalError("protected regular rollback made no progress")
+                view = view[written:]
+            if candidate.candidate_mode is None:
+                raise ProtectedLexicalError("protected regular rollback mode is unavailable")
+            os.fchmod(restore_fd, candidate.candidate_mode & 0o7777)
+            os.fsync(restore_fd)
+            os.close(restore_fd)
+            restore_fd = -1
+            _rename(restore_name, candidate.final_name, candidate.parent_fd)
+            restore_name = ""
+            os.fsync(candidate.parent_fd)
+            restored, restored_identity = _read_final_regular(candidate.parent_fd, candidate.final_name)
+            if restored != candidate.original_bytes or stat.S_IMODE(restored_identity["st_mode"]) != candidate.candidate_mode:
+                raise ProtectedLexicalError("protected regular rollback verification failed")
+            return
+        finally:
+            if restore_fd >= 0:
+                os.close(restore_fd)
+            if restore_name:
+                _unlink(candidate.parent_fd, restore_name)
     restore_name = _random_name(candidate.parent_fd)
     try:
+        if candidate.link_text is None or candidate.target_path is None:
+            raise ProtectedLexicalError("protected symlink token is incomplete")
         os.symlink(candidate.link_text, restore_name, dir_fd=candidate.parent_fd)
         _rename(restore_name, candidate.final_name, candidate.parent_fd)
         restore_name = ""
@@ -384,7 +523,12 @@ def _rollback(candidate: ProtectedLexicalCandidate) -> None:
             candidate.final_name, dir_fd=candidate.parent_fd
         ) != candidate.link_text:
             raise ProtectedLexicalError("protected symlink rollback verification failed")
-        target_bytes, target_identity = _read_regular(candidate.target_path)
+        if candidate.target_identity is None or candidate.target_sha256 is None:
+            raise ProtectedLexicalError("protected symlink token is incomplete")
+        target_path = candidate.target_path
+        if target_path is None:
+            raise ProtectedLexicalError("protected symlink token is incomplete")
+        target_bytes, target_identity = _read_regular(target_path)
         if not _same_identity(candidate.target_identity, target_identity):
             raise ProtectedLexicalError("protected target identity changed during rollback")
         if hashlib.sha256(target_bytes).hexdigest() != candidate.target_sha256:
@@ -468,11 +612,14 @@ def commit_candidate(candidate: ProtectedLexicalCandidate) -> WriteResult:
                 os.close(fd)
             if final_hash != candidate.candidate_sha256:
                 raise ProtectedLexicalError("destination hash differs from requested bytes")
-            target_bytes, target_identity = _read_regular(candidate.target_path)
-            if not _same_identity(candidate.target_identity, target_identity):
-                raise ProtectedLexicalError("external target identity changed")
-            if hashlib.sha256(target_bytes).hexdigest() != candidate.target_sha256:
-                raise ProtectedLexicalError("external target changed")
+            if candidate.initial_kind == "symlink":
+                if candidate.target_path is None or candidate.target_identity is None or candidate.target_sha256 is None:
+                    raise ProtectedLexicalError("protected symlink token is incomplete")
+                target_bytes, target_identity = _read_regular(candidate.target_path)
+                if not _same_identity(candidate.target_identity, target_identity):
+                    raise ProtectedLexicalError("external target identity changed")
+                if hashlib.sha256(target_bytes).hexdigest() != candidate.target_sha256:
+                    raise ProtectedLexicalError("external target changed")
         except Exception as post_error:
             try:
                 _rollback(candidate)
