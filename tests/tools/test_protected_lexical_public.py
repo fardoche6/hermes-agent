@@ -202,6 +202,69 @@ def test_regular_or_absent_leaf_race_after_approval_fails_closed(
     assert result.get("success") is not True
 
 
+@pytest.mark.parametrize("operation", ["write", "patch"])
+def test_regular_leaf_approval_drift_rollback_preserves_newer_bytes(
+    tmp_path, monkeypatch, operation,
+):
+    import stat
+
+    import tools.protected_lexical_write as primitive
+
+    destination = tmp_path / "workspace" / "AGENTS.md"
+    destination.parent.mkdir()
+    destination.write_bytes(b"before\n")
+    original_inode = destination.stat().st_ino
+    original_mode = stat.S_IMODE(destination.stat().st_mode)
+    calls: list = []
+    parent_fsync_failed = False
+    original_fsync = primitive.os.fsync
+
+    def fail_one_parent_fsync(fd):
+        nonlocal parent_fsync_failed
+        if stat.S_ISDIR(os.fstat(fd).st_mode) and not parent_fsync_failed:
+            parent_fsync_failed = True
+            raise OSError("injected post-rename durability failure")
+        return original_fsync(fd)
+
+    def change_in_place_during_approval():
+        with destination.open("wb") as handle:
+            handle.write(
+                b"concurrent\n"
+                if operation == "write"
+                else b"before\nconcurrent\n"
+            )
+        assert destination.stat().st_ino == original_inode
+
+    monkeypatch.setattr(primitive.os, "fsync", fail_one_parent_fsync)
+    if operation == "write":
+        result = _write(
+            destination,
+            "candidate\n",
+            calls,
+            callback=change_in_place_during_approval,
+        )
+        expected = b"concurrent\n"
+    else:
+        result = _patch(
+            destination,
+            "before",
+            "candidate",
+            calls,
+            callback=change_in_place_during_approval,
+        )
+        expected = b"before\nconcurrent\n"
+
+    assert parent_fsync_failed is True
+    assert len(calls) == 1
+    assert result.get("error"), result
+    assert "rollback verified" in result["error"]
+    assert result.get("files_modified", []) == []
+    assert result.get("verified") is not True
+    assert result.get("success") is not True
+    assert destination.read_bytes() == expected
+    assert stat.S_IMODE(destination.stat().st_mode) == original_mode
+
+
 @pytest.mark.parametrize("target_kind", ["directory", "broken"])
 def test_symlink_to_directory_or_broken_target_is_rejected_before_approval(
     tmp_path, target_kind,
