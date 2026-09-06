@@ -30,6 +30,8 @@ from tools.file_operations_common import (
     _strip_terminal_fence_leaks, normalize_read_pagination, normalize_search_pagination)
 from tools.file_operations_lint import LINTERS_INPROC, LintMixin, _FAIL_CLOSED_INPROC_EXTS
 from tools.file_operations_search import SearchMixin
+from tools.protected_lexical_write import (
+    BackendAdmission, ProtectedLexicalCandidate, commit_candidate, prepare_candidate)
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +190,33 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         self._command_cache: Dict[str, bool] = {}
         self._rg_resolution_cache: Dict[str, str] = {}
         self._rg_modified_capability: Dict[str, Optional[str]] = {}
+
+    def protected_lexical_admission(self) -> BackendAdmission:
+        """Select the backend capability without inspecting a destination path."""
+        return BackendAdmission.for_environment(self.env)
+
+    def prepare_protected_lexical_candidate(
+        self, path: str, admission: BackendAdmission | None = None,
+        cwd: str | None = None,
+    ) -> ProtectedLexicalCandidate | None:
+        """Capture a protected final symlink without following its final entry."""
+        return prepare_candidate(
+            path,
+            cwd or getattr(self.env, "cwd", None) or self.cwd,
+            admission,
+        )
+
+    @staticmethod
+    def commit_protected_lexical_candidate(
+        candidate: ProtectedLexicalCandidate,
+    ) -> WriteResult:
+        """Commit the descriptor-bound candidate and prove its no-follow postcondition."""
+        return commit_candidate(candidate)
+
+    @staticmethod
+    def close_protected_lexical_candidate(candidate: ProtectedLexicalCandidate | None) -> None:
+        if candidate is not None:
+            candidate.close()
 
     def _exec(self, command: str, cwd: str = None, timeout: int = None,
               stdin_data: str = None) -> ExecuteResult:
@@ -1205,7 +1234,10 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             pass
         return None, None
 
-    def write_file(self, path: str, content: str, pre_content: Optional[str] = None) -> WriteResult:
+    def write_file(
+        self, path: str, content: str, pre_content: Optional[str] = None,
+        protected_lexical_candidate: ProtectedLexicalCandidate | None = None,
+    ) -> WriteResult:
         """Write content atomically, creating parent directories as needed.
 
         Order: deny list → lone-surrogate refusal → fail-closed syntax gate on the
@@ -1216,7 +1248,11 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         diagnostics when syntax is clean. ``pre_content``: pre-edit content the
         caller already has (skips the read); BOM detection always probes disk.
         """
-        path = self._expand_path(path)
+        path = (
+            protected_lexical_candidate.path
+            if protected_lexical_candidate is not None
+            else self._expand_path(path)
+        )
         denied = get_write_denied_error(path)
         if denied:
             return WriteResult(error=denied)
@@ -1247,12 +1283,19 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         # this content, so these are the bytes on disk; the early rejection above
         # guarantees this cannot raise.
         content_bytes = content.encode("utf-8", "surrogateescape")
-        write_result = self._atomic_write(path, content)
-        if write_result.exit_code != 0:
-            return WriteResult(error=f"Failed to write file: {write_result.stdout}")
-        content_verified, verify_error = self._verify_written_hash(path, content_bytes)
-        if verify_error is not None:
-            return verify_error
+        if protected_lexical_candidate is not None:
+            protected_lexical_candidate.set_content(content_bytes)
+            write_result = self.commit_protected_lexical_candidate(protected_lexical_candidate)
+            if write_result.error:
+                return write_result
+            content_verified = write_result.verified
+        else:
+            write_result = self._atomic_write(path, content)
+            if write_result.exit_code != 0:
+                return WriteResult(error=f"Failed to write file: {write_result.stdout}")
+            content_verified, verify_error = self._verify_written_hash(path, content_bytes)
+            if verify_error is not None:
+                return verify_error
 
         lint_result = self._check_lint_delta(path, pre_content=pre_content, post_content=content)
         # LSP diagnostics are a separate channel, fired only when the syntax tier is
@@ -1308,11 +1351,18 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
                 "The patch did not persist. Re-read the file and try again."))
         return None
 
-    def patch_replace(self, path: str, old_string: str, new_string: str,
-                      replace_all: bool = False) -> PatchResult:
+    def patch_replace(
+        self, path: str, old_string: str, new_string: str,
+        replace_all: bool = False,
+        protected_lexical_candidate: ProtectedLexicalCandidate | None = None,
+    ) -> PatchResult:
         """Replace text in a file using fuzzy matching (``old_string`` must be
         unique unless ``replace_all``). Returns a PatchResult with diff + lint."""
-        path = self._expand_path(path)
+        path = (
+            protected_lexical_candidate.path
+            if protected_lexical_candidate is not None
+            else self._expand_path(path)
+        )
         denied = get_write_denied_error(path)
         if denied:
             return PatchResult(error=denied)
@@ -1334,12 +1384,21 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         file_ending = _detect_line_ending(content)
         if file_ending:
             new_content = _normalize_line_endings(new_content, file_ending)
-        write_result = self.write_file(path, new_content, pre_content=raw_content)
+        write_result = self.write_file(
+            path,
+            new_content,
+            pre_content=raw_content,
+            protected_lexical_candidate=protected_lexical_candidate,
+        )
         if write_result.error:
             return PatchResult(error=f"Failed to write changes: {write_result.error}")
-        verify_error = self._verify_patch_persisted(path, new_content)
-        if verify_error is not None:
-            return verify_error
+        # The protected primitive already verified exact bytes through the retained
+        # parent descriptor with O_NOFOLLOW. A second path-based cat would follow a
+        # raced replacement and could validate the wrong target.
+        if protected_lexical_candidate is None:
+            verify_error = self._verify_patch_persisted(path, new_content)
+            if verify_error is not None:
+                return verify_error
         lint_result = self._check_lint_delta(path, pre_content=content, post_content=new_content)
         return PatchResult(
             success=True, diff=self._unified_diff(content, new_content, path), files_modified=[path],
@@ -1347,10 +1406,49 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             # From the internal write_file call, whose baseline was the pre-patch content.
             lsp_diagnostics=write_result.lsp_diagnostics)
 
-    def patch_v4a(self, patch_content: str) -> PatchResult:
-        """Apply a V4A format patch (``*** Begin Patch`` / ``*** Update File:`` /
-        ``@@ hint @@`` hunks / ``*** End Patch``)."""
+    def patch_v4a(
+        self, patch_content: str,
+        protected_lexical_candidates: dict[str, ProtectedLexicalCandidate] | None = None,
+    ) -> PatchResult:
+        """Apply a V4A patch, optionally routing one protected update through the
+        descriptor-bound lexical primitive."""
         from tools.patch_parser import parse_v4a_patch, apply_v4a_operations
+        if protected_lexical_candidates:
+            operations, parse_error = parse_v4a_patch(patch_content)
+            if parse_error:
+                return PatchResult(error=f"Failed to parse patch: {parse_error}")
+            if len(operations) != 1 or operations[0].operation.value != "update":
+                return PatchResult(
+                    error=(
+                        "Protected lexical replacement does not support a mixed or "
+                        "multi-file V4A patch; no files were modified."
+                    )
+                )
+
+            class _ProtectedV4AOperations:
+                def __init__(self, delegate, candidates):
+                    self._delegate = delegate
+                    self._candidates = candidates
+
+                def read_file_raw(self, path):
+                    return self._delegate.read_file_raw(path)
+
+                def write_file(self, path, content, pre_content=None):
+                    candidate = self._candidates.get(path)
+                    return self._delegate.write_file(
+                        path,
+                        content,
+                        pre_content=pre_content,
+                        protected_lexical_candidate=candidate,
+                    )
+
+                def __getattr__(self, name):
+                    return getattr(self._delegate, name)
+
+            return apply_v4a_operations(
+                operations,
+                _ProtectedV4AOperations(self, protected_lexical_candidates),
+            )
         operations, parse_error = parse_v4a_patch(patch_content)
         if parse_error:
             return PatchResult(error=f"Failed to parse patch: {parse_error}")

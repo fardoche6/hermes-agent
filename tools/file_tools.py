@@ -27,10 +27,13 @@ from tools import file_state
 from agent.redact import redact_sensitive_text
 from tools.file_tools_paths import (
     _expand_tilde, _path_resolution_warning, _resolve_base_dir, _resolve_path_for_task)
+from tools.protected_lexical_write import (
+    BackendAdmission, ProtectedLexicalCandidate, ProtectedLexicalError, ProtectedLexicalNotApplicable,
+    lexical_path)
 from tools.file_tools_write_guards import (
     _READ_DEDUP_STATUS_MESSAGE, _check_approval_required_write, _check_binary_document_write,
     _check_cross_profile_path, _check_protected_instruction_write, _check_sensitive_path,
-    _is_internal_file_tool_content)
+    _is_internal_file_tool_content, _protected_instruction_config, _protected_instruction_reason)
 from tools.file_tools_read_tracking import (
     _bump_consecutive, _cap_read_tracker_data, _check_file_staleness, _check_not_found_cache,
     _mark_verification_stale, _patch_failure_lock, _patch_failure_tracker, _read_tracker,
@@ -664,8 +667,88 @@ def _resolve_or_none(filepath: str, task_id: str) -> str | None:
         return None
 
 
+def _lexical_cwd(task_id: str, file_ops) -> str | None:
+    """Use the task's backend cwd as a lexical anchor, without final-leaf resolve."""
+    try:
+        return str(_resolve_base_dir(task_id))
+    except Exception:
+        env = getattr(file_ops, "env", None)
+        return getattr(env, "cwd", None) or getattr(file_ops, "cwd", None)
+
+
+def _lexical_identity(filepath: str, task_id: str, file_ops) -> str | None:
+    """Return the backend-relative lexical identity without following symlinks."""
+    return lexical_path(filepath, _lexical_cwd(task_id, file_ops))
+
+
+def _close_protected_candidates(
+    candidates: dict[str, ProtectedLexicalCandidate],
+) -> None:
+    for candidate in candidates.values():
+        candidate.close()
+
+
+def _lexical_path_is_ambiguous(filepath: str) -> bool:
+    try:
+        raw = os.fspath(filepath)
+    except TypeError:
+        return True
+    if not isinstance(raw, str) or not raw or "\x00" in raw:
+        return True
+    parts = raw.replace("\\", "/").split("/")
+    if os.path.isabs(raw) and parts:
+        parts = parts[1:]
+    return any(part in ("", ".", "..") for part in parts)
+
+
+def _protected_candidates_for_paths(
+    paths: list[str], task_id: str, file_ops, admission: BackendAdmission,
+) -> tuple[dict[str, ProtectedLexicalCandidate], str | None, list[str]]:
+    """Preflight protected symlinks after backend admission and before approval."""
+    enabled, extra = _protected_instruction_config()
+    if not enabled:
+        return {}, None, []
+    protected_paths = [
+        path for path in paths
+        if _protected_instruction_reason(
+            path, task_id, enabled=enabled, extra_patterns=extra)
+    ]
+    if not protected_paths:
+        return {}, None, []
+    if not admission.supported:
+        return {}, admission.error or "protected lexical replacement capability unavailable", []
+
+    deferred = [path for path in dict.fromkeys(protected_paths) if _lexical_path_is_ambiguous(path)]
+    candidates: dict[str, ProtectedLexicalCandidate] = {}
+    try:
+        for path in dict.fromkeys(protected_paths):
+            if path in deferred:
+                continue
+            try:
+                candidate = file_ops.prepare_protected_lexical_candidate(
+                    path,
+                    admission,
+                    cwd=_lexical_cwd(task_id, file_ops),
+                )
+            except ProtectedLexicalNotApplicable:
+                candidate = None
+            if candidate is not None:
+                candidates[path] = candidate
+    except Exception as exc:
+        _close_protected_candidates(candidates)
+        return {}, str(exc), deferred
+    return candidates, None, deferred
+
+
+def _backend_path(path: str, path_to_resolved: dict, candidates: dict) -> str:
+    candidate = candidates.get(path)
+    if candidate is not None:
+        return candidate.path
+    return path_to_resolved.get(path) or path
+
+
 def _write_precheck_error(paths: list[str], content_paths: list[str], task_id: str,
-                          cross_profile: bool) -> str | None:
+                          cross_profile: bool, *, include_approval: bool = True) -> str | None:
     """Run the shared write/patch guards in order; return the first error string.
 
     Order matters: hard denies (sensitive path, mirror) and the corruption
@@ -681,33 +764,46 @@ def _write_precheck_error(paths: list[str], content_paths: list[str], task_id: s
         err = _check_binary_document_write(p, task_id)
         if err:
             return err
+    if not include_approval:
+        return None
     return (_check_protected_instruction_write(paths, task_id)
             or _check_approval_required_write(paths, task_id))
 
 
-def _edit_warnings(paths: list[str], path_to_resolved: dict, task_id: str) -> list[str]:
-    """One pre-edit warning per path, in priority order: cross-agent registry
-    (names the sibling subagent) > per-task staleness > workspace divergence
-    (relative path resolving outside the terminal's cwd — the worktree-cwd bug)."""
+def _edit_warnings(
+    paths: list[str], path_to_resolved: dict, task_id: str,
+    path_to_identity: dict | None = None,
+) -> list[str]:
+    """One pre-edit warning per path, bound to the lexical identity when a
+    protected final entry is being replaced."""
     warnings: list[str] = []
+    path_to_identity = path_to_identity or {}
     for p in paths:
-        r = path_to_resolved.get(p)
-        w = (file_state.check_stale(task_id, r) if r else None) or _check_file_staleness(p, task_id)
-        if not w and r:
-            w = _path_resolution_warning(p, Path(r), task_id)
+        resolved = path_to_identity.get(p) or path_to_resolved.get(p)
+        w = (file_state.check_stale(task_id, resolved) if resolved else None)
+        if not w:
+            w = _check_file_staleness(
+                p, task_id, identity_path=path_to_identity.get(p))
+        if not w and path_to_resolved.get(p):
+            w = _path_resolution_warning(p, Path(path_to_resolved[p]), task_id)
         if w:
             warnings.append(w)
     return warnings
 
 
-def _note_edited(task_id: str, paths: list[str], path_to_resolved: dict, session_id: str | None) -> None:
-    """Post-success bookkeeping: verification-stale marker, then per path refresh
-    the read stamp (no false staleness on the next edit) and record the write."""
-    _mark_verification_stale(task_id, [path_to_resolved.get(p) or p for p in paths], session_id=session_id)
+def _note_edited(
+    task_id: str, paths: list[str], path_to_resolved: dict,
+    session_id: str | None, path_to_identity: dict | None = None,
+) -> None:
+    path_to_identity = path_to_identity or {}
+    tracking_paths = [path_to_identity.get(p) or path_to_resolved.get(p) or p for p in paths]
+    _mark_verification_stale(task_id, tracking_paths, session_id=session_id)
     for p in paths:
-        _update_read_timestamp(p, task_id)
-        if path_to_resolved.get(p):
-            file_state.note_write(task_id, path_to_resolved[p])
+        _update_read_timestamp(
+            p, task_id, identity_path=path_to_identity.get(p))
+        tracking_path = path_to_identity.get(p) or path_to_resolved.get(p)
+        if tracking_path:
+            file_state.note_write(task_id, tracking_path)
 
 
 # Whole-file rewrite hint: an overwrite of an existing file this large whose new content keeps at least
@@ -765,11 +861,11 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     (unadvertised in the schema; the mirror rejection error teaches it — the
     cross-PROFILE guard it was named for no longer exists).
     """
-    # write_file checks the binary-document guard before the mirror guard.
+    # Keep hard denies and malformed internal display content before environment
+    # creation. Capability selection follows these non-mutating guards and still
+    # precedes protected lexical classification and all descriptor inspection.
     err = (_check_sensitive_path(path, task_id)
            or _check_binary_document_write(path, task_id)
-           or _check_protected_instruction_write([path], task_id)
-           or _check_approval_required_write([path], task_id)
            or (None if cross_profile else _check_cross_profile_path(path, task_id)))
     if not err and _is_internal_file_tool_content(content):
         err = ("Refusing to write internal read_file display text as file content. "
@@ -777,33 +873,78 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                "file contents before writing.")
     if err:
         return tool_error(err)
+
+    try:
+        file_ops = _get_file_ops(task_id)
+        admission = file_ops.protected_lexical_admission()
+    except Exception as exc:
+        if _is_expected_write_exception(exc):
+            logger.debug("write_file expected denial: %s: %s", type(exc).__name__, exc)
+        else:
+            logger.error("write_file error: %s: %s", type(exc).__name__, exc, exc_info=True)
+        return tool_error(str(exc))
+
+    candidates, preflight_error, deferred_paths = _protected_candidates_for_paths(
+        [path], task_id, file_ops, admission)
+    if preflight_error:
+        return tool_error(preflight_error)
+    try:
+        approval_error = (_check_protected_instruction_write([path], task_id)
+                          or _check_approval_required_write([path], task_id))
+    except Exception as exc:
+        _close_protected_candidates(candidates)
+        return tool_error(f"approval failed closed: {exc}")
+    if approval_error:
+        _close_protected_candidates(candidates)
+        return tool_error(approval_error)
+    if deferred_paths:
+        _close_protected_candidates(candidates)
+        return tool_error("protected path contains an ambiguous dot or empty component")
+
     try:
         # Resolution failure falls back to the legacy unlocked path (the write
         # still proceeds; the per-task staleness check still runs).
         _resolved = _resolve_or_none(path, task_id)
         path_to_resolved = {path: _resolved}
+        path_to_identity = {
+            path: candidates[path].path for path in candidates
+        }
+        lock_path = _backend_path(path, path_to_resolved, candidates)
+        tracking = path_to_identity or {}
         with ExitStack() as _lock:
-            if _resolved:
-                # Per-path lock serializes read→modify→write across concurrent
-                # subagents; different paths stay fully parallel.
-                _lock.enter_context(file_state.lock_path(_resolved))
-            warnings = _edit_warnings([path], path_to_resolved, task_id)
-            rewrite_hint = _whole_file_rewrite_hint(task_id, _resolved, content)
-            result_dict = _get_file_ops(task_id).write_file(_resolved or path, content).to_dict()
+            if lock_path:
+                # Per-path locking must use the lexical candidate path when one
+                # was admitted; ordinary writes retain the resolved backend path.
+                _lock.enter_context(file_state.lock_path(lock_path))
+            warnings = _edit_warnings(
+                [path], path_to_resolved, task_id, path_to_identity=tracking)
+            backend_path = _backend_path(path, path_to_resolved, candidates)
+            candidate = candidates.get(path)
+            rewrite_hint = None
+            if candidate is not None:
+                result = file_ops.write_file(
+                    backend_path, content, protected_lexical_candidate=candidate)
+            else:
+                rewrite_hint = _whole_file_rewrite_hint(task_id, _resolved, content)
+                result = file_ops.write_file(backend_path, content)
+            result_dict = result.to_dict()
             if warnings:
                 result_dict["_warning"] = warnings[0]
             if rewrite_hint and not result_dict.get("error"):
                 result_dict["hint"] = rewrite_hint
-            if _resolved:
-                # Always report the ABSOLUTE path written so a wrong-cwd mismatch
-                # is visible in the response instead of silently landing elsewhere.
-                result_dict["resolved_path"] = _resolved
+            if backend_path:
+                # Always report the absolute/backend path actually written so a
+                # wrong-cwd mismatch is visible instead of silently landing elsewhere.
+                result_dict["resolved_path"] = backend_path
             if result_dict.get("error"):
-                _update_read_timestamp(path, task_id)
+                _update_read_timestamp(
+                    path, task_id, identity_path=tracking.get(path))
             else:
-                if _resolved:
-                    result_dict["files_modified"] = [_resolved]
-                _note_edited(task_id, [path], path_to_resolved, session_id)
+                if backend_path:
+                    result_dict["files_modified"] = [backend_path]
+                _note_edited(
+                    task_id, [path], path_to_resolved, session_id,
+                    path_to_identity=tracking)
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
         if _is_expected_write_exception(e):
@@ -811,6 +952,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         else:
             logger.error("write_file error: %s: %s", type(e).__name__, e, exc_info=True)
         return tool_error(str(e))
+    finally:
+        _close_protected_candidates(candidates)
 
 
 def _collect_v4a_header_paths(patch: str) -> tuple[list[str], list[str]] | str:
@@ -858,56 +1001,162 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             return collected
         _paths_to_check += collected[0]
         _content_write_paths += collected[1]
-    precheck_err = _write_precheck_error(_paths_to_check, _content_write_paths, task_id, cross_profile)
+
+    if mode == "replace":
+        if not path:
+            return tool_error("path required")
+        if old_string is None or new_string is None:
+            return tool_error("old_string and new_string required")
+    elif mode == "patch":
+        if not patch:
+            return tool_error("patch content required")
+    else:
+        return tool_error(f"Unknown mode: {mode}")
+
+    precheck_err = _write_precheck_error(
+        _paths_to_check,
+        _content_write_paths,
+        task_id,
+        cross_profile,
+        include_approval=False,
+    )
     if precheck_err:
         return tool_error(precheck_err)
-    try:
-        # Lock paths in sorted, deduplicated order so concurrent callers with
-        # overlapping multi-file patches can't deadlock (every caller locks in
-        # the same order). An unresolvable path is simply not locked.
-        _path_to_resolved: dict[str, str] = {_p: _resolve_or_none(_p, task_id) for _p in _paths_to_check}
-        with ExitStack() as _locks:
-            for _r in sorted({_r for _r in _path_to_resolved.values() if _r}):
-                _locks.enter_context(file_state.lock_path(_r))
-            stale_warnings = _edit_warnings(_paths_to_check, _path_to_resolved, task_id)
-            file_ops = _get_file_ops(task_id)
 
-            # Hand the shell layer the RESOLVED targets so both layers agree on
-            # which file is edited even when the shell's cwd differs.
+    # Capability selection precedes protected lexical classification and all
+    # descriptor inspection, while hard-deny prechecks above stay environment-free.
+    try:
+        file_ops = _get_file_ops(task_id)
+        admission = file_ops.protected_lexical_admission()
+    except Exception as exc:
+        if _is_expected_write_exception(exc):
+            logger.debug("patch expected denial: %s: %s", type(exc).__name__, exc)
+        else:
+            logger.error("patch error: %s: %s", type(exc).__name__, exc, exc_info=True)
+        return tool_error(str(exc))
+
+    candidates, preflight_error, deferred_paths = _protected_candidates_for_paths(
+        _paths_to_check, task_id, file_ops, admission)
+    if preflight_error:
+        return tool_error(preflight_error)
+    if candidates and (
+        mode != "replace"
+        and (len(set(_paths_to_check)) != 1 or len(candidates) != 1)
+    ):
+        _close_protected_candidates(candidates)
+        return tool_error(
+            "Protected lexical replacement does not support a mixed or multi-file "
+            "V4A patch; no files were modified."
+        )
+    try:
+        approval_error = (_check_protected_instruction_write(_paths_to_check, task_id)
+                          or _check_approval_required_write(_paths_to_check, task_id))
+    except Exception as exc:
+        _close_protected_candidates(candidates)
+        return tool_error(f"approval failed closed: {exc}")
+    if approval_error:
+        _close_protected_candidates(candidates)
+        return tool_error(approval_error)
+    if deferred_paths:
+        _close_protected_candidates(candidates)
+        return tool_error("protected path contains an ambiguous dot or empty component")
+
+    _path_to_resolved: dict[str, str | None] = {}
+    _path_to_identity: dict[str, str | None] = {}
+    try:
+        # Lexical identities are never produced by Path.resolve(); they remain
+        # distinct from the followed physical paths used by ordinary backends.
+        _path_to_resolved = {
+            _p: _resolve_or_none(_p, task_id) for _p in _paths_to_check
+        }
+        _path_to_identity = {
+            _p: _lexical_identity(_p, task_id, file_ops) for _p in _paths_to_check
+        }
+        tracking = {
+            _p: candidate.path for _p, candidate in candidates.items()
+        }
+        lock_keys = {
+            _backend_path(_p, _path_to_resolved, candidates)
+            for _p in _paths_to_check
+        }
+        with ExitStack() as _locks:
+            for _lock_key in sorted(key for key in lock_keys if key):
+                _locks.enter_context(file_state.lock_path(_lock_key))
+            stale_warnings = _edit_warnings(
+                _paths_to_check,
+                _path_to_resolved,
+                task_id,
+                path_to_identity=tracking,
+            )
+            path_to_backend = {
+                _p: _backend_path(_p, _path_to_resolved, candidates)
+                for _p in _paths_to_check
+            }
             if mode == "replace":
-                if not path:
-                    return tool_error("path required")
-                if old_string is None or new_string is None:
-                    return tool_error("old_string and new_string required")
-                _replace_target = _path_to_resolved.get(path) or path
-                result = file_ops.patch_replace(_replace_target, old_string, new_string, replace_all)
-            elif mode == "patch":
-                if not patch:
-                    return tool_error("patch content required")
-                result = file_ops.patch_v4a(_rewrite_v4a_patch_paths_for_host(patch, _path_to_resolved, file_ops))
+                _replace_target = path_to_backend.get(path) or path
+                candidate = candidates.get(path)
+                if candidate is not None:
+                    result = file_ops.patch_replace(
+                        _replace_target,
+                        old_string,
+                        new_string,
+                        replace_all,
+                        protected_lexical_candidate=candidate,
+                    )
+                else:
+                    result = file_ops.patch_replace(
+                        _replace_target, old_string, new_string, replace_all)
             else:
-                return tool_error(f"Unknown mode: {mode}")
+                rewritten = _rewrite_v4a_patch_paths_for_host(
+                    patch, path_to_backend, file_ops)
+                if candidates:
+                    result = file_ops.patch_v4a(
+                        rewritten,
+                        protected_lexical_candidates={
+                            candidate.path: candidate for candidate in candidates.values()
+                        },
+                    )
+                else:
+                    result = file_ops.patch_v4a(rewritten)
 
             result_dict = result.to_dict()
             if stale_warnings:
                 result_dict["_warning"] = " | ".join(stale_warnings)
             if not result_dict.get("error"):
-                # Report the ABSOLUTE path(s) actually patched so a wrong-cwd
-                # mismatch is visible instead of silently landing elsewhere.
-                _resolved_modified = [_path_to_resolved.get(_p) or _p for _p in _paths_to_check]
-                result_dict["files_modified"] = _resolved_modified
-                if len(_resolved_modified) == 1:
-                    result_dict["resolved_path"] = _resolved_modified[0]
-                _note_edited(task_id, _paths_to_check, _path_to_resolved, session_id)
-                # Clear failure counters so a future miss starts a fresh count.
-                _reset_patch_failures(task_id, [_r for _r in _path_to_resolved.values() if _r])
+                modified = [
+                    path_to_backend.get(_p) or _p for _p in _paths_to_check
+                ]
+                result_dict["files_modified"] = modified
+                if len(modified) == 1:
+                    result_dict["resolved_path"] = modified[0]
+                _note_edited(
+                    task_id,
+                    _paths_to_check,
+                    _path_to_resolved,
+                    session_id,
+                    path_to_identity=tracking,
+                )
+                # Reset exactly the identities used for failure accounting. The
+                # fallback is for legacy doubles that cannot provide a lexical key.
+                reset_keys = [
+                    _path_to_identity.get(_p)
+                    or _path_to_resolved.get(_p)
+                    or _p
+                    for _p in _paths_to_check
+                ]
+                _reset_patch_failures(task_id, reset_keys)
         # old_string-not-found hint. Failure escalation is tracked for replace
         # mode only (V4A misses are rare); the generic hint is suppressed when
         # patch_replace already attached a richer "Did you mean?" snippet.
         if result_dict.get("error") and "Could not find" in str(result_dict["error"]):
             failure_count = 0
             if mode == "replace" and path:
-                failure_count = _record_patch_failure(task_id, _path_to_resolved.get(path) or path)
+                failure_key = _path_to_identity.get(path)
+                if failure_key is None:
+                    # Compatibility fallback for legacy/non-production doubles
+                    # that cannot expose a lexical identity.
+                    failure_key = _path_to_resolved.get(path) or path
+                failure_count = _record_patch_failure(task_id, failure_key)
             if failure_count >= 3:
                 result_dict["_hint"] = (
                     f"This is failure #{failure_count} patching {path!r}. "
@@ -924,6 +1173,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
         return tool_error(str(e))
+    finally:
+        _close_protected_candidates(candidates)
 
 
 def search_tool(pattern: str, target: str = "content", path: str = ".",
