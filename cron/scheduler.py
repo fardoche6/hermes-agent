@@ -2679,9 +2679,12 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
     env = os.environ.copy()
     if profile:
         argv += ["-p", profile]
-        # -p owns profile resolution in the child; a leftover HERMES_HOME
-        # from THIS scheduler's profile must not shadow it.
-        env.pop("HERMES_HOME", None)
+        # Bind the target before spawning.  Leaving resolution to ``-p`` with
+        # the scheduler's inherited HERMES_HOME lets a parent profile (or its
+        # managed HOME) anchor the child incorrectly.
+        from hermes_cli.profiles import build_profile_launch_env
+
+        env = build_profile_launch_env(profile, base_env=env)
 
     # The prefix tells the receiving bot this is scheduled output, not the
     # human typing — mirrors the Bot Mode sender-attribution convention.

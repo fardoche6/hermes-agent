@@ -30,6 +30,7 @@ from hermes_cli.profiles import (
     get_active_profile,
     get_active_profile_name,
     resolve_profile_env,
+    build_profile_launch_env,
     check_alias_collision,
     create_wrapper_script,
     remove_wrapper_script,
@@ -1133,15 +1134,13 @@ class TestProfilesToServe:
 
 
 # ---------------------------------------------------------------------------
-# resolve_profile_env spelling preservation (#82581 junction follow-up)
+# resolve_profile_env root selection (#82581 junction follow-up)
 # ---------------------------------------------------------------------------
 
 
 class TestResolveProfileEnvSpelling:
-    """resolve_profile_env() keeps the configured HERMES_HOME spelling as
-
-    the launch root (junction installs) while preserving the pre-existing
-    profile-path handling and existence/validation semantics.
+    """resolve_profile_env() preserves root-shaped launch spelling while
+    canonicalizing inherited named-profile and tool-home values.
     """
 
     def test_resolution_matrix_preserves_configured_spelling(self, monkeypatch, tmp_path):
@@ -1170,6 +1169,55 @@ class TestResolveProfileEnvSpelling:
         monkeypatch.setenv("HERMES_HOME", str(root))
         with pytest.raises(FileNotFoundError):
             resolve_profile_env("nope")
+
+    def test_noncanonical_parent_tool_home_resolves_sibling(self, monkeypatch, tmp_path):
+        """A parent's ``home/`` cannot become the target profile root."""
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        root = tmp_path / ".hermes"
+        parent = root / "profiles" / "orchestrator"
+        target = root / "profiles" / "programmer-luna"
+        (parent / "home").mkdir(parents=True)
+        target.mkdir(parents=True)
+        inherited_home = parent / "home"
+        monkeypatch.setenv("HERMES_HOME", str(inherited_home))
+
+        assert Path(resolve_profile_env("programmer-luna")) == target
+        assert not (inherited_home / "profiles" / "programmer-luna").exists()
+
+    def test_profile_launch_env_rebinds_home_atomically(self, monkeypatch, tmp_path):
+        """A child gets only the selected profile's Hermes and tool homes."""
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        root = tmp_path / ".hermes"
+        parent = root / "profiles" / "orchestrator"
+        target = root / "profiles" / "programmer-luna"
+        (parent / "home").mkdir(parents=True)
+        (target / "home").mkdir(parents=True)
+        inherited = {
+            "HERMES_HOME": str(parent),
+            "HOME": str(parent / "home"),
+            "HERMES_REAL_HOME": str(tmp_path),
+        }
+
+        child = build_profile_launch_env("programmer-luna", base_env=inherited)
+
+        assert child["HERMES_HOME"] == str(target)
+        assert child["HOME"] == str(target / "home")
+        assert inherited["HERMES_HOME"] == str(parent)
+        assert inherited["HOME"] == str(parent / "home")
+
+    def test_root_shaped_launch_env_targets_named_profile(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        root = tmp_path / ".hermes"
+        target = root / "profiles" / "programmer-luna"
+        (root / "home").mkdir(parents=True)
+        (target / "home").mkdir(parents=True)
+        inherited = {"HERMES_HOME": str(root), "HOME": str(root / "home")}
+
+        child = build_profile_launch_env("programmer-luna", base_env=inherited)
+
+        assert child["HERMES_HOME"] == str(target)
+        assert child["HOME"] == str(target / "home")
+        assert child["HERMES_REAL_HOME"] != str(root / "home")
 
     def test_unset_env_falls_back_to_default_root(self, monkeypatch):
         # No HERMES_HOME: the platform default root applies (existing contract).

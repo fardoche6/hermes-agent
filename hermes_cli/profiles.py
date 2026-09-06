@@ -31,7 +31,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 
 from agent.skill_utils import is_excluded_skill_path
 from hermes_cli.archive_safe import (
@@ -2612,30 +2612,87 @@ def rename_profile(old_name: str, new_name: str) -> Path:
 # Profile env resolution (called from _apply_profile_override)
 # ---------------------------------------------------------------------------
 
-def resolve_profile_env(profile_name: str) -> str:
+def _absolute_profile_path(path: str | Path) -> Path:
+    """Return an absolute path without resolving away its configured spelling."""
+    return Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+
+
+def _platform_profile_root() -> Path:
+    """Return the platform default root without consulting ``HERMES_HOME``."""
+    from hermes_constants import _get_platform_default_hermes_home
+
+    return _absolute_profile_path(_get_platform_default_hermes_home())
+
+
+def _profile_root_from_home(home: str | Path | None) -> Path:
+    """Resolve the canonical profile root represented by an inherited home.
+
+    A child may inherit any of these values from its parent:
+
+    * ``<root>`` — the default/root profile;
+    * ``<root>/profiles/<name>`` — the parent named profile; or
+    * a tool-home descendant such as ``<root>/profiles/<name>/home``.
+
+    The last form is the dangerous one: treating it as a root creates
+    ``<parent>/home/profiles/<target>``.  Walk ancestors for a profile-shaped
+    component before accepting a custom root, and keep the platform default
+    root authoritative for the normal ``~/.hermes`` layout.
+    """
+    if home is None or not str(home).strip():
+        return _platform_profile_root()
+
+    candidate = _absolute_profile_path(home)
+    platform_root = _platform_profile_root()
+    try:
+        candidate.relative_to(platform_root)
+    except ValueError:
+        pass
+    else:
+        return platform_root
+
+    for ancestor in (candidate, *candidate.parents):
+        if ancestor.parent.name != "profiles":
+            continue
+        try:
+            normalized = normalize_profile_name(ancestor.name)
+            validate_profile_name(normalized)
+        except ValueError:
+            continue
+        if normalized == ancestor.name:
+            return ancestor.parent.parent
+
+    # A custom deployment's root is allowed to live outside the platform
+    # default (for example ``/opt/data``).  It remains authoritative when the
+    # inherited value is root-shaped and not a descendant of a named profile.
+    return candidate
+
+
+def _configured_hermes_home(env: Mapping[str, str] | None = None) -> str:
+    """Read the process/child HERMES_HOME without consulting a context override."""
+    if env is not None:
+        return str(env.get("HERMES_HOME", "")).strip()
+    return os.environ.get("HERMES_HOME", "").strip()
+
+
+def resolve_profile_env(
+    profile_name: str,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> str:
     """Resolve a profile name to a HERMES_HOME path string.
 
     Called early in the CLI entry point, before any hermes modules
     are imported, to set the HERMES_HOME environment variable.
 
-    When HERMES_HOME is already set, the configured spelling IS the
-    launch root (it may be a junction/symlink alias of the platform
-    default).  Keep that spelling so profile re-home does not destroy
-    the launcher's lexical provenance -- the subprocess sanitizer needs
-    it to match Hermes-owned PYTHONPATH entries written in the same
-    spelling (#82581 junction follow-up).  Physically the paths are
-    identical (junction-transparent); only the spelling is preserved.
+    When HERMES_HOME is already set, distinguish a root-shaped value from
+    both a named-profile value and a descendant of a named profile.  The
+    configured spelling is retained after making the result absolute so
+    junction/symlink launchers keep their lexical provenance (#82581), but a
+    parent profile can never become the root of a sibling target.
     """
     canon = normalize_profile_name(profile_name)
     validate_profile_name(canon)
-    env_home = os.environ.get("HERMES_HOME", "").strip()
-    if env_home:
-        env_path = Path(env_home)
-        # A profile-shaped env value means the root is the grandparent
-        # (mirrors get_default_hermes_root()).
-        root = env_path.parent.parent if env_path.parent.name == "profiles" else env_path
-    else:
-        root = _get_default_hermes_home()
+    root = _profile_root_from_home(_configured_hermes_home(env) or None)
     if canon == "default":
         return str(root)
     profile_dir = root / "profiles" / canon
@@ -2647,3 +2704,53 @@ def resolve_profile_env(profile_name: str) -> str:
         )
 
     return str(profile_dir)
+
+
+def build_profile_launch_env(
+    profile_name: str,
+    *,
+    base_env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Build an atomic environment for a child bound to *profile_name*.
+
+    The target ``HERMES_HOME`` is resolved before it is written, using the
+    canonical root represented by the caller's inherited environment.  The
+    subprocess ``HOME`` policy is then applied *after* that write, so a parent
+    root/profile ``HOME`` cannot remain attached to the child.  The caller's
+    mapping is never mutated.
+    """
+    env = dict(os.environ if base_env is None else base_env)
+    inherited_home = env.get("HERMES_HOME") or os.environ.get("HERMES_HOME", "")
+    inherited_tool_home = ""
+    if inherited_home:
+        inherited_tool_home = str(_absolute_profile_path(inherited_home) / "home")
+    inherited_process_home = str(env.get("HOME", "")).strip()
+    inherited_hermes_tool_home = bool(
+        inherited_tool_home
+        and inherited_process_home
+        and os.path.normcase(os.path.abspath(os.path.expanduser(inherited_process_home)))
+        == os.path.normcase(os.path.abspath(os.path.expanduser(inherited_tool_home)))
+    )
+
+    from hermes_constants import apply_subprocess_home_env, get_real_home
+
+    # Determine the account HOME while the inherited HERMES_HOME still
+    # describes the parent.  If this is delayed until after the target bind,
+    # ``HOME=<parent>/home`` can be mistaken for the child's real HOME.
+    inherited_real_home = get_real_home(env)
+    target_home = resolve_profile_env(profile_name, env=env)
+    env["HERMES_HOME"] = target_home
+    if inherited_real_home:
+        env["HERMES_REAL_HOME"] = inherited_real_home
+
+    apply_subprocess_home_env(env)
+
+    # ``auto`` mode intentionally preserves a host user's real HOME for
+    # ordinary terminal commands.  A profile child is different: when its
+    # parent was already using Hermes' managed tool HOME, carry that isolation
+    # to the selected sibling rather than leaving the parent's HOME behind.
+    target_tool_home = _absolute_profile_path(target_home) / "home"
+    if inherited_hermes_tool_home and target_tool_home.is_dir():
+        env["HOME"] = str(target_tool_home)
+
+    return env

@@ -1229,7 +1229,14 @@ def _norm_home_path(path: str | None) -> str:
 
 def _profile_home_path(env: dict[str, str] | None = None) -> str | None:
     """Return ``{HERMES_HOME}/home`` when the profile-home directory exists."""
-    hermes_home = get_hermes_home_override() or (env or {}).get("HERMES_HOME") or os.getenv("HERMES_HOME")
+    # An explicit child environment is authoritative.  A context-local
+    # override belongs to the caller's in-process task and must not re-anchor a
+    # child whose HERMES_HOME was already resolved to a different profile.
+    hermes_home = (
+        (env or {}).get("HERMES_HOME")
+        or get_hermes_home_override()
+        or os.getenv("HERMES_HOME")
+    )
     if not hermes_home:
         return None
     profile_home = os.path.join(hermes_home, "home")
@@ -1240,6 +1247,20 @@ def _profile_home_path(env: dict[str, str] | None = None) -> str | None:
 
 def _is_profile_home(candidate: str | None, profile_home: str | None) -> bool:
     return bool(candidate and profile_home and _norm_home_path(candidate) == _norm_home_path(profile_home))
+
+
+def _named_profile_tool_home(candidate: str | None) -> str | None:
+    """Return the named-profile owner when *candidate* is ``<profile>/home``."""
+    if not candidate:
+        return None
+    try:
+        owner = named_profile_home(candidate)
+    except Exception:
+        return None
+    if owner is None:
+        return None
+    tool_home = str(owner / "home")
+    return owner.name if _norm_home_path(candidate) == _norm_home_path(tool_home) else None
 
 
 def _iter_real_home_candidates(env: dict[str, str] | None = None) -> list[str]:
@@ -1288,7 +1309,7 @@ def get_real_home(env: dict[str, str] | None = None) -> str:
         if not key or key in seen:
             continue
         seen.add(key)
-        if not _is_profile_home(candidate, profile_home):
+        if not _is_profile_home(candidate, profile_home) and not _named_profile_tool_home(candidate):
             return candidate
     return "/tmp"
 
@@ -1322,10 +1343,29 @@ def get_subprocess_home(env: dict[str, str] | None = None) -> str | None:
     if mode == "real":
         return real_home if _norm_home_path(real_home) != _norm_home_path(current_home) else None
 
+    target_owner = _named_profile_tool_home(profile_home)
+    current_owner = _named_profile_tool_home(current_home)
+    if target_owner and current_owner:
+        if target_owner != current_owner:
+            return profile_home
+        # Preserve the existing host policy for a subprocess already attached
+        # to the selected profile: auto mode repairs it to the real account
+        # HOME rather than leaving the Python-process HOME policy implicit.
+        return real_home if _norm_home_path(real_home) != _norm_home_path(current_home) else None
+
     if profile_home and is_container():
         return profile_home
     if _is_profile_home(current_home, profile_home):
         return real_home if _norm_home_path(real_home) != _norm_home_path(current_home) else None
+    # ``HERMES_REAL_HOME`` marks an earlier Hermes subprocess-home injection.
+    # If the selected target changed since then, carry the managed HOME to the
+    # selected target instead of inheriting the previous profile/root home.
+    if (
+        profile_home
+        and env.get("HERMES_REAL_HOME")
+        and _norm_home_path(current_home) != _norm_home_path(real_home)
+    ):
+        return profile_home
     return None
 
 

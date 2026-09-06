@@ -7,6 +7,7 @@ and the delivery-targets listing used by UI pickers.
 """
 
 import subprocess
+from pathlib import Path
 from unittest import mock
 
 import pytest
@@ -144,8 +145,13 @@ def test_deliver_runs_canonical_bot_chat_lane():
     assert not any("the output" in str(a) for a in argv)
 
 
-def test_deliver_named_profile_uses_p_flag_and_clears_home():
+def test_deliver_named_profile_binds_target_home(tmp_path):
     calls = {}
+    root = tmp_path / ".hermes"
+    parent = root / "profiles" / "orchestrator"
+    target = root / "profiles" / "research"
+    (parent / "home").mkdir(parents=True)
+    (target / "home").mkdir(parents=True)
 
     def fake_run(argv, **kwargs):
         calls["argv"] = argv
@@ -154,14 +160,19 @@ def test_deliver_named_profile_uses_p_flag_and_clears_home():
 
     with mock.patch.object(sched.subprocess, "run", side_effect=fake_run), \
          mock.patch.object(sched.shutil, "which", return_value="/usr/bin/hermes"), \
-         mock.patch.dict(sched.os.environ, {"HERMES_HOME": "/tmp/other-profile"}):
+         mock.patch.object(Path, "home", return_value=tmp_path), \
+         mock.patch.dict(
+             sched.os.environ,
+             {"HERMES_HOME": str(parent), "HOME": str(parent / "home")},
+         ):
         err = _deliver_to_bot_chat({"id": "j1", "name": "n"}, "out", "research")
 
     assert err is None
     argv = calls["argv"]
     assert argv[1:3] == ["-p", "research"]
-    # -p owns resolution; the scheduler's own HERMES_HOME must not leak in.
-    assert "HERMES_HOME" not in calls["kwargs"]["env"]
+    child_env = calls["kwargs"]["env"]
+    assert child_env["HERMES_HOME"] == str(target)
+    assert child_env["HOME"] == str(target / "home")
 
 
 def test_deliver_failure_returns_error_string():

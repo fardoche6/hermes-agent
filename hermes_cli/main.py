@@ -725,6 +725,31 @@ def _apply_profile_override() -> None:
 
     # 3. If we found a profile, resolve and set HERMES_HOME
     if profile_name is not None:
+        inherited_hermes_home = os.environ.get("HERMES_HOME", "").strip()
+        inherited_process_home = os.environ.get("HOME", "").strip()
+        inherited_tool_home = (
+            str(Path(inherited_hermes_home) / "home")
+            if inherited_hermes_home
+            else ""
+        )
+        inherited_real_home = None
+        if inherited_tool_home and inherited_process_home:
+            try:
+                inherited_matches_tool_home = (
+                    Path(inherited_process_home).expanduser().absolute()
+                    == Path(inherited_tool_home).expanduser().absolute()
+                )
+            except OSError:
+                inherited_matches_tool_home = False
+            if inherited_matches_tool_home:
+                from hermes_constants import get_real_home
+
+                inherited_real_home = get_real_home(
+                    {
+                        "HERMES_HOME": inherited_hermes_home,
+                        "HOME": inherited_process_home,
+                    }
+                )
         try:
             from hermes_cli.profiles import resolve_profile_env
 
@@ -745,6 +770,8 @@ def _apply_profile_override() -> None:
             )
             return
         os.environ["HERMES_HOME"] = hermes_home
+        if inherited_real_home:
+            os.environ["HERMES_REAL_HOME"] = inherited_real_home
         # Strip the flag from argv so argparse doesn't choke
         if consume > 0 and profile_index is not None:
             start = profile_index + 1  # +1 because argv is sys.argv[1:]

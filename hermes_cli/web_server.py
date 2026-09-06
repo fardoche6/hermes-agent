@@ -4788,15 +4788,37 @@ def _spawn_hermes_action(
     # trip the in-process restart-loop guard and exit 1 — silently failing the
     # dashboard's auto-restart paths. The gateway's own restart watcher already
     # drops it (gateway/run.py); mirror that here (#52470).
-    action_env = {**os.environ, "HERMES_NONINTERACTIVE": "1"}
+    action_env = {
+        **os.environ,
+        "HERMES_NONINTERACTIVE": "1",
+        **(env_overrides or {}),
+    }
     action_env.pop("_HERMES_GATEWAY", None)
+
+    # Profile-bearing dashboard actions must bind both Hermes state and the
+    # managed subprocess HOME before the child starts.  Clearing HERMES_HOME
+    # and leaving ``-p`` to resolve against the inherited process is unsafe:
+    # the inherited value may itself be a parent profile or its ``home/``
+    # directory, which can anchor the target below the wrong profile.
+    target_profile = None
+    for index, arg in enumerate(subcommand):
+        if arg in {"-p", "--profile"} and index + 1 < len(subcommand):
+            target_profile = subcommand[index + 1]
+            break
+        if isinstance(arg, str) and arg.startswith("--profile="):
+            target_profile = arg.split("=", 1)[1]
+            break
+    if target_profile:
+        from hermes_cli.profiles import build_profile_launch_env
+
+        action_env = build_profile_launch_env(target_profile, base_env=action_env)
 
     popen_kwargs: Dict[str, Any] = {
         "cwd": str(PROJECT_ROOT),
         "stdin": subprocess.DEVNULL,
         "stdout": log_file,
         "stderr": subprocess.STDOUT,
-        "env": {**action_env, **(env_overrides or {})},
+        "env": action_env,
     }
     if sys.platform == "win32":
         popen_kwargs["creationflags"] = windows_detach_flags()

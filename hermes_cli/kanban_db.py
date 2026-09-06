@@ -10784,21 +10784,17 @@ def _default_spawn(
     for key in _VAR_MAP:
         env.pop(key, None)
 
-    # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
-    # (fallback_providers, toolsets, agent settings, etc.) instead of the root
-    # config.  Without this, `env = dict(os.environ)` copies only the parent's
-    # env, and when the child process starts `hermes -p <name>` the
-    # _apply_profile_override() runs *before* hermes_constants is imported.
-    # If HERMES_HOME is absent from the child's env, get_hermes_home() falls
-    # back to Path.home() / ".hermes" (the DEFAULT profile root), ignoring the
-    # profile-specific config entirely.  Fixes profile-scoped fallback_providers
-    # being invisible to kanban workers.
-    from hermes_cli.profiles import resolve_profile_env
+    # Bind the worker's complete profile environment before adding task
+    # metadata.  In particular, setting only HERMES_HOME after the generic
+    # subprocess factory has run leaves HOME pointing at the dispatcher or a
+    # different profile's managed tool home.
+    from hermes_cli.profiles import build_profile_launch_env
+
     try:
-        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+        env = build_profile_launch_env(profile_arg, base_env=env)
     except FileNotFoundError:
         # Profile dir doesn't exist — defer resolution to the CLI's
-        # _apply_profile_override() via HERMES_PROFILE (set below).
+        # _apply_profile_override() via the explicit -p (set below).
         # This only happens in test fixtures where the isolated
         # HERMES_HOME never had profiles created.
         pass
