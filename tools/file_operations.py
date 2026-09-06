@@ -1224,7 +1224,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
     ) -> tuple[bool, Optional[str], Optional[str]]:
         """Probe a protected final entry without following its lexical leaf."""
         try:
-            raw_bytes = read_candidate(candidate)
+            raw_bytes = read_candidate(candidate, refresh_regular_preimage=True)
         except FileNotFoundError:
             ending = _detect_line_ending(pre_content) if pre_content else None
             return False, pre_content, ending
@@ -1420,7 +1420,10 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             return PatchResult(error=denied)
         if protected_lexical_candidate is not None:
             try:
-                raw_content = read_candidate(protected_lexical_candidate).decode(
+                raw_content = read_candidate(
+                    protected_lexical_candidate,
+                    refresh_regular_preimage=True,
+                ).decode(
                     "utf-8", "surrogateescape")
             except FileNotFoundError:
                 return PatchResult(error=f"Failed to read file: {path}")
@@ -1499,7 +1502,10 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
                     candidate = self._candidates.get(path)
                     if candidate is not None:
                         try:
-                            content = read_candidate(candidate).decode("utf-8", "surrogateescape")
+                            content = read_candidate(
+                                candidate,
+                                refresh_regular_preimage=True,
+                            ).decode("utf-8", "surrogateescape")
                         except FileNotFoundError:
                             return ReadResult(error=f"File not found: {path}")
                         except ProtectedLexicalError as exc:
