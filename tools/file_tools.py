@@ -3,10 +3,12 @@
 
 import base64
 import errno
+import hashlib
 import json
 import logging
 import os
 import posixpath
+import stat
 import sys
 import threading
 from pathlib import Path, PurePosixPath
@@ -18,6 +20,7 @@ from tools.binary_extensions import (
     is_pdf_path,
 )
 from tools.file_operations import (
+    ProtectedFinalSymlinkPlan,
     ShellFileOperations,
     normalize_read_pagination,
     normalize_search_pagination,
@@ -842,6 +845,127 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
         if len(parts) >= 2 and parts[-2] == ".hermes":
             return candidate
     return None
+
+
+def _build_protected_final_symlink_plan(
+    filepath: str, candidate: bytes, task_id: str = "default",
+) -> ProtectedFinalSymlinkPlan | None:
+    """Inspect a protected lexical final symlink without following its final entry."""
+    if os.path.basename(os.path.normpath(filepath)).lower() not in _PROTECTED_INSTRUCTION_BASENAMES:
+        return None
+    expanded = _expand_tilde(filepath)
+    if os.path.isabs(expanded):
+        lexical = os.path.normpath(expanded)
+    else:
+        lexical = os.path.normpath(os.path.join(
+            str(_resolve_base_dir(task_id, container_paths=False)), expanded
+        ))
+    parent = os.path.dirname(lexical)
+    raw_parts = filepath.replace("\\", "/").split("/")
+    if "." in raw_parts or ".." in raw_parts:
+        raise ValueError("protected final symlink path contains dot or traversal components")
+    if os.path.realpath(parent) != os.path.abspath(parent):
+        raise ValueError("protected final symlink path contains an intermediate symlink")
+    try:
+        parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    try:
+        parent_stat = os.fstat(parent_fd)
+        final_name = os.path.basename(lexical)
+        final_stat = os.lstat(final_name, dir_fd=parent_fd)
+        if stat.S_ISDIR(final_stat.st_mode):
+            raise ValueError("protected final symlink final entry is a directory")
+        if not stat.S_ISLNK(final_stat.st_mode):
+            os.close(parent_fd)
+            return None
+        raw_target = os.readlink(final_name, dir_fd=parent_fd)
+        if not raw_target or os.path.isabs(raw_target) or any(part in {".", ".."} for part in raw_target.split("/")):
+            raise ValueError("protected final symlink target is absolute or traverses")
+        target_path = os.path.realpath(os.path.join(parent, raw_target))
+        target_stat = os.stat(raw_target, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISREG(target_stat.st_mode):
+            raise ValueError("protected final symlink target is not regular")
+        with os.fdopen(os.open(raw_target, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent_fd), "rb") as stream:
+            target_hash = hashlib.sha256(stream.read()).hexdigest()
+        return ProtectedFinalSymlinkPlan(
+            lexical_path=lexical, lexical_parent=parent, parent_fd=parent_fd,
+            parent_dev=parent_stat.st_dev, parent_ino=parent_stat.st_ino,
+            final_type="symlink", final_dev=final_stat.st_dev, final_ino=final_stat.st_ino,
+            final_raw_target=raw_target, target_path=target_path, target_type="regular",
+            target_dev=target_stat.st_dev, target_ino=target_stat.st_ino,
+            target_sha256=target_hash, candidate=candidate,
+            candidate_sha256=hashlib.sha256(candidate).hexdigest(),
+        )
+    except Exception:
+        os.close(parent_fd)
+        raise
+
+
+def _protected_plan_packet(plan: ProtectedFinalSymlinkPlan) -> str:
+    values = {
+        "candidate": plan.candidate.decode("utf-8"), "candidate_sha256": plan.candidate_sha256,
+        "lexical_path": plan.lexical_path, "lexical_parent": plan.lexical_parent,
+        "parent_dev": str(plan.parent_dev), "parent_ino": str(plan.parent_ino),
+        "final_type": plan.final_type, "final_dev": str(plan.final_dev),
+        "final_ino": str(plan.final_ino), "final_raw_target": plan.final_raw_target,
+        "target_path": plan.target_path, "target_type": plan.target_type,
+        "target_dev": str(plan.target_dev), "target_ino": str(plan.target_ino),
+        "target_sha256": plan.target_sha256, "operation": plan.operation,
+        "target_effect": plan.target_effect, "approval_scope": plan.approval_scope,
+    }
+    return "PROTECTED_PACKET_V1\n" + "\n".join(
+        f"{key}={base64.urlsafe_b64encode(value.encode()).decode()}"
+        for key, value in values.items()
+    )
+
+
+def _request_protected_final_symlink_approval(plan: ProtectedFinalSymlinkPlan) -> str | None:
+    """Request exactly one nonpersistent approval for one immutable plan."""
+    packet = _protected_plan_packet(plan)
+    try:
+        import tools.approval as _approval
+        from tools.terminal_tool import _get_approval_callback
+        callback = _get_approval_callback()
+    except Exception:
+        callback = None
+        _approval = None
+    if callback is None or _approval is None:
+        return "BLOCKED: protected final symlink write requires interactive approval."
+    try:
+        choice = _approval.prompt_dangerous_approval(
+            "<protected final symlink operation>", packet,
+            allow_permanent=False, allow_session=False, approval_callback=callback,
+        )
+    except Exception as exc:
+        return f"BLOCKED: protected final symlink approval failed: {exc}"
+    if choice in {"once", "session", "always"}:
+        return None
+    if choice == "timeout":
+        return "BLOCKED: protected final symlink approval timed out."
+    return "BLOCKED: protected final symlink write was denied."
+
+
+def _revalidate_protected_final_symlink_plan(plan: ProtectedFinalSymlinkPlan) -> None:
+    """Recheck every object binding after approval, using the retained parent fd."""
+    current_parent = os.stat(plan.lexical_parent, follow_symlinks=False)
+    if (current_parent.st_dev, current_parent.st_ino) != (plan.parent_dev, plan.parent_ino):
+        raise ValueError("protected final symlink parent changed")
+    final_name = os.path.basename(plan.lexical_path)
+    final_stat = os.lstat(final_name, dir_fd=plan.parent_fd)
+    if (final_stat.st_dev, final_stat.st_ino) != (plan.final_dev, plan.final_ino):
+        raise ValueError("protected final symlink final entry changed")
+    if not stat.S_ISLNK(final_stat.st_mode):
+        raise ValueError("protected final symlink final entry is no longer a symlink")
+    if os.readlink(final_name, dir_fd=plan.parent_fd) != plan.final_raw_target:
+        raise ValueError("protected final symlink target text changed")
+    target_stat = os.stat(plan.final_raw_target, dir_fd=plan.parent_fd, follow_symlinks=False)
+    if (target_stat.st_dev, target_stat.st_ino) != (plan.target_dev, plan.target_ino):
+        raise ValueError("protected final symlink target identity changed")
+    with os.fdopen(os.open(plan.final_raw_target, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=plan.parent_fd), "rb") as stream:
+        target_hash = hashlib.sha256(stream.read()).hexdigest()
+    if target_hash != plan.target_sha256:
+        raise ValueError("protected final symlink target preimage changed")
 
 
 def _request_protected_instruction_approval(
@@ -2289,6 +2413,33 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     binary_doc_err = _check_binary_document_write(path, task_id)
     if binary_doc_err:
         return tool_error(binary_doc_err)
+    try:
+        protected_plan = _build_protected_final_symlink_plan(
+            path, content.encode("utf-8"), task_id
+        )
+    except (OSError, ValueError, UnicodeError) as exc:
+        return tool_error(str(exc))
+    if protected_plan is not None:
+        try:
+            protected_err = _request_protected_final_symlink_approval(protected_plan)
+            if protected_err:
+                return tool_error(protected_err)
+            _revalidate_protected_final_symlink_plan(protected_plan)
+            result = _get_file_ops(task_id).protected_final_symlink_write(protected_plan)
+            if result.error and result.error.startswith("UNCERTAIN STATE:"):
+                return json.dumps({
+                    "error": result.error,
+                    "uncertain": True,
+                    "rollback": "not_attempted",
+                }, ensure_ascii=False)
+            return json.dumps(result.to_dict(), ensure_ascii=False)
+        except Exception as exc:
+            return tool_error(str(exc))
+        finally:
+            try:
+                os.close(protected_plan.parent_fd)
+            except OSError:
+                pass
     protected_err = _check_protected_instruction_write([path], task_id)
     if protected_err:
         return tool_error(protected_err)
@@ -2437,6 +2588,17 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         binary_doc_err = _check_binary_document_write(_p, task_id)
         if binary_doc_err:
             return tool_error(binary_doc_err)
+    if mode == "replace" or mode == "patch":
+        for _p in _paths_to_check:
+            try:
+                _protected_plan = _build_protected_final_symlink_plan(_p, b"", task_id)
+            except (OSError, ValueError) as exc:
+                return tool_error(str(exc))
+            if _protected_plan is not None:
+                os.close(_protected_plan.parent_fd)
+                return tool_error(
+                    "Protected final symlink edits are supported only through write_file."
+                )
     # One approval prompt for the whole patch: a single protected file gates
     # the ENTIRE patch (deny applies nothing — see the helper's docstring).
     protected_err = _check_protected_instruction_write(_paths_to_check, task_id)

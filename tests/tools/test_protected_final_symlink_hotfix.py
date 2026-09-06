@@ -6,6 +6,7 @@ until protected lexical-final-symlink handling is implemented.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -93,15 +94,14 @@ _PACKET_FIELDS = {
 
 
 def _packet_fields(command: str, description: str) -> dict[str, str]:
-    packet = command + "\n" + description
-    matches = list(re.finditer(r"(?<![A-Za-z0-9_])([a-z_]+)=", packet))
+    packet = description
+    assert packet.startswith("PROTECTED_PACKET_V1\n")
     parsed = {}
-    for index, match in enumerate(matches):
-        field = match.group(1)
-        if field not in _PACKET_FIELDS:
-            continue
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(packet)
-        parsed[field] = packet[match.end():end].strip()
+    for line in packet.splitlines()[1:]:
+        field, encoded = line.split("=", 1)
+        assert field in _PACKET_FIELDS
+        assert field not in parsed
+        parsed[field] = base64.urlsafe_b64decode(encoded).decode()
     return parsed
 
 
@@ -110,6 +110,9 @@ def _assert_complete_packet(packet: dict[str, str]) -> None:
 
 
 def _assert_no_affirmative_rollback(result: dict) -> None:
+    assert set(result) == {"error", "uncertain", "rollback"}
+    assert result["uncertain"] is True
+    assert result["rollback"] == "not_attempted"
     for field in ("success", "verified", "rolled_back", "rollback_succeeded"):
         assert result.get(field) is not True
     text = str(result.get("error", "")).lower()
@@ -136,6 +139,7 @@ def test_approved_protected_final_symlink_replaces_link_and_preserves_target(
 
     target_before = target.read_bytes()
     target_before_stat = target.stat()
+    before = _state(tmp_path)
     set_approval_callback(approve)
     result = _result(write_file_tool(str(link), candidate.decode()))
 
@@ -146,6 +150,11 @@ def test_approved_protected_final_symlink_replaces_link_and_preserves_target(
     assert target.stat().st_ino == target_before_stat.st_ino
     assert target.read_bytes() == target_before
     assert _sha(target_before) == _sha(target.read_bytes())
+    after = _state(tmp_path)
+    assert set(after) == set(before)
+    assert after["AGENTS.md"][0] == stat.S_IFREG
+    assert after["external-target.txt"][1:3] == before["external-target.txt"][1:3]
+    assert not any("hermes-protected-" in name for name in after)
 
 
 def test_approval_packet_binds_every_operation_field(tmp_path: Path, symlink_capability):
@@ -166,7 +175,7 @@ def test_approval_packet_binds_every_operation_field(tmp_path: Path, symlink_cap
     link_stat = link.lstat()
     target_stat = target.stat()
     required = {
-        "candidate": candidate.decode().strip(),
+        "candidate": candidate.decode(),
         "candidate_sha256": _sha(candidate),
         "lexical_path": str(link.absolute()),
         "lexical_parent": str(link.parent.absolute()),
@@ -185,11 +194,12 @@ def test_approval_packet_binds_every_operation_field(tmp_path: Path, symlink_cap
         "target_effect": "untouched",
         "approval_scope": "one operation",
     }
-    for field, value in required.items():
-        assert f"{field}={value}" in packet, (field, value, packet)
     parsed = _packet_fields(command, description)
     _assert_complete_packet(parsed)
-    assert parsed["candidate_sha256"] == _sha(candidate)
+    assert parsed == required
+    duplicate = description + "\n" + description.splitlines()[1]
+    with pytest.raises(AssertionError):
+        _packet_fields(command, duplicate)
     assert kwargs["allow_permanent"] is False
     assert kwargs["allow_session"] is False
 
@@ -238,21 +248,17 @@ def test_preimage_delta_changes_only_target_identity_and_hash(tmp_path: Path, sy
     packets = []
     _capture_denied_packet(tmp_path, "A\n", link, packets)
     original = target.read_bytes()
-    original_target = tmp_path / "preimage-original"
-    target.rename(original_target)
     target.write_bytes(b"changed preimage\n")
     _capture_denied_packet(tmp_path, "A\n", link, packets)
     assert len(packets) == 2
     for packet in packets:
         _assert_complete_packet(packet)
     assert packets[0]["target_sha256"] != packets[1]["target_sha256"]
-    assert packets[0]["target_ino"] != packets[1]["target_ino"]
+    assert packets[0]["target_ino"] == packets[1]["target_ino"]
     assert packets[0]["target_dev"] == packets[1]["target_dev"]
     for field in _PACKET_FIELDS - {"target_sha256"}:
         assert packets[0][field] == packets[1][field], field
-    target.unlink()
-    original_target.rename(target)
-    assert target.read_bytes() == original
+    target.write_bytes(original)
 
 
 def test_once_approval_does_not_authorize_reprompted_denied_operation(
@@ -260,6 +266,8 @@ def test_once_approval_does_not_authorize_reprompted_denied_operation(
 ):
     link_a, _target_a = _protected_link(tmp_path / "a")
     link_b, _target_b = _protected_link(tmp_path / "b")
+    before_a = _state(tmp_path / "a")
+    before_b = _state(tmp_path / "b")
     packets = []
 
     def approve(command, description, **_kwargs):
@@ -275,6 +283,8 @@ def test_once_approval_does_not_authorize_reprompted_denied_operation(
     _assert_complete_packet(packets[0])
     _assert_complete_packet(packets[1])
     assert packets[0]["candidate_sha256"] != packets[1]["candidate_sha256"]
+    assert _state(tmp_path / "a") != before_a
+    assert _state(tmp_path / "b") == before_b
 
 
 @pytest.mark.parametrize("decision", ["deny", "timeout"])
@@ -328,7 +338,9 @@ def test_deterministic_pre_rename_failure_is_complete_zero_change(
     assert len(calls) == 1
     assert calls[0][1].get("src_dir_fd") is not None
     assert calls[0][1].get("src_dir_fd") == calls[0][1].get("dst_dir_fd")
-    assert calls[0][0] == ("AGENTS.md.tmp", "AGENTS.md")
+    src, dst = calls[0][0]
+    assert src != dst and Path(src).name == src and "/" not in src
+    assert dst == "AGENTS.md"
     _assert_unchanged(tmp_path, before)
 
 
@@ -455,7 +467,8 @@ def test_parent_final_and_target_drift_aborts_without_candidate_landing(
                 old_parent_stat.st_dev, old_parent_stat.st_ino
             )
             assert drift_link.lstat().st_ino == old_link_stat.st_ino
-            assert (replacement / target.name).stat().st_ino == old_target_stat.st_ino
+            os.rename(replacement / target.name, original_parent / target.name)
+            assert (original_parent / target.name).stat().st_ino == old_target_stat.st_ino
             assert os.readlink(drift_link) == old_raw_target
         elif drift == "final_identity":
             drift_link.rename(drift_link.with_name("original-final"))
@@ -513,7 +526,8 @@ def test_descriptor_relative_failure_has_no_path_fallback(tmp_path: Path, symlin
     assert kwargs.get("src_dir_fd") == kwargs.get("dst_dir_fd")
     assert Path(src).name == src and Path(dst).name == dst
     assert "/" not in src and "/" not in dst
-    assert src == "AGENTS.md.tmp" and dst == "AGENTS.md"
+    assert src != dst and Path(src).name == src and "/" not in src
+    assert dst == "AGENTS.md"
 
 
 def test_post_rename_verification_failure_reports_uncertain_state(tmp_path: Path, symlink_capability, monkeypatch):
@@ -560,6 +574,9 @@ def test_post_rename_verification_failure_reports_uncertain_state(tmp_path: Path
     assert commit_kwargs.get("src_dir_fd") == commit_kwargs.get("dst_dir_fd")
     assert len(commit_args) == 2
     assert all(Path(arg).name == arg and "/" not in arg for arg in commit_args)
+    assert Path(verify_faults[0][0][0]).name == verify_faults[0][0][0]
+    assert verify_faults[0][0][0] == "AGENTS.md"
+    assert verify_faults[0][1].get("dir_fd") == commit_kwargs.get("src_dir_fd")
     assert not link.is_symlink()
     assert link.read_bytes() == b"candidate\n"
     assert target.read_bytes() == b"external\n"

@@ -31,6 +31,7 @@ import os
 import posixpath
 import re
 import secrets
+import stat
 import sys
 import difflib
 import hashlib
@@ -475,6 +476,31 @@ class ExecuteResult:
     exit_code: int = 0
 
 
+@dataclass(frozen=True)
+class ProtectedFinalSymlinkPlan:
+    """Immutable object-bound preimage for one protected final-symlink write."""
+
+    lexical_path: str
+    lexical_parent: str
+    parent_fd: int
+    parent_dev: int
+    parent_ino: int
+    final_type: str
+    final_dev: int
+    final_ino: int
+    final_raw_target: str
+    target_path: str
+    target_type: str
+    target_dev: int
+    target_ino: int
+    target_sha256: str
+    candidate: bytes
+    candidate_sha256: str
+    operation: str = "replace"
+    target_effect: str = "untouched"
+    approval_scope: str = "one operation"
+
+
 _SEARCH_TIMEOUT_MARKER_RE = re.compile(r"\n?\[Command timed out after \d+s\]\s*$")
 
 
@@ -662,6 +688,11 @@ class FileOperations(ABC):
                    pre_content: Optional[str] = None) -> WriteResult:
         """Write content to a file, creating directories as needed."""
         ...
+
+    def protected_final_symlink_write(
+        self, plan: ProtectedFinalSymlinkPlan,
+    ) -> WriteResult:
+        return WriteResult(error="Protected final symlink writes are not implemented")
 
     @abstractmethod
     def patch_replace(self, path: str, old_string: str, new_string: str,
@@ -1512,6 +1543,50 @@ class ShellFileOperations(FileOperations):
             "trap - EXIT"
         )
         return self._exec(script, stdin_data=content)
+
+    def protected_final_symlink_write(
+        self, plan: ProtectedFinalSymlinkPlan,
+    ) -> WriteResult:
+        """Commit and verify an approved plan through its retained parent fd."""
+        temp_name = f".hermes-protected-{secrets.token_hex(16)}"
+        temp_fd = None
+        final_name = os.path.basename(plan.lexical_path)
+        try:
+            temp_fd = os.open(
+                temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+                dir_fd=plan.parent_fd,
+            )
+            view = memoryview(plan.candidate)
+            while view:
+                count = os.write(temp_fd, view)
+                if count <= 0:
+                    raise OSError("protected atomic write made no progress")
+                view = view[count:]
+            os.fsync(temp_fd)
+            os.close(temp_fd)
+            temp_fd = None
+            os.rename(temp_name, final_name,
+                      src_dir_fd=plan.parent_fd, dst_dir_fd=plan.parent_fd)
+        except Exception as exc:
+            if temp_fd is not None:
+                os.close(temp_fd)
+            try:
+                os.unlink(temp_name, dir_fd=plan.parent_fd)
+            except OSError:
+                pass
+            return WriteResult(error=str(exc))
+
+        try:
+            installed = os.lstat(final_name, dir_fd=plan.parent_fd)
+            if not stat.S_ISREG(installed.st_mode):
+                raise OSError("installed entry is not regular")
+            with os.fdopen(os.open(final_name, os.O_RDONLY, dir_fd=plan.parent_fd), "rb") as stream:
+                installed_hash = hashlib.sha256(stream.read()).hexdigest()
+            if installed_hash != plan.candidate_sha256:
+                raise OSError("installed candidate hash mismatch")
+        except Exception as exc:
+            return WriteResult(error=f"UNCERTAIN STATE: {exc}")
+        return WriteResult(bytes_written=len(plan.candidate), verified=True)
 
     def _detect_file_line_ending(self, path: str, pre_content: Optional[str] = None) -> Optional[str]:
         """Detect the dominant line ending of a file on disk.
