@@ -179,10 +179,11 @@ def notify_other_tool_call(task_id: str = "default"):
                     task_data[key].clear()
 
 
-def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
-    """Evict every dedup entry (all offset/limit ranges) and not-found entry for *filepath*
-    after a write, so the next read returns fresh content. Acquires the lock itself."""
-    resolved = _resolved_or_none(filepath, task_id)
+def _invalidate_dedup_for_path(
+    filepath: str, task_id: str, identity_path: str | None = None,
+) -> None:
+    """Evict every dedup entry for *filepath* after a write."""
+    resolved = identity_path or _resolved_or_none(filepath, task_id)
     if resolved is None:
         return
     with _read_tracker_lock:
@@ -197,19 +198,20 @@ def _invalidate_dedup_for_path(filepath: str, task_id: str) -> None:
         _pop_not_found("search", resolved, task_id)
 
 
-def _update_read_timestamp(filepath: str, task_id: str) -> None:
-    """After a successful write: invalidate dedup and refresh the stored mtime so
-    consecutive edits by the same task don't trigger false staleness warnings.
-
-    Also invalidates the dedup cache for the written path so that subsequent reads return fresh content
-    (fixes #13144).
-    """
-    _invalidate_dedup_for_path(filepath, task_id)
-    resolved = _resolved_or_none(filepath, task_id)
+def _update_read_timestamp(
+    filepath: str, task_id: str, identity_path: str | None = None,
+) -> None:
+    """Refresh read state after a successful write, using lexical lstat state
+    when a protected final entry was replaced."""
+    _invalidate_dedup_for_path(filepath, task_id, identity_path=identity_path)
+    resolved = identity_path or _resolved_or_none(filepath, task_id)
     if resolved is None:
         return
     try:
-        current_mtime = os.path.getmtime(resolved)
+        current_mtime = (
+            os.lstat(resolved).st_mtime if identity_path
+            else os.path.getmtime(resolved)
+        )
     except OSError:
         return
     with _read_tracker_lock:
@@ -219,10 +221,11 @@ def _update_read_timestamp(filepath: str, task_id: str) -> None:
             _cap_read_tracker_data(task_data)
 
 
-def _check_file_staleness(filepath: str, task_id: str) -> str | None:
-    """Warn (don't block) when the file's mtime changed since this task last read it.
-    ``None`` when never read, fresh, or unstattable (a deleted file is the write's problem)."""
-    resolved = _resolved_or_none(filepath, task_id)
+def _check_file_staleness(
+    filepath: str, task_id: str, identity_path: str | None = None,
+) -> str | None:
+    """Warn when the lexical or resolved identity changed since the last read."""
+    resolved = identity_path or _resolved_or_none(filepath, task_id)
     if resolved is None:
         return None
     with _read_tracker_lock:
@@ -231,7 +234,10 @@ def _check_file_staleness(filepath: str, task_id: str) -> str | None:
     if read_mtime is None:
         return None
     try:
-        current_mtime = os.path.getmtime(resolved)
+        current_mtime = (
+            os.lstat(resolved).st_mtime if identity_path
+            else os.path.getmtime(resolved)
+        )
     except OSError:
         return None
     if current_mtime != read_mtime:

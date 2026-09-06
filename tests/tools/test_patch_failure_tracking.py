@@ -111,3 +111,58 @@ class TestPatchFailureEscalation:
         assert "failure #" not in hint, (
             f"task_B's hint cross-contaminated from task_A: {hint!r}"
         )
+
+    def test_public_patch_failure_identity_is_lexical_for_symlink_aliases(
+        self, hermes_home, tmp_path, fresh_tracker
+    ):
+        from tools.file_tools import patch_tool
+        from tools.file_tools_read_tracking import _patch_failure_tracker
+
+        target = tmp_path / "physical.py"
+        lexical = tmp_path / "lexical.py"
+        target.write_text("before\n")
+        lexical.symlink_to(target)
+        task_id = "lexical_failure_identity"
+
+        lexical_failure = json.loads(patch_tool(
+            path=str(lexical),
+            old_string="missing-lexical",
+            new_string="replacement",
+            task_id=task_id,
+        ))
+        target_failure = json.loads(patch_tool(
+            path=str(target),
+            old_string="missing-target",
+            new_string="replacement",
+            task_id=task_id,
+        ))
+        assert lexical_failure.get("error")
+        assert target_failure.get("error")
+
+        with _patch_failure_tracker_lock():
+            failures = dict(_patch_failure_tracker[task_id])
+        lexical_key = str(lexical)
+        target_key = str(target)
+        assert failures.get(lexical_key) == 1
+        assert failures.get(target_key) == 1
+
+        success = json.loads(patch_tool(
+            path=str(lexical),
+            old_string="before",
+            new_string="after",
+            task_id=task_id,
+        ))
+        assert success.get("success") is True, success
+        with _patch_failure_tracker_lock():
+            failures = dict(_patch_failure_tracker[task_id])
+        assert lexical_key not in failures
+        assert failures.get(target_key) == 1
+        assert lexical.is_symlink()
+        assert target.read_text() == "after\n"
+
+
+def _patch_failure_tracker_lock():
+    """Import the tracker lock lazily so the test remains isolated from imports."""
+    from tools.file_tools_read_tracking import _patch_failure_lock
+
+    return _patch_failure_lock
