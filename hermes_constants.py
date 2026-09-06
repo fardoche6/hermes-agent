@@ -178,6 +178,7 @@ def get_default_hermes_root() -> Path:
 _DELETED_PROFILES_DIR = ".deleted"
 # Files marking a real Hermes home; arbitrary dirs with a ``profiles`` segment lack them.
 _HERMES_HOME_MARKERS = ("config.yaml", ".env", "state.db")
+_PROFILE_COMPONENT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 def _is_hermes_profiles_root(profiles_dir: Path) -> bool:
@@ -850,8 +851,16 @@ def _named_profile_tool_home(
         root = Path(configured)
         if root.parent.name == "profiles":
             root = root.parent.parent
-        if candidate_path.parent.name == "home" and candidate_path.parent.parent.parent == root:
-            return str(candidate_path.parent.parent)
+        if (
+            candidate_path.name == "home"
+            and candidate_path.parent.parent.name == "profiles"
+            and not candidate_path.parent.name.startswith(".")
+            and _PROFILE_COMPONENT_RE.fullmatch(candidate_path.parent.name)
+            and candidate_path.parent.parent.parent == root
+        ):
+            return str(candidate_path.parent)
+        if candidate_path == root / "home":
+            return "default"
     try:
         if _norm_home_path(candidate) == _norm_home_path(str(_get_platform_default_hermes_home() / "home")):
             return "default"
