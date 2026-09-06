@@ -110,6 +110,36 @@ class TestGetSubprocessHome:
         assert home_a.endswith("alpha/home")
         assert home_b.endswith("beta/home")
 
+    def test_host_auto_switches_parent_profile_home_to_selected_target(self, tmp_path, monkeypatch):
+        self._host_mode(monkeypatch)
+        base = tmp_path / ".hermes" / "profiles"
+        for name in ("alpha", "beta"):
+            profile = base / name
+            (profile / "home").mkdir(parents=True)
+        real_home = tmp_path / "real-home"
+        real_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(base / "alpha"))
+        monkeypatch.setenv("HOME", str(base / "beta" / "home"))
+        monkeypatch.setenv("HERMES_REAL_HOME", str(real_home))
+
+        from hermes_constants import get_subprocess_home
+
+        assert get_subprocess_home() == str(base / "alpha" / "home")
+
+    def test_stale_profile_real_home_marker_cannot_anchor_target(self, tmp_path, monkeypatch):
+        self._host_mode(monkeypatch)
+        base = tmp_path / ".hermes" / "profiles"
+        for name in ("alpha", "beta"):
+            (base / name / "home").mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(base / "alpha"))
+        monkeypatch.setenv("HOME", str(base / "beta" / "home"))
+        monkeypatch.setenv("HERMES_REAL_HOME", str(base / "beta" / "home"))
+
+        from hermes_constants import get_real_home, get_subprocess_home
+
+        assert get_real_home() != str(base / "beta" / "home")
+        assert get_subprocess_home() == str(base / "alpha" / "home")
+
 
 
 # ---------------------------------------------------------------------------

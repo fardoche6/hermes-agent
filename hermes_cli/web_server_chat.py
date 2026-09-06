@@ -322,9 +322,11 @@ def _resolve_chat_argv(
     # Secrets kept — the spawned agent needs provider creds.  An explicit profile
     # scope overrides HERMES_HOME before config is bridged into the env.
     from tools.environments.local import build_subprocess_env
+    from hermes_constants import get_hermes_home
     env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=True)
-    if profile_dir is not None:
-        env["HERMES_HOME"] = str(profile_dir)
+    from hermes_cli.profiles import build_profile_launch_env
+
+    env = build_profile_launch_env(profile_dir or get_hermes_home(), base_env=env)
     try:
         from hermes_cli.config import (
             apply_terminal_config_to_env, read_raw_config, terminal_config_owned_env_vars)

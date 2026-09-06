@@ -33,6 +33,16 @@ from hermes_constants import (
 class TestGetDefaultHermesRoot:
     """Tests for get_default_hermes_root() — Docker/custom deployment awareness."""
 
+    def test_windows_home_data_fallback_is_host_independent(self, tmp_path):
+        """The path-only Windows fallback is testable without faking sys.platform."""
+        assert hermes_constants._windows_hermes_home("", tmp_path / "user") == (
+            tmp_path / "user" / "AppData" / "Local" / "hermes"
+        )
+        local_appdata = tmp_path / "LocalAppData"
+        assert hermes_constants._windows_hermes_home(str(local_appdata), tmp_path / "user") == (
+            local_appdata / "hermes"
+        )
+
     def test_no_hermes_home_returns_native(self, tmp_path, monkeypatch):
         """When HERMES_HOME is not set, returns ~/.hermes."""
         monkeypatch.delenv("HERMES_HOME", raising=False)
@@ -63,6 +73,16 @@ class TestGetDefaultHermesRoot:
         monkeypatch.setattr(Path, "home", lambda: tmp_path / "Home")
 
         assert get_default_hermes_root() == local_appdata / "hermes"
+
+    @pytest.mark.windows_only
+    def test_no_localappdata_uses_appdata_local_fallback_on_windows(self, tmp_path, monkeypatch):
+        """Native Windows uses the user's AppData\\Local when LOCALAPPDATA is absent."""
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.delenv("LOCALAPPDATA", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path / "Home")
+        monkeypatch.setattr(hermes_constants, "_default_hermes_root_memo", None)
+
+        assert get_default_hermes_root() == tmp_path / "Home" / "AppData" / "Local" / "hermes"
 
     def test_result_memoised_until_env_or_home_changes(self, tmp_path, monkeypatch):
         """Repeated calls reuse the memo; HERMES_HOME / home changes invalidate.

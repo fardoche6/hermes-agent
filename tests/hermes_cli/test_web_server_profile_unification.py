@@ -695,6 +695,8 @@ class TestProfileScopedChatPty:
         argv, cwd, env = _web_server_chat._resolve_chat_argv(profile="worker_beta")
         assert env is not None
         assert env["HERMES_HOME"] == str(isolated_profiles["worker_beta"])
+        assert env["HOME"] != str(isolated_profiles["default"] / "home")
+        assert env["HOME"] == env["HERMES_REAL_HOME"]
         # Scoped chat must NOT attach to the dashboard's in-memory gateway.
         assert "HERMES_TUI_GATEWAY_URL" not in env
 
