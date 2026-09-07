@@ -16,7 +16,9 @@ supported vocabulary. The policy under test:
 import pytest
 
 from agent.reasoning_effort import (
+    CODEX_GPT6_ASTRA_EFFORTS,
     CODEX_GPT56_EFFORTS,
+    CODEX_LEGACY_EFFORTS,
     EFFORT_LADDER,
     GLM52_EFFORTS,
     GLM52_OVERRIDES,
@@ -141,7 +143,8 @@ class TestCodexVocabulary:
         assert clamp_effort("ultra", CODEX_GPT56_EFFORTS) == "max"
 
     def test_per_model_max_support(self):
-        """Live-verified (Aug 2026, #68365): 'max' is gpt-5.6-only — gpt-5.5
+        """Live-verified (Aug 2026, #68365): 'max' is GPT-5.6-only among the
+        older Codex generations — gpt-5.5
         rejects it ("Supported values are: 'none','low','medium','high',
         'xhigh'"); 'minimal' is rejected by both generations."""
         from agent.reasoning_effort import (
@@ -159,6 +162,19 @@ class TestCodexVocabulary:
         assert clamp_effort("max", CODEX_LEGACY_EFFORTS) == "xhigh"
         assert clamp_effort("ultra", CODEX_LEGACY_EFFORTS) == "xhigh"
         assert clamp_effort("minimal", CODEX_LEGACY_EFFORTS) == "low"
+
+    def test_gpt_6_astra_uses_documented_max_vocabulary(self):
+        """GPT-6 Astra's provider documentation explicitly includes ``max``;
+        only the exact model slug (with an optional namespace) gets that set.
+        Unknown Astra-like names remain on the conservative legacy set."""
+        from agent.reasoning_effort import codex_supported_efforts
+
+        assert CODEX_GPT6_ASTRA_EFFORTS == ("low", "medium", "high", "xhigh", "max")
+        assert codex_supported_efforts("gpt-6-astra") is CODEX_GPT6_ASTRA_EFFORTS
+        assert codex_supported_efforts("openai/gpt-6-astra") is CODEX_GPT6_ASTRA_EFFORTS
+        assert codex_supported_efforts("gpt-6-astra-preview") is CODEX_LEGACY_EFFORTS
+        assert codex_supported_efforts("gpt-6") is CODEX_LEGACY_EFFORTS
+        assert clamp_effort("max", CODEX_GPT6_ASTRA_EFFORTS) == "max"
 
 
 class TestRequestedEffort:

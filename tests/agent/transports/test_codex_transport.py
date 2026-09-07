@@ -58,8 +58,19 @@ class TestCodexBuildKwargs:
         )
         assert kw["model"] == "gpt-5.6-sol"
 
-
-
+    def test_gpt_6_astra_max_effort_survives_request_builder(self, transport):
+        """A configured Astra/max route must serialize max without a task-local override."""
+        kw = transport.build_kwargs(
+            model="gpt-6-astra",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            provider="openai-codex",
+            base_url="https://chatgpt.com/backend-api/codex",
+            is_codex_backend=True,
+            reasoning_config={"enabled": True, "effort": "max"},
+        )
+        assert kw["model"] == "gpt-6-astra"
+        assert kw["reasoning"] == {"effort": "max", "summary": "auto"}
 
     def test_cache_key_is_content_addressed_not_session_id(self, transport):
         """prompt_cache_key is content-addressed from the static prefix
