@@ -1391,7 +1391,8 @@ class _CodexCompletionsAdapter:
             # ``enabled: False`` leaves reasoning/include unset (Codex still thinks by default).
             if isinstance(reasoning_cfg, dict) and reasoning_cfg.get("enabled") is not False:
                 # Truthy-only: Codex 400s on e.g. {"effort": null}, so falsy → default. Shared
-                # per-model clamp with the main transport ("max" is gpt-5.6-only; "minimal"/"ultra" rejected).
+                # per-model clamp with the main transport (GPT-5.6/Astra support "max";
+                # "minimal"/"ultra" are rejected by the Codex wire).
                 from agent.reasoning_effort import clamp_effort, codex_supported_efforts
                 effort = clamp_effort(reasoning_cfg.get("effort") or "medium", codex_supported_efforts(model))
                 resp_kwargs["reasoning"] = {"effort": effort, "summary": "auto"}

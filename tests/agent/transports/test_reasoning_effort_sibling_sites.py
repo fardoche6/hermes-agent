@@ -12,7 +12,9 @@ sibling sites fixed in the same sweep:
 - Tencent TokenHub: accepts low/medium/high; upper-ladder levels previously
   dropped to the "high" default (accidentally right) but "minimal" also
   dropped to high — asked for the least, got the most.
-- Codex/Responses transport: ultra → max for EVERY model, not just gpt-5.6.
+- Codex/Responses transport: ultra → max for models whose documented
+  vocabulary includes max (GPT-5.6 and GPT-6 Astra); lower-ceiling models stay
+  at xhigh.
 """
 
 from agent.transports import get_transport
@@ -111,11 +113,13 @@ class TestTokenHubEffortVocabulary:
 class TestCodexUltraForEveryModel:
     def test_ultra_never_leaks_and_respects_per_model_ceiling(self):
         """'ultra' must never reach the Codex wire. Live-verified vocabulary
-        (#68365): gpt-5.6 accepts max (its ceiling), gpt-5.5/o5 do not —
+        (#68365): GPT-5.6 and GPT-6 Astra accept max (their ceiling),
+        gpt-5.5/o5 do not —
         their ceiling is xhigh."""
         transport = get_transport("codex_responses")
         expected = {
             "gpt-5.6-codex": "max",
+            "gpt-6-astra": "max",
             "o5-pro": "xhigh",
             "gpt-5.5": "xhigh",
             "some-responses-model": "xhigh",

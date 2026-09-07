@@ -13,7 +13,8 @@ from typing import Any, Callable, Optional
 from agent.reasoning_effort import (
     ACTUAL_RELAY_EFFORTS, XAI_GROK46_EFFORTS, XAI_LEGACY_EFFORTS, clamp_effort,
     # Same declared vocabulary + shared clamp as the main Codex transport (agent.reasoning_effort):
-    # per-model — "max" is gpt-5.6-only, "minimal"/"ultra" always rejected (live-verified, #68365).
+    # per-model — GPT-5.6 and GPT-6 Astra support "max"; "minimal"/"ultra" are internal-only
+    # levels and clamp down (live-verified, #68365; Astra provider docs).
     codex_supported_efforts,
 )
 from agent.transports.base import ProviderTransport
