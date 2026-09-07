@@ -118,6 +118,20 @@ class FileStateRegistry:
             _evict_oldest(self._last_writer, _MAX_GLOBAL_WRITERS)
             self._stamp(task_id, resolved, mtime, now, False)
 
+    def note_possible_write(self, task_id: str, resolved: str) -> None:
+        """Record last-writer evidence when a write's final mtime is unavailable.
+
+        A possible write must still invalidate sibling assumptions, but it must not
+        manufacture this agent's successful-read stamp when the lexical entry cannot
+        be observed.
+        """
+        if _disabled():
+            return
+        now = time.time()
+        with self._state_lock:
+            self._last_writer[resolved] = (task_id, now)
+            _evict_oldest(self._last_writer, _MAX_GLOBAL_WRITERS)
+
     def check_stale(self, task_id: str, resolved: str) -> Optional[str]:
         """Model-facing warning if this write would be stale, else ``None``. Severity
         order: sibling wrote after our read > mtime drift / partial read > never read."""
@@ -223,6 +237,10 @@ def note_write(
     _registry.note_write(task_id, str(resolved_or_path), mtime=mtime)
 
 
+def note_possible_write(task_id: str, resolved_or_path: str | Path) -> None:
+    _registry.note_possible_write(task_id, str(resolved_or_path))
+
+
 def check_stale(task_id: str, resolved_or_path: str | Path) -> Optional[str]:
     return _registry.check_stale(task_id, str(resolved_or_path))
 
@@ -244,6 +262,7 @@ __all__ = [
     "get_registry",
     "record_read",
     "note_write",
+    "note_possible_write",
     "check_stale",
     "lock_path",
     "writes_since",

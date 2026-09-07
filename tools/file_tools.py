@@ -882,8 +882,9 @@ def _note_edited(
                 try:
                     lexical_mtime = os.lstat(tracking_path).st_mtime
                 except OSError:
-                    continue
-                file_state.note_write(task_id, tracking_path, mtime=lexical_mtime)
+                    file_state.note_possible_write(task_id, tracking_path)
+                else:
+                    file_state.note_write(task_id, tracking_path, mtime=lexical_mtime)
             else:
                 file_state.note_write(task_id, tracking_path)
 
@@ -1031,7 +1032,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                     _note_edited(
                         task_id, [path], path_to_resolved, session_id,
                         path_to_identity=tracking)
-                elif outcome != "not_committed" or not candidate:
+                elif not candidate and outcome != "not_committed":
                     _update_read_timestamp(
                         path, task_id, identity_path=tracking.get(path))
             else:
