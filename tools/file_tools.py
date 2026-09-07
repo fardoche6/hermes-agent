@@ -963,20 +963,14 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                 [path], path_to_resolved, task_id, path_to_identity=tracking)
             backend_path = _backend_path(path, path_to_resolved, candidates)
             candidate = candidates.get(path)
-            rewrite_hint = None
             if candidate is not None:
                 result = file_ops.write_file(
                     backend_path, content, protected_lexical_candidate=candidate)
             else:
-                # Preserve the existing whole-file rewrite guidance for ordinary
-                # writes; protected candidates use the lexical replacement path.
-                rewrite_hint = _whole_file_rewrite_hint(task_id, _resolved, content)
                 result = file_ops.write_file(backend_path, content)
             result_dict = result.to_dict()
             if warnings:
                 result_dict["_warning"] = warnings[0]
-            if rewrite_hint and not result_dict.get("error"):
-                result_dict["hint"] = rewrite_hint
             if backend_path:
                 # Always report the absolute/backend path actually written so a
                 # wrong-cwd mismatch is visible instead of silently landing elsewhere.
