@@ -8,11 +8,18 @@ protected final symlink.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import os
 import stat
 import sys
 from dataclasses import dataclass
+
+
+_RENAME_NOREPLACE = 1
+_RENAME_EXCHANGE = 2
+_O_PATH = getattr(os, "O_PATH", 0)
+_LIBC = None
 
 from tools.file_operations_common import WriteResult
 
@@ -49,12 +56,18 @@ class BackendAdmission:
 
         if sys.platform == "win32" or os.name == "nt":
             return cls(True, False, "protected lexical replacement is unavailable on Windows")
-        required_names = ("O_NOFOLLOW", "O_DIRECTORY", "fsync", "fchmod")
+        required_names = ("O_NOFOLLOW", "O_DIRECTORY", "O_PATH", "fsync", "fchmod")
         if not all(hasattr(os, name) for name in required_names):
             return cls(
                 True,
                 False,
                 "protected lexical replacement requires no-follow descriptor primitives",
+            )
+        if _renameat2_function() is None:
+            return cls(
+                True,
+                False,
+                "protected lexical replacement requires renameat2 atomic rename support",
             )
         supports_dir_fd = getattr(os, "supports_dir_fd", ())
         required_functions = (
@@ -123,6 +136,7 @@ class ProtectedLexicalCandidate:
     protection_token: ProtectedInstructionToken | None = None
     staged_identity: dict | None = None
     committed_identity: dict | None = None
+    final_fd: int = -1
     closed: bool = False
 
     def set_content(self, content: str | bytes) -> None:
@@ -137,6 +151,9 @@ class ProtectedLexicalCandidate:
         if self.closed:
             return
         self.closed = True
+        if self.final_fd >= 0:
+            fd, self.final_fd = self.final_fd, -1
+            os.close(fd)
         if self.parent_fd >= 0:
             fd, self.parent_fd = self.parent_fd, -1
             os.close(fd)
@@ -174,6 +191,89 @@ def _same_identity(expected: dict, actual: dict) -> bool:
 def _same_inode(expected: dict, actual: dict) -> bool:
     """Compare the inode identity while allowing a bound file's mode to change."""
     return all(expected.get(key) == actual.get(key) for key in ("st_dev", "st_ino"))
+
+
+def _renameat2_function():
+    """Return libc's descriptor-relative atomic rename primitive, if available."""
+    global _LIBC
+    if _LIBC is False:
+        return None
+    if _LIBC is None:
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            function = getattr(libc, "renameat2")
+        except (AttributeError, OSError):
+            _LIBC = False
+            return None
+        function.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        function.restype = ctypes.c_int
+        _LIBC = libc
+    return getattr(_LIBC, "renameat2", None)
+
+
+def _renameat2(source: str, destination: str, parent_fd: int, flags: int) -> None:
+    function = _renameat2_function()
+    if function is None:
+        raise ProtectedLexicalError("protected lexical replacement requires renameat2 atomic rename support")
+    result = function(
+        parent_fd,
+        os.fsencode(source),
+        parent_fd,
+        os.fsencode(destination),
+        flags,
+    )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), destination)
+
+
+def _entry_matches(
+    candidate: ProtectedLexicalCandidate,
+    name: str,
+    expected: dict,
+    *,
+    expected_sha256: str | None = None,
+    expected_link_text: str | None = None,
+) -> bool:
+    """Compare one descriptor-relative entry with a bound preimage snapshot."""
+    try:
+        observed = os.stat(name, dir_fd=candidate.parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    observed_identity = {"kind": "regular" if stat.S_ISREG(observed.st_mode) else "symlink" if stat.S_ISLNK(observed.st_mode) else "other", **_identity(observed)}
+    if observed_identity.get("kind") != expected.get("kind"):
+        return False
+    if expected.get("kind") == "regular":
+        if not _same_identity(expected, observed_identity):
+            return False
+        if expected_sha256 is None:
+            return True
+        try:
+            data, _ = _read_final_regular(candidate.parent_fd, name, expected_identity=expected)
+        except (OSError, ProtectedLexicalError):
+            return False
+        return hashlib.sha256(data).hexdigest() == expected_sha256
+    if expected.get("kind") == "symlink":
+        link_text = os.readlink(name, dir_fd=candidate.parent_fd)
+        if expected_link_text is not None and link_text != expected_link_text:
+            return False
+        return _same_identity(expected, observed_identity)
+    return False
+
+
+def _entry_expected_from_candidate(candidate: ProtectedLexicalCandidate) -> dict:
+    if candidate.final_fd < 0:
+        return candidate.final_identity
+    return {
+        "kind": candidate.final_identity.get("kind"),
+        **_identity(os.fstat(candidate.final_fd)),
+    }
 
 
 def _entry_identity(st: os.stat_result, link_text: str) -> dict:
@@ -262,8 +362,13 @@ def _random_name(parent_fd: int) -> str:
 
 
 def _rename(source: str, destination: str, parent_fd: int) -> None:
-    """Rename only through the retained parent descriptor."""
-    os.rename(source, destination, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+    """Atomically exchange two descriptor-relative lexical entries."""
+    _renameat2(source, destination, parent_fd, _RENAME_EXCHANGE)
+
+
+def _rename_noreplace(source: str, destination: str, parent_fd: int) -> None:
+    """Move an entry only when the destination is still absent."""
+    _renameat2(source, destination, parent_fd, _RENAME_NOREPLACE)
 
 
 def prepare_candidate(
@@ -288,6 +393,7 @@ def prepare_candidate(
     parent_path = os.path.dirname(absolute)
     final_name = os.path.basename(absolute)
     parent_fd = -1
+    final_fd = -1
     try:
         try:
             parent_fd = _open_directory(parent_path)
@@ -311,6 +417,10 @@ def prepare_candidate(
                 candidate_mode=None,
                 initial_kind="absent",
             )
+        final_fd = os.open(final_name, _O_PATH | os.O_NOFOLLOW, dir_fd=parent_fd)
+        bound_identity = _identity(os.fstat(final_fd))
+        if not _same_identity(bound_identity, _identity(final_stat)):
+            raise ProtectedLexicalError("protected final entry changed while binding its descriptor")
         if not stat.S_ISLNK(final_stat.st_mode):
             if stat.S_ISREG(final_stat.st_mode):
                 original_bytes, final_identity = _read_final_regular(
@@ -334,6 +444,7 @@ def prepare_candidate(
                     original_bytes=original_bytes,
                     original_sha256=hashlib.sha256(original_bytes).hexdigest(),
                     original_mode=stat.S_IMODE(final_identity["st_mode"]),
+                    final_fd=final_fd,
                 )
             raise ProtectedLexicalError("protected final entry is not a regular-file symlink")
         link_text = os.readlink(final_name, dir_fd=parent_fd)
@@ -355,8 +466,11 @@ def prepare_candidate(
             target_sha256=hashlib.sha256(target_bytes).hexdigest(),
             candidate_mode=stat.S_IMODE(target_identity["st_mode"]),
             initial_kind="symlink",
+            final_fd=final_fd,
         )
     except Exception:
+        if final_fd >= 0:
+            os.close(final_fd)
         if parent_fd >= 0:
             os.close(parent_fd)
         raise
@@ -555,21 +669,46 @@ def _final_is_candidate(candidate: ProtectedLexicalCandidate) -> bool:
         return False
 
 
-def _cleanup_temp(candidate: ProtectedLexicalCandidate, name: str | None) -> str | None:
+def _cleanup_temp(
+    candidate: ProtectedLexicalCandidate,
+    name: str | None,
+    *,
+    expected_identity: dict | None = None,
+    expected_sha256: str | None = None,
+    expected_link_text: str | None = None,
+) -> str | None:
+    """Remove only an entry atomically bound to the expected object.
+
+    The generated name is first moved with RENAME_NOREPLACE into a fresh
+    quarantine name.  A raced replacement is therefore moved out of the
+    original name and remains available for inspection; it is never passed to
+    unlink.  Identity uncertainty leaves the quarantined object in place.
+    """
     if not name:
         return None
-    if candidate.staged_identity is None:
+    expected = expected_identity or candidate.staged_identity
+    if expected is None:
         return "protected temporary identity is not bound; leaving it in place"
+    quarantine = _random_name(candidate.parent_fd)
     try:
-        temp_stat = os.stat(name, dir_fd=candidate.parent_fd, follow_symlinks=False)
+        _rename_noreplace(name, quarantine, candidate.parent_fd)
     except FileNotFoundError:
-        return "protected temporary object could not be observed; leaving it in place"
+        return "protected temporary object could not be atomically bound; leaving it in place"
     except Exception as exc:
-        return f"protected temporary object could not be observed: {exc}"
-    if not _same_inode(candidate.staged_identity, _identity(temp_stat)):
-        return "protected temporary object changed; leaving it in place"
+        return f"protected temporary object could not be atomically bound: {exc}"
     try:
-        os.unlink(name, dir_fd=candidate.parent_fd)
+        if not _entry_matches(
+            candidate,
+            quarantine,
+            expected,
+            expected_sha256=expected_sha256,
+            expected_link_text=expected_link_text,
+        ):
+            return "protected temporary object changed; leaving it in quarantine"
+    except Exception as exc:
+        return f"protected temporary object could not be verified: {exc}"
+    try:
+        os.unlink(quarantine, dir_fd=candidate.parent_fd)
     except Exception as exc:
         return str(exc)
     return None
@@ -590,29 +729,52 @@ def _protected_failure(
     )
 
 
-def _classify_rename_failure(
-    candidate: ProtectedLexicalCandidate,
-    temp_name: str,
-    rename_error: Exception,
-) -> WriteResult:
-    """Classify a rename exception without mutating the guarded lexical leaf."""
+def _approved_preimage_matches(candidate: ProtectedLexicalCandidate, name: str) -> bool:
+    expected = _entry_expected_from_candidate(candidate)
+    expected_sha256 = candidate.original_sha256 if candidate.initial_kind == "regular" else None
+    if not _entry_matches(
+        candidate,
+        name,
+        expected,
+        expected_sha256=expected_sha256,
+        expected_link_text=candidate.link_text,
+    ):
+        return False
+    if candidate.initial_kind != "symlink":
+        return True
+    if candidate.target_path is None or candidate.target_identity is None or candidate.target_sha256 is None:
+        return False
     try:
-        if _observe_staged_final(candidate):
-            return _protected_failure(
-                candidate,
-                "COMMITTED (possibly modified): protected rename raised after the "
-                "staged object was installed; the protected lexical entry may be "
-                f"modified: {rename_error}",
-                outcome="committed",
-                possibly_modified=True,
-            )
-        _revalidate(candidate)
-    except Exception as observation_error:
+        target_bytes, target_identity = _read_regular(candidate.target_path)
+    except (OSError, ProtectedLexicalError):
+        return False
+    return (
+        _same_identity(candidate.target_identity, target_identity)
+        and hashlib.sha256(target_bytes).hexdigest() == candidate.target_sha256
+    )
+
+
+def _rollback_exchange(candidate: ProtectedLexicalCandidate, temp_name: str) -> WriteResult:
+    """Exchange a raced preimage back without deleting either object."""
+    try:
+        _rename(temp_name, candidate.final_name, candidate.parent_fd)
+    except Exception as rollback_error:
         return _protected_failure(
             candidate,
-            "UNCERTAIN STATE (possibly modified): protected rename raised and the "
-            "final state could not be proven; the protected lexical entry may be "
-            f"modified: {observation_error}; rename error: {rename_error}",
+            "UNCERTAIN STATE (possibly modified): protected preimage drifted and "
+            f"rollback could not be completed: {rollback_error}",
+            outcome="uncertain",
+            possibly_modified=True,
+        )
+    if not _approved_preimage_matches(candidate, candidate.final_name):
+        restored = False
+    else:
+        restored = True
+    if not _entry_matches(candidate, temp_name, candidate.staged_identity or {}):
+        return _protected_failure(
+            candidate,
+            "UNCERTAIN STATE (possibly modified): protected preimage drifted and "
+            "rollback left an unproven staged object",
             outcome="uncertain",
             possibly_modified=True,
         )
@@ -620,15 +782,101 @@ def _classify_rename_failure(
     if cleanup_error:
         return _protected_failure(
             candidate,
-            "UNCERTAIN STATE (possibly modified): protected rename did not install "
-            "the staged object, but its bound temporary object could not be cleaned "
-            f"up: {cleanup_error}; rename error: {rename_error}",
+            "UNCERTAIN STATE: protected preimage drifted and rollback completed, but "
+            f"the staged object could not be cleaned up: {cleanup_error}",
+            outcome="uncertain",
+            possibly_modified=True,
+        )
+    if not restored:
+        return _protected_failure(
+            candidate,
+            "UNCERTAIN STATE (possibly modified): protected preimage drifted and the "
+            "raced replacement was preserved, but the approved lexical entry could "
+            "not be proven restored",
             outcome="uncertain",
             possibly_modified=True,
         )
     return _protected_failure(
         candidate,
-        "NOT COMMITTED: protected rename failed, the frozen lexical entry was "
+        "NOT COMMITTED: protected final entry changed before the atomic replacement; "
+        "the replacement was preserved and the approved entry was restored",
+        outcome="not_committed",
+        possibly_modified=False,
+    )
+
+
+def _classify_rename_failure(
+    candidate: ProtectedLexicalCandidate,
+    temp_name: str,
+    rename_error: Exception,
+) -> WriteResult:
+    """Classify an atomic rename exception without guessing its outcome."""
+    try:
+        if _observe_staged_final(candidate):
+            cleanup_error = None
+            if candidate.initial_kind != "absent":
+                cleanup_error = _cleanup_temp(
+                    candidate,
+                    temp_name,
+                    expected_identity=candidate.final_identity,
+                    expected_sha256=candidate.original_sha256 if candidate.initial_kind == "regular" else None,
+                    expected_link_text=candidate.link_text,
+                )
+            if cleanup_error:
+                return _protected_failure(
+                    candidate,
+                    "UNCERTAIN STATE (possibly modified): protected atomic rename "
+                    f"installed the staged object, but the displaced preimage could "
+                    f"not be cleaned up: {cleanup_error}; rename error: {rename_error}",
+                    outcome="uncertain",
+                    possibly_modified=True,
+                )
+            return _protected_failure(
+                candidate,
+                "COMMITTED (possibly modified): protected atomic rename raised after "
+                "the staged object was installed; the protected lexical entry may be "
+                f"modified: {rename_error}",
+                outcome="committed",
+                possibly_modified=True,
+            )
+        if candidate.initial_kind == "absent" and isinstance(rename_error, FileExistsError):
+            observation_error = None
+        else:
+            try:
+                _revalidate(candidate)
+                observation_error = None
+            except Exception as error:
+                observation_error = error
+        if observation_error is not None:
+            return _protected_failure(
+                candidate,
+                "UNCERTAIN STATE (possibly modified): protected atomic rename raised "
+                "and the final state could not be proven; the protected lexical entry "
+                f"may be modified: {observation_error}; rename error: {rename_error}",
+                outcome="uncertain",
+                possibly_modified=True,
+            )
+    except Exception as observation_error:
+        return _protected_failure(
+            candidate,
+            "UNCERTAIN STATE (possibly modified): protected atomic rename raised and "
+            f"the final state could not be proven: {observation_error}; rename error: {rename_error}",
+            outcome="uncertain",
+            possibly_modified=True,
+        )
+    cleanup_error = _cleanup_temp(candidate, temp_name)
+    if cleanup_error:
+        return _protected_failure(
+            candidate,
+            "UNCERTAIN STATE (possibly modified): protected atomic rename did not "
+            "install the staged object, but its bound temporary object could not be "
+            f"cleaned up: {cleanup_error}; rename error: {rename_error}",
+            outcome="uncertain",
+            possibly_modified=True,
+        )
+    return _protected_failure(
+        candidate,
+        "NOT COMMITTED: protected atomic rename failed, the frozen lexical entry was "
         f"unchanged, and the bound temporary object was cleaned up: {rename_error}",
         outcome="not_committed",
         possibly_modified=False,
@@ -647,10 +895,33 @@ def commit_candidate(candidate: ProtectedLexicalCandidate) -> WriteResult:
         _revalidate(candidate)
         commit_attempted = True
         try:
-            _rename(temp_name, candidate.final_name, candidate.parent_fd)
-            temp_name = None
+            if candidate.initial_kind == "absent":
+                _rename_noreplace(temp_name, candidate.final_name, candidate.parent_fd)
+            else:
+                _rename(temp_name, candidate.final_name, candidate.parent_fd)
         except Exception as rename_error:
             return _classify_rename_failure(candidate, temp_name, rename_error)
+
+        if candidate.initial_kind != "absent":
+            if not _approved_preimage_matches(candidate, temp_name):
+                return _rollback_exchange(candidate, temp_name)
+            cleanup_error = _cleanup_temp(
+                candidate,
+                temp_name,
+                expected_identity=candidate.final_identity,
+                expected_sha256=candidate.original_sha256 if candidate.initial_kind == "regular" else None,
+                expected_link_text=candidate.link_text,
+            )
+            if cleanup_error:
+                return _protected_failure(
+                    candidate,
+                    "UNCERTAIN STATE (possibly modified): protected atomic replacement "
+                    "installed the candidate, but the approved displaced object could "
+                    f"not be cleaned up: {cleanup_error}",
+                    outcome="uncertain",
+                    possibly_modified=True,
+                )
+        temp_name = None
 
         try:
             _capture_committed_state(candidate)
