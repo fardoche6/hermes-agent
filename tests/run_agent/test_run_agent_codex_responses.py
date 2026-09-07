@@ -2244,6 +2244,40 @@ def test_dump_api_request_debug_redacts_structured_headers_in_file_and_stdout(mo
     assert len(persisted) <= 8192
 
 
+def test_dump_api_request_debug_keeps_serialized_literal_cookie_records_atomic(
+    monkeypatch, tmp_path, capsys
+):
+    agent = _build_agent(monkeypatch)
+    agent.base_url = "https://api.example.test/v1"
+    agent.logs_dir = tmp_path
+    request = _codex_request_kwargs()
+    request["input"] = [{
+        "role": "user",
+        "content": (
+            r"Cookie: sid=SYN_R6_DUMP_COOKIE_HEAD\ncontinued=SYN_R6_DUMP_COOKIE_TAIL; Path=/SYN_R6_DUMP_COOKIE_PATH"
+            "\n"
+            r"Set-Cookie: sid=SYN_R6_DUMP_SET_HEAD\rcontinued=SYN_R6_DUMP_SET_TAIL; Path=/SYN_R6_DUMP_SET_PATH"
+        ),
+    }]
+    monkeypatch.setenv("HERMES_DUMP_REQUEST_STDOUT", "1")
+
+    dump_file = agent._dump_api_request_debug(request, reason="serialized-boundary-preflight")
+
+    persisted = dump_file.read_text(encoding="utf-8")
+    stdout = capsys.readouterr().out
+    payload = json.loads(persisted)
+    content = payload["request"]["body"]["input"][0]["content"]
+    assert content == "Cookie: ***\nSet-Cookie: ***"
+    assert all(marker not in persisted for marker in (
+        "SYN_R6_DUMP_COOKIE_", "SYN_R6_DUMP_SET_",
+    ))
+    assert all(marker not in stdout for marker in (
+        "SYN_R6_DUMP_COOKIE_", "SYN_R6_DUMP_SET_",
+    ))
+    assert stdout[stdout.find("{"):] == persisted
+    assert len(persisted.encode("utf-8")) <= 8192
+
+
 def test_dump_api_request_debug_fails_closed_for_malformed_nested_headers(
     monkeypatch, tmp_path, capsys,
 ):

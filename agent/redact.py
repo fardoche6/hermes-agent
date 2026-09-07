@@ -818,20 +818,118 @@ def _find_balanced_container_end(
     return _scan_balanced_container(text, start, escape_depth)
 
 
-def _quoted_context_map(text: str) -> list[bool]:
-    """Record whether each source position is inside an unescaped quote layer."""
-    context = [False] * (len(text) + 1)
-    quote = None
-    backslashes = 0
-    for position, char in enumerate(text):
-        context[position] = quote is not None
-        if char in "\"'" and backslashes % 2 == 0:
-            if quote is None:
-                quote = char
-            elif quote == char:
-                quote = None
-        backslashes = backslashes + 1 if char == "\\" else 0
-    context[len(text)] = quote is not None
+def _is_json_whitespace(char: str) -> bool:
+    """Return whether ``char`` is one of RFC 8259's four JSON whitespace bytes."""
+    return char in " \t\n\r"
+
+
+def _skip_json_whitespace(text: str, start: int) -> int:
+    """Skip only RFC 8259 JSON whitespace from ``start``."""
+    while start < len(text) and _is_json_whitespace(text[start]):
+        start += 1
+    return start
+
+
+def _skip_header_ows(text: str, start: int) -> int:
+    """Skip HTTP header optional whitespace without crossing a physical record."""
+    while start < len(text) and text[start] in " \t":
+        start += 1
+    return start
+
+
+def _serialization_parent_layer(layer: int) -> Optional[int]:
+    """Return the parent raw quote depth for a canonical serialized layer."""
+    return None if layer == 0 else (layer - 1) // 2
+
+
+def _serialized_string_allows_child(text: str, quote_index: int, layer: int) -> bool:
+    """Recognize a serialized JSON value that can contain another encoded layer."""
+    position = _skip_json_whitespace(text, quote_index + 1)
+    if position >= len(text) or text[position] in "{[":
+        return position < len(text)
+    if text[position] != "\\":
+        return False
+    run_end = _backslash_run_end(text, position)
+    child_layer = 2 * layer + 1
+    return (
+        run_end < len(text)
+        and text[run_end] in "\"'"
+        and run_end - position == child_layer
+    )
+
+
+def _serialized_quote_can_open(text: str, run_start: int, layer: int,
+                               children_allowed: dict[int, bool]) -> bool:
+    """Require structural evidence before treating an escaped quote as a layer opener."""
+    parent = _serialization_parent_layer(layer)
+    if parent is None:
+        return True
+    if not children_allowed.get(parent, False):
+        return False
+    previous = run_start - 1
+    while previous >= 0 and _is_json_whitespace(text[previous]):
+        previous -= 1
+    return previous >= 0 and text[previous] in "{[,:\"'"
+
+
+def _serialization_layer_map(text: str) -> list[Optional[int]]:
+    """Map source positions to the deepest proven canonical serialization layer.
+
+    A raw quote depth is ``0, 1, 3, 7, ...``.  Deeper layers are considered
+    only inside a parent string whose first value is itself serialized JSON;
+    escaped quotes in ordinary prose therefore cannot authorize ``\\n`` record
+    framing by accident.
+    """
+    context: list[Optional[int]] = [None] * (len(text) + 1)
+    active: dict[int, bool] = {}
+    quote_chars: dict[int, str] = {}
+    children_allowed: dict[int, bool] = {}
+
+    def current_layer() -> Optional[int]:
+        return max((layer for layer, is_open in active.items() if is_open), default=None)
+
+    def mark(start: int, end: int) -> None:
+        layer = current_layer()
+        for position in range(start, min(end, len(text))):
+            context[position] = layer
+
+    def handle_quote(layer: int, quote_index: int, run_start: int, quote: str) -> None:
+        if active.get(layer, False):
+            if quote_chars.get(layer) == quote:
+                active[layer] = False
+                children_allowed[layer] = False
+                for child in tuple(active):
+                    if child > layer:
+                        active[child] = False
+                        children_allowed[child] = False
+            return
+        if _is_canonical_escape_depth(layer) and _serialized_quote_can_open(
+            text, run_start, layer, children_allowed
+        ):
+            active[layer] = True
+            quote_chars[layer] = quote
+            children_allowed[layer] = _serialized_string_allows_child(
+                text, quote_index, layer
+            )
+
+    position = 0
+    while position < len(text):
+        if text[position] == "\\":
+            run_end = _backslash_run_end(text, position)
+            mark(position, run_end + 1 if run_end < len(text) and text[run_end] in "\"'" else run_end)
+            if run_end < len(text) and text[run_end] in "\"'":
+                layer = run_end - position
+                if _is_canonical_escape_depth(layer):
+                    handle_quote(layer, run_end, position, text[run_end])
+                position = run_end + 1
+            else:
+                position = run_end
+            continue
+        mark(position, position + 1)
+        if text[position] in "\"'":
+            handle_quote(0, position, position, text[position])
+        position += 1
+    context[len(text)] = current_layer()
     return context
 
 
@@ -845,9 +943,7 @@ def _json_bare_scalar_end(text: str, start: int) -> Optional[int]:
     match = _JSON_BARE_SCALAR_RE.match(text, start)
     if match is None:
         return None
-    delimiter = match.end()
-    while delimiter < len(text) and text[delimiter].isspace():
-        delimiter += 1
+    delimiter = _skip_json_whitespace(text, match.end())
     if delimiter >= len(text) or text[delimiter] not in ",]}":
         return None
     return match.end()
@@ -864,33 +960,65 @@ def _line_end(text: str, start: int) -> int:
 
 
 def _plain_field_value_end(
-    text: str, start: int, *, inside_quote: bool,
-    quote_context: Optional[list[bool]],
-) -> int:
-    """Find a plain header record end without treating inner quotes as boundaries."""
+    text: str,
+    start: int,
+    *,
+    serialization_layer: Optional[int] = None,
+    inside_quote: bool = False,
+    quote_context: Optional[list[Optional[int]]] = None,
+) -> Optional[int]:
+    """Scan one plain record at its proven serialization layer.
+
+    Physical CR/LF bytes always terminate the record.  A textual ``\\n`` or
+    ``\\r`` terminates it only when the exact canonical escape width for the
+    containing serialized string is known.  A literal even-width run stays in
+    the atomic value; an odd/mismatched run is ambiguous and fails closed.
+    """
+    if serialization_layer is None and inside_quote and quote_context is not None:
+        candidate = quote_context[start] if start < len(quote_context) else None
+        if isinstance(candidate, int) and not isinstance(candidate, bool):
+            serialization_layer = candidate
+
     end = start
-    while end < len(text) and text[end] not in "\r\n":
-        if (
-            inside_quote
-            and text[end] in "\"'"
-            and quote_context is not None
-            and not quote_context[end + 1]
-        ):
-            break
+    while end < len(text):
+        if text[end] in "\r\n":
+            return end
         if text[end] == "\\":
-            escaped_end = _backslash_run_end(text, end)
-            if escaped_end < len(text) and text[escaped_end] in "nNrR":
-                break
-            end = escaped_end
+            run_end = _backslash_run_end(text, end)
+            run_length = run_end - end
+            if run_end < len(text) and text[run_end] in "nNrR":
+                if serialization_layer is None:
+                    return None
+                line_escape_width = serialization_layer + 1
+                if run_length == line_escape_width:
+                    return end
+                if (
+                    run_length % line_escape_width == 0
+                    and (run_length // line_escape_width) % 2 == 0
+                ):
+                    end = run_end + 1
+                    continue
+                return None
+            if run_end < len(text) and text[run_end] in "\"'" and serialization_layer is not None:
+                if run_length == serialization_layer:
+                    return end
+                if not _quote_run_matches_layer(run_length, serialization_layer):
+                    return None
+            end = run_end + 1 if run_end < len(text) else run_end
             continue
+        if text[end] in "\"'" and serialization_layer is not None:
+            if serialization_layer == 0:
+                return end
+            return None
         end += 1
-    return end
+    return end if serialization_layer is None else None
 
 
 def _find_header_value_span(
     text: str, start: int, *, inside_quote: bool = False,
-    quote_context: Optional[list[bool]] = None, escape_depth: int = 0,
-    json_field: bool = False,
+    quote_context: Optional[list[Optional[int]]] = None,
+    serialization_layer: Optional[int] = None,
+    escape_depth: int = 0, json_field: bool = False,
 ) -> tuple[int, int, Optional[int], Optional[int], bool]:
     """Return a sensitive field value span, rejecting ambiguous boundaries."""
     if start >= len(text):
@@ -909,14 +1037,12 @@ def _find_header_value_span(
         if end_quote is None:
             return start, _line_end(text, start), None, None, False
         if json_field:
-            after_quote = end_quote + 1
-            while after_quote < len(text) and text[after_quote].isspace():
-                after_quote += 1
+            after_quote = _skip_json_whitespace(text, end_quote + 1)
             if after_quote < len(text) and text[after_quote] not in ",]}":
                 return start, end_quote + 1, None, None, False
         else:
             line_end = _line_end(text, end_quote + 1)
-            if text[end_quote + 1:line_end].strip():
+            if _skip_json_whitespace(text, end_quote + 1) < line_end:
                 return start, end_quote + 1, None, None, False
         return (
             start, end_quote + 1, quote_index + 1,
@@ -928,9 +1054,7 @@ def _find_header_value_span(
             text, start, escape_depth=escape_depth
         )
         if complete and json_field:
-            after_container = value_end
-            while after_container < len(text) and text[after_container].isspace():
-                after_container += 1
+            after_container = _skip_json_whitespace(text, value_end)
             if after_container < len(text) and text[after_container] not in ",]}":
                 return start, value_end, None, None, False
         return start, value_end, None, None, complete
@@ -941,12 +1065,16 @@ def _find_header_value_span(
             return start, _line_end(text, start), None, None, False
         return start, scalar_end, None, None, True
 
-    return start, _plain_field_value_end(
+    plain_end = _plain_field_value_end(
         text,
         start,
+        serialization_layer=serialization_layer,
         inside_quote=inside_quote,
         quote_context=quote_context,
-    ), None, None, True
+    )
+    if plain_end is None:
+        return start, _line_end(text, start), None, None, False
+    return start, plain_end, None, None, True
 
 
 def _is_header_name_boundary(text: str, start: int, end: int) -> bool:
@@ -991,9 +1119,7 @@ def _quoted_field_key_info(text: str, name_start: int, end_name: int):
     if closing is None:
         return None
     _, closing_quote, closing_depth = closing
-    separator = closing_quote + 1
-    while separator < len(text) and text[separator].isspace():
-        separator += 1
+    separator = _skip_json_whitespace(text, closing_quote + 1)
     if separator >= len(text) or text[separator] not in ":=":
         return None
     valid = (
@@ -1006,7 +1132,7 @@ def _quoted_field_key_info(text: str, name_start: int, end_name: int):
 
 def _persisted_header_spans(text: str, names: tuple[str, ...]):
     """Yield non-overlapping candidate field spans with checked value boundaries."""
-    quote_context = _quoted_context_map(text)
+    serialization_layers = _serialization_layer_map(text)
     position = 0
     while position < len(text):
         candidate = _next_persisted_header_name(text, position, names)
@@ -1015,16 +1141,20 @@ def _persisted_header_spans(text: str, names: tuple[str, ...]):
         found, end_name, name = candidate
         key_info = _quoted_field_key_info(text, found, end_name)
         quoted_name = found > 0 and text[found - 1] in "\"'"
+        plain_serialized_name = (
+            quoted_name
+            and end_name < len(text)
+            and text[end_name] in ":="
+            and serialization_layers[found] is not None
+        )
         if key_info is None:
-            if quoted_name:
+            if quoted_name and not plain_serialized_name:
                 yield found, name, found, len(text), None, None, False
                 position = max(found + 1, end_name)
                 continue
-            separator = end_name
+            separator = _skip_header_ows(text, end_name)
             field_escape_depth = 0
             json_field = False
-            while separator < len(text) and text[separator].isspace():
-                separator += 1
         else:
             separator, field_escape_depth, valid_key = key_info
             json_field = True
@@ -1035,23 +1165,30 @@ def _persisted_header_spans(text: str, names: tuple[str, ...]):
         if separator >= len(text) or text[separator] not in ":=":
             position = found + 1
             continue
-        value_start = separator + 1
-        while value_start < len(text) and text[value_start].isspace():
-            value_start += 1
+        value_start = (
+            _skip_json_whitespace(text, separator + 1)
+            if json_field
+            else _skip_header_ows(text, separator + 1)
+        )
+        serialization_layer = serialization_layers[value_start]
         if not json_field and _ascii_lower(name) in {"cookie", "set-cookie"}:
             value_end = _plain_field_value_end(
                 text,
                 value_start,
-                inside_quote=quote_context[value_start],
-                quote_context=quote_context,
+                serialization_layer=serialization_layer,
             )
-            yield found, name, value_start, value_end, None, None, True
-            position = max(value_end, found + 1)
+            if value_end is None:
+                failure_end = _line_end(text, value_start)
+                yield found, name, value_start, failure_end, None, None, False
+                position = max(failure_end, found + 1)
+            else:
+                yield found, name, value_start, value_end, None, None, True
+                position = max(value_end, found + 1)
             continue
         value_start, value_end, content_start, content_end, structured_ok = _find_header_value_span(
-            text, value_start,
-            inside_quote=quote_context[value_start],
-            quote_context=quote_context,
+            text,
+            value_start,
+            serialization_layer=None if json_field else serialization_layer,
             escape_depth=field_escape_depth,
             json_field=json_field,
         )

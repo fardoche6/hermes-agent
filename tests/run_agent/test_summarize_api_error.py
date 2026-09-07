@@ -10,6 +10,7 @@ contract: when ``body`` is empty, fall back to ``response.text`` (parsing a JSON
 provider error. This is a diagnostic improvement and is platform-agnostic.
 """
 
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -374,3 +375,54 @@ def test_entitlement_hint_is_complete_after_detail_redaction_and_second_pass():
     assert "https://grok.com/?_s=usage" in summary
     assert "/model" in summary
     assert redact_persisted_diagnostic(summary, limit=None) == summary
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        r"provider Set-Cookie: sid=SYN_R6_SUMMARY_HEAD\ncontinued=SYN_R6_SUMMARY_TAIL; Path=/SYN_R6_SUMMARY_PATH",
+        '{"X-Api-Key": true\x0b, "safe": "SYN_R6_SUMMARY_WHITESPACE_TAIL"}',
+        '{"Authorization": "Bearer SYN_R6_SUMMARY_AUTH"\u00a0, "safe": "SYN_R6_SUMMARY_NBSP_TAIL"}',
+    ],
+)
+def test_summary_and_auxiliary_warning_fail_closed_for_ambiguous_http_framing(
+    detail, monkeypatch
+):
+    error = Exception("synthetic provider failure")
+    error.status_code = 502
+    error.body = {"error": {"message": detail}}
+    summary = AIAgent._summarize_api_error(error)
+    warnings = []
+    agent = object.__new__(AIAgent)
+    monkeypatch.setattr(agent, "_emit_warning", warnings.append)
+
+    AIAgent._emit_auxiliary_failure(agent, "summary", error)
+
+    assert summary == "[redaction-unavailable]"
+    assert warnings == ["⚠ Auxiliary summary failed: [redaction-unavailable]"]
+    assert "SYN_R6_" not in summary
+    assert all("SYN_R6_" not in warning for warning in warnings)
+
+
+def test_summary_and_auxiliary_warning_keep_serialized_literal_cookie_atomic(monkeypatch):
+    detail = json.dumps({
+        "detail": r"Set-Cookie: sid=SYN_R6_SUMMARY_COOKIE\ncontinued=SYN_R6_SUMMARY_SUFFIX; Path=/SYN_R6_SUMMARY_PATH",
+        "safe": "public",
+    }, ensure_ascii=False)
+    error = Exception("synthetic provider failure")
+    error.status_code = 502
+    error.body = {"error": {"message": detail}}
+    summary = AIAgent._summarize_api_error(error)
+    warnings = []
+    agent = object.__new__(AIAgent)
+    monkeypatch.setattr(agent, "_emit_warning", warnings.append)
+
+    AIAgent._emit_auxiliary_failure(agent, "summary", error)
+
+    prefix = "HTTP 502: "
+    assert summary.startswith(prefix)
+    parsed = json.loads(summary[len(prefix):])
+    assert parsed == {"detail": "Set-Cookie: ***", "safe": "public"}
+    assert warnings == [f"⚠ Auxiliary summary failed: {summary}"]
+    assert "SYN_R6_SUMMARY_" not in summary
+    assert "SYN_R6_SUMMARY_" not in warnings[0]
