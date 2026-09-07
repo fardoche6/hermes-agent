@@ -266,7 +266,7 @@ def test_rename_committed_then_raised_reports_committed_path(
     import tools.protected_lexical_write as primitive
 
     target, destination = _tree(tmp_path)
-    original_rename = primitive.os.rename
+    original_rename = primitive._rename
     rename_called = False
 
     def rename_then_raise(*args, **kwargs):
@@ -275,7 +275,7 @@ def test_rename_committed_then_raised_reports_committed_path(
         rename_called = True
         raise OSError("injected after-rename failure")
 
-    monkeypatch.setattr(primitive.os, "rename", rename_then_raise)
+    monkeypatch.setattr(primitive, "_rename", rename_then_raise)
     monkeypatch.setattr(
         primitive.os,
         "supports_dir_fd",
@@ -334,7 +334,7 @@ def test_post_rename_mutation_or_observation_is_uncertain(
     import tools.protected_lexical_write as primitive
 
     target, destination = _tree(tmp_path)
-    original_rename = primitive.os.rename
+    original_rename = primitive._rename
     original_stat = primitive.os.stat
     rename_done = False
     fault_fired = False
@@ -360,7 +360,7 @@ def test_post_rename_mutation_or_observation_is_uncertain(
                 raise OSError("injected post-rename observation failure")
         return original_stat(path, *args, **kwargs)
 
-    monkeypatch.setattr(primitive.os, "rename", record_rename)
+    monkeypatch.setattr(primitive, "_rename", record_rename)
     monkeypatch.setattr(primitive.os, "stat", fail_or_mutate_after_rename)
     monkeypatch.setattr(
         primitive.os,
@@ -825,7 +825,7 @@ def test_commit_failure_with_cleanup_failure_reports_uncertain_state(tmp_path, m
     import tools.protected_lexical_write as primitive
 
     target, destination = _tree(tmp_path)
-    original_rename = primitive.os.rename
+    original_rename = primitive._rename
     original_unlink = primitive.os.unlink
 
     def fail_rename(*args, **kwargs):
@@ -836,7 +836,7 @@ def test_commit_failure_with_cleanup_failure_reports_uncertain_state(tmp_path, m
             raise OSError("injected cleanup failure")
         return original_unlink(name, *args, **kwargs)
 
-    monkeypatch.setattr(primitive.os, "rename", fail_rename)
+    monkeypatch.setattr(primitive, "_rename", fail_rename)
     monkeypatch.setattr(primitive.os, "unlink", fail_temp_cleanup)
     monkeypatch.setattr(
         primitive.os,
@@ -1107,6 +1107,132 @@ def test_temp_cleanup_preserves_replacement_after_bound_creation(
     assert target.read_bytes() == b"before\n"
 
 
+@pytest.mark.parametrize("operation", ["write", "replace", "v4a"])
+def test_atomic_exchange_rolls_back_raced_final_without_overwrite(
+    tmp_path, monkeypatch, operation,
+):
+    import tools.protected_lexical_write as primitive
+
+    target, destination = _tree(tmp_path)
+    original_rename = primitive._rename
+    raced = False
+    replacement_name = ".raced-protected-final"
+    replacement_bytes = b"unapproved final replacement\n"
+
+    def replace_before_exchange(source, final_name, parent_fd):
+        nonlocal raced
+        if not raced:
+            fd = os.open(
+                replacement_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=parent_fd,
+            )
+            try:
+                os.write(fd, replacement_bytes)
+            finally:
+                os.close(fd)
+            os.rename(
+                replacement_name,
+                final_name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            raced = True
+        return original_rename(source, final_name, parent_fd)
+
+    monkeypatch.setattr(primitive, "_rename", replace_before_exchange)
+    calls: list = []
+
+    result = _run_operation(
+        operation,
+        destination,
+        "before",
+        "candidate",
+        calls,
+    )
+
+    assert raced is True, result
+    assert result.get("error"), result
+    assert result.get("outcome") == "uncertain"
+    assert result.get("files_modified") == [str(destination)]
+    assert result.get("verified") is False
+    assert result.get("success") is not True
+    assert "could not be proven restored" in result["error"]
+    assert destination.is_symlink() is False
+    assert destination.read_bytes() == replacement_bytes
+    assert target.read_bytes() == b"before\n"
+    assert list(destination.parent.glob(".hermes-protected-*.tmp")) == []
+
+
+@pytest.mark.parametrize("operation", ["write", "replace", "v4a"])
+def test_atomic_cleanup_preserves_raced_unowned_temp_and_reports_uncertainty(
+    tmp_path, monkeypatch, operation,
+):
+    import tools.protected_lexical_write as primitive
+
+    target, destination = _tree(tmp_path)
+    original_noreplace = primitive._rename_noreplace
+    original_unlink = primitive.os.unlink
+    raced = False
+    replacement_bytes = b"unowned cleanup replacement\n"
+    unlinks: list[str] = []
+
+    def reject_commit(*args, **kwargs):
+        raise OSError("injected atomic commit failure")
+
+    def replace_before_cleanup_transfer(source, quarantine, parent_fd):
+        nonlocal raced
+        if not raced and source.startswith(".hermes-protected-"):
+            original_unlink(source, dir_fd=parent_fd)
+            fd = os.open(
+                source,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=parent_fd,
+            )
+            try:
+                os.write(fd, replacement_bytes)
+            finally:
+                os.close(fd)
+            raced = True
+        return original_noreplace(source, quarantine, parent_fd)
+
+    def record_unlink(name, *args, **kwargs):
+        unlinks.append(name)
+        return original_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(primitive, "_rename", reject_commit)
+    monkeypatch.setattr(primitive, "_rename_noreplace", replace_before_cleanup_transfer)
+    monkeypatch.setattr(primitive.os, "unlink", record_unlink)
+    monkeypatch.setattr(
+        primitive.os,
+        "supports_dir_fd",
+        set(primitive.os.supports_dir_fd) | {record_unlink},
+    )
+    calls: list = []
+
+    result = _run_operation(
+        operation,
+        destination,
+        "before",
+        "candidate",
+        calls,
+    )
+
+    assert raced is True, result
+    assert result.get("error"), result
+    assert "leaving it in quarantine" in result["error"]
+    assert result.get("outcome") == "uncertain"
+    assert result.get("verified") is False
+    assert result.get("success") is not True
+    assert unlinks == []
+    residues = list(destination.parent.glob(".hermes-protected-*.tmp"))
+    assert any(residue.read_bytes() == replacement_bytes for residue in residues)
+    assert destination.is_symlink()
+    assert target.read_bytes() == b"before\n"
+
+
 @pytest.mark.parametrize("outcome", ["committed", "uncertain"])
 @pytest.mark.parametrize("operation", ["write", "replace", "v4a"])
 def test_protected_terminal_outcome_updates_write_and_verification_state(
@@ -1136,20 +1262,20 @@ def test_protected_terminal_outcome_updates_write_and_verification_state(
     if operation != "write":
         _record_patch_failure(task_id, str(destination))
     if outcome == "committed":
-        original_rename = primitive.os.rename
+        original_rename = primitive._rename
 
         def rename_then_raise(*args, **kwargs):
             original_rename(*args, **kwargs)
             raise OSError("injected after-rename failure")
 
-        monkeypatch.setattr(primitive.os, "rename", rename_then_raise)
+        monkeypatch.setattr(primitive, "_rename", rename_then_raise)
         monkeypatch.setattr(
             primitive.os,
             "supports_dir_fd",
             set(primitive.os.supports_dir_fd) | {rename_then_raise},
         )
     else:
-        original_rename = primitive.os.rename
+        original_rename = primitive._rename
         original_stat = primitive.os.stat
         rename_done = False
         fault_fired = False
@@ -1172,7 +1298,7 @@ def test_protected_terminal_outcome_updates_write_and_verification_state(
                 destination.write_bytes(b"newer after rename\n")
             return original_stat(path, *args, **kwargs)
 
-        monkeypatch.setattr(primitive.os, "rename", record_rename)
+        monkeypatch.setattr(primitive, "_rename", record_rename)
         monkeypatch.setattr(primitive.os, "stat", mutate_after_rename)
         monkeypatch.setattr(
             primitive.os,
@@ -1227,7 +1353,7 @@ def test_possible_protected_write_keeps_verification_and_last_writer_evidence(
 
     import tools.protected_lexical_write as primitive
 
-    original_rename = primitive.os.rename
+    original_rename = primitive._rename
     unobservable = False
 
     def rename_then_fail(*args, **kwargs):
@@ -1239,7 +1365,7 @@ def test_possible_protected_write_keeps_verification_and_last_writer_evidence(
             unobservable = True
         raise OSError("injected after-rename observation failure")
 
-    monkeypatch.setattr(primitive.os, "rename", rename_then_fail)
+    monkeypatch.setattr(primitive, "_rename", rename_then_fail)
     monkeypatch.setattr(
         primitive.os,
         "supports_dir_fd",
