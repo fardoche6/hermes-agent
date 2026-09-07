@@ -1203,6 +1203,131 @@ def test_protected_terminal_outcome_updates_write_and_verification_state(
         assert str(destination) not in _patch_failure_tracker.get(task_id, {})
 
 
+@pytest.mark.parametrize("visibility", ["disappeared", "unobservable"])
+@pytest.mark.parametrize("operation", ["write", "replace", "v4a"])
+def test_possible_protected_write_keeps_verification_and_last_writer_evidence(
+    tmp_path, monkeypatch, operation, visibility,
+):
+    from agent.verification_evidence import record_verify_run, verification_status
+    from tools import file_state
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(
+        "[project]\nname = 'possible-write-bookkeeping'\nversion = '0'\n",
+        encoding="utf-8",
+    )
+    target = project / "external.txt"
+    destination = project / "AGENTS.md"
+    target.write_bytes(b"before\n")
+    destination.symlink_to(target)
+    task_id = f"possible-write-{operation}-{visibility}"
+    file_state.get_registry().clear()
+    record_verify_run(root=project, session_id=task_id, ok=True)
+
+    import tools.protected_lexical_write as primitive
+
+    original_rename = primitive.os.rename
+    unobservable = False
+
+    def rename_then_fail(*args, **kwargs):
+        nonlocal unobservable
+        original_rename(*args, **kwargs)
+        if visibility == "disappeared":
+            destination.unlink()
+        else:
+            unobservable = True
+        raise OSError("injected after-rename observation failure")
+
+    monkeypatch.setattr(primitive.os, "rename", rename_then_fail)
+    monkeypatch.setattr(
+        primitive.os,
+        "supports_dir_fd",
+        set(primitive.os.supports_dir_fd) | {rename_then_fail},
+    )
+    if visibility == "unobservable":
+        import tools.file_tools as file_tools
+
+        original_lstat = file_tools.os.lstat
+
+        def hide_leaf(path):
+            if unobservable and path == str(destination):
+                raise OSError("injected lexical observation failure")
+            return original_lstat(path)
+
+        monkeypatch.setattr(file_tools.os, "lstat", hide_leaf)
+
+    calls: list = []
+    result = _run_operation(
+        operation,
+        destination,
+        "before",
+        "after",
+        calls,
+        task_id=task_id,
+        session_id=task_id,
+    )
+
+    assert result.get("error"), result
+    assert result.get("outcome") in {"committed", "uncertain"}
+    assert result.get("files_modified") == [str(destination)]
+    assert result.get("verified") is False
+    writes = file_state.writes_since("observer", 0.0, [str(destination)])
+    assert writes.get(task_id) == [str(destination)]
+    assert file_state.known_reads(task_id) == []
+    assert verification_status(session_id=task_id, cwd=project)["status"] == "stale"
+
+
+@pytest.mark.parametrize("operation", ["write", "replace", "v4a"])
+def test_protected_staging_uncertainty_without_modified_path_preserves_read_timestamp(
+    tmp_path, monkeypatch, operation,
+):
+    from tools.file_tools import read_file_tool
+    from tools.file_tools_read_tracking import _read_tracker
+
+    destination = tmp_path / "AGENTS.md"
+    destination.write_bytes(b"before\n")
+    task_id = f"protected-staging-drift-{operation}"
+    json.loads(read_file_tool(str(destination), task_id=task_id))
+    before_timestamp = _read_tracker[task_id]["read_timestamps"][str(destination)]
+
+    import tools.protected_lexical_write as primitive
+
+    original_fsync = primitive.os.fsync
+    fault_fired = False
+
+    def fail_staging_after_guarded_drift(fd):
+        nonlocal fault_fired
+        original_fsync(fd)
+        if not fault_fired:
+            residues = list(destination.parent.glob(".hermes-protected-*.tmp"))
+            assert len(residues) == 1
+            residue = residues[0]
+            residue.unlink()
+            residue.write_bytes(b"replacement during staging\n")
+            destination.write_bytes(b"concurrent\n")
+            fault_fired = True
+        raise OSError("injected staging uncertainty")
+
+    monkeypatch.setattr(primitive.os, "fsync", fail_staging_after_guarded_drift)
+    calls: list = []
+    result = _run_operation(
+        operation,
+        destination,
+        "before",
+        "candidate",
+        calls,
+        task_id=task_id,
+    )
+
+    assert fault_fired is True
+    assert result.get("error"), result
+    assert result.get("outcome") == "uncertain"
+    assert result.get("files_modified") == []
+    assert destination.read_bytes() == b"concurrent\n"
+    assert _read_tracker[task_id]["read_timestamps"][str(destination)] == before_timestamp
+
+
 @pytest.mark.parametrize("operation", ["write", "replace", "v4a"])
 def test_not_committed_drift_does_not_refresh_read_timestamp(
     tmp_path, operation,
