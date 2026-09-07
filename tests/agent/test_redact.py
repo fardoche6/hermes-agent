@@ -5,6 +5,7 @@ import logging
 
 import pytest
 
+import agent.redact as redact_module
 from agent.redact import (
     RedactingFormatter,
     mask_secret,
@@ -12,6 +13,18 @@ from agent.redact import (
     redact_persisted_diagnostic,
     redact_sensitive_text,
 )
+
+
+def _r8_percent_encode_once(value):
+    if "%" not in value:
+        return "".join(f"%{byte:02X}" for byte in value.encode("utf-8"))
+    return value.replace("%", "%25")
+
+
+def _r8_percent_encode(value, depth):
+    for _ in range(depth):
+        value = _r8_percent_encode_once(value)
+    return value
 
 
 @pytest.fixture(autouse=True)
@@ -1793,7 +1806,7 @@ class TestPersistedHttpCredentialCorrection:
         [
             "https://api.example.test/x?token=&safe=ok",
             'https://api.example.test/x?token="SYN_R7_QUOTED_QUERY"&safe=ok',
-            "https://api.example.test/x?client%2525255Fsecret=SYN_R7_QUERY_CAP&safe=ok",
+            f"https://api.example.test/x?{_r8_percent_encode('client_secret', 11)}=SYN_R7_QUERY_CAP&safe=ok",
         ],
     )
     def test_r7_strict_query_ambiguity_fails_closed(self, text):
@@ -1854,3 +1867,72 @@ class TestPersistedHttpCredentialCorrection:
 
         assert result == "[redaction-unavailable]"
         assert marker not in result
+
+
+_R8_POLICY_NAMES = tuple(sorted(
+    redact_module._PERSISTED_STRUCTURED_POLICY_NAMES
+))
+
+
+@pytest.mark.parametrize("field_name", _R8_POLICY_NAMES)
+def test_r8_policy_names_are_safe_in_structured_shapes_and_formatter(field_name):
+    marker = "SYN_R8_STRUCTURED_" + field_name.replace("-", "_")
+    structured = json.dumps({field_name: marker, "safe": "public"})
+    list_value = json.dumps([{"safe": "public"}, {field_name: marker}])
+    malformed = '{"' + field_name + '\": "' + marker + '"'
+
+    for candidate in (structured, list_value, structured.encode("utf-8"), malformed):
+        result = redact_persisted_diagnostic(candidate, limit=None)
+        assert marker not in result
+    formatted = RedactingFormatter("%(message)s").format(
+        logging.makeLogRecord({"msg": "provider detail " + structured})
+    )
+    assert marker not in formatted
+
+
+def test_r8_canonicalization_reaches_fully_percent_encoded_names_through_depth_ten():
+    name = "token"
+    for depth in range(1, 11):
+        name = _r8_percent_encode_once(name)
+        marker = f"SYN_R8_DEPTH_{depth}"
+        result = redact_persisted_diagnostic(
+            f"https://api.example.test/x?{name}={marker}&safe=ok", limit=None
+        )
+        assert marker not in result
+        assert result != "[redaction-unavailable]"
+
+    name = _r8_percent_encode_once(name)
+    result = redact_persisted_diagnostic(
+        f"https://api.example.test/x?{name}=SYN_R8_DEPTH_CAP&safe=ok", limit=None
+    )
+    assert result == "[redaction-unavailable]"
+
+
+def test_r8_mixed_percent_and_rfc8259_query_name_is_safe():
+    marker = "SYN_R8_MIXED_QUERY"
+    text = "https://api.example.test/x?%5Cu0074oken=" + marker + "&safe=ok"
+
+    result = redact_persisted_diagnostic(text, limit=None)
+    formatted = RedactingFormatter("%(message)s").format(
+        logging.makeLogRecord({"msg": text})
+    )
+
+    assert marker not in result
+    assert marker not in formatted
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    tuple(redact_module._PERSISTED_AUTH_HEADER_NAMES) + ("cookie", "set-cookie"),
+)
+def test_r8_repeated_non_ows_header_run_fails_closed(field_name):
+    marker = "SYN_R8_NBSP_" + field_name.replace("-", "_")
+    value = "Bearer " + marker if "authorization" in field_name else marker
+    if field_name in {"cookie", "set-cookie"}:
+        value = "sid=" + marker
+    text = field_name + ("\u00a0" * 5) + ": " + value
+
+    result = redact_persisted_diagnostic(text, limit=None)
+
+    assert result == "[redaction-unavailable]"
+    assert marker not in result

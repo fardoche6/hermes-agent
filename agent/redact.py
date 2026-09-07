@@ -435,38 +435,20 @@ def _redact_query_string(query: str) -> str:
     if not query:
         return query
     return "&".join(
-        f"{key}=***" if sep and key.lower() in _SENSITIVE_QUERY_PARAMS else pair
+        f"{key}=***" if sep and _canonical_url_param_name(key) in _SENSITIVE_QUERY_PARAMS else pair
         for pair in query.split("&") for key, sep, _ in (pair.partition("="),)
     )
 
 
 def _canonical_url_param_name(name: str) -> str:
-    """Decode a URL parameter name (up to 3 unquote rounds) for case-insensitive matching."""
-    decoded = name
-    for _ in range(3):
-        if "%" not in decoded:
-            break
-        next_value = unquote_plus(decoded)
-        if next_value == decoded:
-            break
-        decoded = next_value
-    return decoded.casefold().replace("-", "_")
+    """Return the fixed-point canonical form used by URL-name matching."""
+    canonical, _exhausted = _decoded_marker_name(name)
+    return canonical
 
 
 def _canonical_url_param_name_with_cap(name: str) -> tuple[str, bool]:
-    """Return a canonical query name and whether another decode round remains."""
-    decoded = name
-    exhausted = False
-    for round_index in range(3):
-        if "%" not in decoded:
-            break
-        next_value = unquote_plus(decoded)
-        if next_value == decoded:
-            break
-        decoded = next_value
-        if round_index == 2 and "%" in decoded:
-            exhausted = True
-    return decoded.casefold().replace("-", "_"), exhausted
+    """Return a canonical query name and whether the shared cap was exhausted."""
+    return _decoded_marker_name(name)
 
 
 def _strict_url_value_end(
@@ -505,7 +487,7 @@ def _redact_strict_url_credentials(text: str) -> str:
     replacements = []
     for match in _STRICT_URL_PARAM_START_RE.finditer(text):
         canonical, exhausted = _canonical_url_param_name_with_cap(match.group(2))
-        if exhausted and _looks_like_sensitive_fragment(match.group(2)):
+        if exhausted:
             raise ValueError("URL query-name decode cap exhausted")
         if canonical not in _SENSITIVE_QUERY_PARAMS:
             continue
@@ -739,8 +721,8 @@ _PERSISTED_JSON_MAX_CHARS = 262_144
 _PERSISTED_JSON_MAX_STRING_CHARS = 32_768
 _PERSISTED_JSON_MAX_DEPTH = 8
 _PERSISTED_JSON_MAX_NODES = 512
-_PERSISTED_PERCENT_DECODE_ROUNDS = 3
-_PERSISTED_ESCAPE_DECODE_ROUNDS = 3
+_PERSISTED_CANONICALIZATION_MAX_STEPS = 10
+_PERSISTED_CANONICALIZATION_MAX_VARIANTS = 2048
 _PERSISTED_QUERY_NAMES = frozenset(_SENSITIVE_QUERY_PARAMS)
 _PERSISTED_AUTH_NAMES = frozenset(_PERSISTED_AUTH_HEADER_NAMES)
 _PERSISTED_QUERY_CANONICAL_NAMES = frozenset(
@@ -749,13 +731,24 @@ _PERSISTED_QUERY_CANONICAL_NAMES = frozenset(
 _PERSISTED_AUTH_CANONICAL_NAMES = frozenset(
     name.replace("-", "_") for name in _PERSISTED_AUTH_NAMES
 )
-_PERSISTED_STRUCTURED_NAMES = frozenset({
-    "authorization", "proxy-authorization", "x-api-key", "x-goog-api-key",
-    "api-key", "apikey", "x-api-token", "x-auth-token", "x-access-token",
-    "cookie", "set-cookie", "password", "passwd", "secret", "token",
-    "access_token", "refresh_token", "auth_token", "client_secret", "bearer",
-    "key_material", "raw_secret", "secret_value", "secret_input",
+_PERSISTED_STRUCTURED_EXTRA_NAMES = frozenset({
+    "auth_token", "bearer", "key_material", "passwd", "raw_secret",
+    "secret_value", "secret_input",
 })
+_PERSISTED_STRUCTURED_POLICY_NAMES = frozenset(
+    _PERSISTED_QUERY_NAMES
+    | _PERSISTED_AUTH_NAMES
+    | {"cookie", "set-cookie"}
+    | _PERSISTED_STRUCTURED_EXTRA_NAMES
+)
+_PERSISTED_STRUCTURED_CANONICAL_NAMES = frozenset(
+    name.replace("-", "_") for name in _PERSISTED_STRUCTURED_POLICY_NAMES
+)
+_PERSISTED_STRUCTURED_NAMES = frozenset(
+    alias
+    for name in _PERSISTED_STRUCTURED_POLICY_NAMES
+    for alias in {name, name.replace("-", "_"), name.replace("_", "-")}
+)
 
 
 class _PersistedDiagnosticAmbiguous(ValueError):
@@ -849,57 +842,53 @@ def _decode_marker_escape_layer(text: str) -> str:
     return "".join(output)
 
 
+def _decode_marker_percent_layer(text: str) -> str:
+    """Decode one percent-encoding layer without treating a plain ``+`` as a layer."""
+    if "%" not in text:
+        return text
+    return unquote_plus(text)
+
+
 def _marker_variants(text: str) -> tuple[list[str], bool]:
-    """Return a small set of decoded views and whether a decode cap was hit."""
+    """Return deduplicated fixed-point views and whether the bounded worklist was cut off."""
     if len(text) > _PERSISTED_JSON_MAX_CHARS:
         return [text], True
     variants: list[str] = []
-    seen: set[str] = set()
-    escape_cap = False
-    current = text
-    for _ in range(_PERSISTED_ESCAPE_DECODE_ROUNDS + 1):
-        if current not in seen:
-            variants.append(current)
-            seen.add(current)
-        decoded = _decode_marker_escape_layer(current)
-        if decoded == current:
-            break
-        current = decoded
-    else:
-        escape_cap = True
-
-    percent_sources = tuple(variants)
-    for source in percent_sources:
-        current = source
-        for round_index in range(_PERSISTED_PERCENT_DECODE_ROUNDS + 1):
-            if current not in seen:
-                variants.append(current)
-                seen.add(current)
-            if "%" not in current:
-                break
-            decoded = unquote_plus(current)
+    seen = {text}
+    worklist: list[tuple[str, int]] = [(text, 0)]
+    exhausted = False
+    position = 0
+    while position < len(worklist):
+        current, steps = worklist[position]
+        position += 1
+        variants.append(current)
+        for transform in (_decode_marker_percent_layer, _decode_marker_escape_layer):
+            decoded = transform(current)
             if decoded == current:
-                break
-            current = decoded
-            if round_index == _PERSISTED_PERCENT_DECODE_ROUNDS - 1 and "%" in current:
-                escape_cap = True
-    return variants, escape_cap
+                continue
+            if steps >= _PERSISTED_CANONICALIZATION_MAX_STEPS:
+                exhausted = True
+                continue
+            if decoded in seen:
+                continue
+            if len(seen) >= _PERSISTED_CANONICALIZATION_MAX_VARIANTS:
+                exhausted = True
+                continue
+            seen.add(decoded)
+            worklist.append((decoded, steps + 1))
+    return variants, exhausted
 
 
 def _decoded_marker_name(name: str) -> tuple[str, bool]:
-    """Canonicalize a query/key name with an explicit percent-decode cap."""
-    current = name
-    exhausted = False
-    for round_index in range(_PERSISTED_PERCENT_DECODE_ROUNDS):
-        if "%" not in current:
-            break
-        decoded = unquote_plus(current)
-        if decoded == current:
-            break
-        current = decoded
-        if round_index == _PERSISTED_PERCENT_DECODE_ROUNDS - 1 and "%" in current:
-            exhausted = True
-    return _ascii_lower(current).replace("-", "_"), exhausted
+    """Canonicalize a query/key name through the shared fixed-point worklist."""
+    variants, exhausted = _marker_variants(name)
+    canonical_variants = [
+        _ascii_lower(variant).replace("-", "_") for variant in variants
+    ]
+    for canonical in canonical_variants:
+        if canonical in _PERSISTED_STRUCTURED_CANONICAL_NAMES:
+            return canonical, exhausted
+    return canonical_variants[-1], exhausted
 
 
 def _looks_like_sensitive_fragment(value: str) -> bool:
@@ -983,10 +972,16 @@ def _header_candidate_is_marker(
         delimiter += 1
     if delimiter >= len(text) or text[delimiter] not in ":=":
         # A recognized name followed by VT/FF/NBSP (or another non-OWS byte)
-        # and then a delimiter is malformed framing, not ordinary prose.
-        for probe in range(position, min(len(text), position + 5)):
+        # and then a delimiter is malformed framing, not ordinary prose. Scan
+        # the complete bounded run; a fixed probe horizon misses repeated NBSP.
+        probe = position
+        while probe < len(text) and text[probe] not in "\r\n":
             if text[probe] in ":=":
                 return True
+            if text[probe] in " \t" or _CONTROL_CHARS_RE.match(text[probe]) or text[probe].isspace():
+                probe += 1
+                continue
+            break
         return False
     value_start = delimiter + 1
     while value_start < len(text) and text[value_start] in " \t":
@@ -1091,9 +1086,9 @@ def _contains_query_marker(text: str) -> bool:
             end += 1
         if end < length and text[end] == "=" and end > start:
             canonical, exhausted = _decoded_marker_name(text[start:end])
+            if exhausted:
+                return True
             sensitive = canonical in _PERSISTED_QUERY_CANONICAL_NAMES
-            if exhausted and _looks_like_sensitive_fragment(text[start:end]):
-                sensitive = True
             value_end = end + 1
             if sensitive:
                 value_start = end + 1
@@ -1197,19 +1192,21 @@ def _contains_persisted_sensitive_marker(text: str) -> bool:
                 or _contains_structured_key_marker(variant)
                 or _contains_prefix_marker(variant)):
             return True
-    return decode_cap and _looks_like_sensitive_fragment(text)
+    return decode_cap
 
 
 def _json_key_kind(key: str) -> Optional[str]:
     canonical, exhausted = _decoded_marker_name(key)
+    if exhausted:
+        raise _PersistedDiagnosticAmbiguous("JSON key decode cap exhausted")
     if canonical in _PERSISTED_AUTH_CANONICAL_NAMES:
         return "authorization" if canonical in {"authorization", "proxy_authorization"} else "secret"
     if canonical in {"cookie", "set_cookie"}:
         return "cookie"
     if canonical in _PERSISTED_QUERY_CANONICAL_NAMES:
         return "secret"
-    if exhausted and _looks_like_sensitive_fragment(key):
-        raise _PersistedDiagnosticAmbiguous("JSON key decode cap exhausted")
+    if canonical in _PERSISTED_STRUCTURED_CANONICAL_NAMES:
+        return "secret"
     return None
 
 

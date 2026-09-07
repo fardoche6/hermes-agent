@@ -17,6 +17,7 @@ from typing import Any
 import httpx
 import pytest
 
+import agent.redact as redact_module
 from run_agent import AIAgent
 from agent.api_error_summary import ApiErrorSummaryMixin
 
@@ -34,6 +35,12 @@ def _make_empty_body_error(response_text: str, status_code: int = 400) -> Except
 class _R7Error(Exception):
     status_code: Any
     body: Any
+
+
+def _r8_percent_encode_once(value: str) -> str:
+    if "%" not in value:
+        return "".join(f"%{byte:02X}" for byte in value.encode("utf-8"))
+    return value.replace("%", "%25")
 
 
 def test_empty_body_falls_back_to_response_json_error_message():
@@ -499,3 +506,69 @@ def test_r7_summary_redacts_utf8_bytes_on_the_same_auxiliary_path(monkeypatch):
 
     assert marker not in summary
     assert warnings == [f"⚠ Auxiliary summary failed: {summary}"]
+
+
+_R8_POLICY_NAMES = tuple(sorted(
+    redact_module._PERSISTED_STRUCTURED_POLICY_NAMES
+))
+
+
+@pytest.mark.parametrize("field_name", _R8_POLICY_NAMES)
+def test_r8_summary_sanitizes_structured_list_bytes_and_malformed_details(field_name):
+    marker = "SYN_R8_SUMMARY_" + field_name.replace("-", "_")
+    details = (
+        {field_name: marker, "safe": "public"},
+        [{field_name: marker}, {"safe": "public"}],
+        json.dumps({field_name: marker, "safe": "public"}).encode("utf-8"),
+        '{"' + field_name + '\": "' + marker + '"',
+    )
+
+    for detail in details:
+        error = _R7Error("synthetic provider failure")
+        error.status_code = 502
+        error.body = {"error": {"message": detail}}
+        summary = AIAgent._summarize_api_error(error)
+        assert marker not in summary
+
+
+def test_r8_summary_redacts_mixed_percent_and_rfc8259_query_name():
+    marker = "SYN_R8_SUMMARY_MIXED"
+    error = Exception("synthetic provider failure")
+    error.status_code = 502
+    error.body = {
+        "error": {
+            "message": "provider https://api.example.test/x?%5Cu0074oken="
+            + marker
+            + "&safe=ok",
+        },
+    }
+
+    summary = AIAgent._summarize_api_error(error)
+
+    assert marker not in summary
+    assert "api.example.test" in summary
+
+
+@pytest.mark.parametrize("depth", range(1, 11))
+def test_r8_summary_redacts_fully_percent_encoded_query_name_at_each_depth(depth):
+    name = "token"
+    for _ in range(depth):
+        name = _r8_percent_encode_once(name)
+    marker = f"SYN_R8_SUMMARY_DEPTH_{depth}"
+    error = _R7Error("synthetic provider failure")
+    error.status_code = 502
+    error.body = {
+        "error": {
+            "message": (
+                "provider https://api.example.test/x?"
+                + name
+                + "="
+                + marker
+                + "&safe=ok"
+            ),
+        },
+    }
+
+    summary = AIAgent._summarize_api_error(error)
+
+    assert marker not in summary
