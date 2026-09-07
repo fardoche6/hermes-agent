@@ -1645,3 +1645,123 @@ class TestPersistedHttpCredentialCorrection:
 
         assert result.encode("utf-8").decode("utf-8") == result
         assert marker not in result
+
+    def test_plain_record_scanner_requires_a_proven_serialization_layer(self):
+        import agent.redact as redact_module
+
+        physical = "sid=SYN_R6_PHYSICAL\nnext=SYN_R6_TAIL"
+        assert redact_module._plain_field_value_end(physical, 0) == physical.index("\n")
+        assert redact_module._plain_field_value_end(
+            r"sid=SYN_R6_LITERAL\nnext=SYN_R6_TAIL", 0
+        ) is None
+
+        for layer in (0, 1, 3, 7):
+            closing = "\\" * layer + '"'
+            literal_width = 2 * (layer + 1)
+            for line_char in ("n", "r"):
+                literal = (
+                    "sid=SYN_R6_LITERAL"
+                    + "\\" * literal_width
+                    + line_char
+                    + "continued=SYN_R6_TAIL"
+                    + closing
+                )
+                assert redact_module._plain_field_value_end(
+                    literal, 0, serialization_layer=layer
+                ) == literal.index(closing)
+
+                boundary = (
+                    "sid=SYN_R6_BOUNDARY"
+                    + "\\" * (layer + 1)
+                    + line_char
+                    + "continued=SYN_R6_TAIL"
+                    + closing
+                )
+                assert redact_module._plain_field_value_end(
+                    boundary, 0, serialization_layer=layer
+                ) == boundary.index("\\" * (layer + 1) + line_char)
+
+        for layer in (1, 3, 7):
+            mismatched = (
+                "sid=SYN_R6_MISMATCH"
+                + "\\"
+                + "ncontinued=SYN_R6_TAIL"
+                + "\\" * layer
+                + '"'
+            )
+            assert redact_module._plain_field_value_end(
+                mismatched, 0, serialization_layer=layer
+            ) is None
+
+    @pytest.mark.parametrize(
+        ("field_name", "line_char", "prefix"),
+        [
+            ("Cookie", "n", "SYN_R6_COOKIE_N"),
+            ("Cookie", "r", "SYN_R6_COOKIE_R"),
+            ("Set-Cookie", "n", "SYN_R6_SET_N"),
+            ("Set-Cookie", "r", "SYN_R6_SET_R"),
+        ],
+    )
+    def test_literal_slash_records_are_atomic_at_each_serialization_depth(
+        self, field_name, line_char, prefix
+    ):
+        value = (
+            f"{field_name}: sid={prefix}_HEAD"
+            + "\\"
+            + line_char
+            + f"continued={prefix}_TAIL; Path=/{prefix}_PATH"
+        )
+        raw = json.dumps({"content": value, "safe": "public"}, ensure_ascii=False)
+
+        for depth in range(5):
+            result = redact_persisted_diagnostic(raw, limit=None)
+            assert all(marker not in result for marker in (
+                f"{prefix}_HEAD", f"{prefix}_TAIL", f"{prefix}_PATH",
+            ))
+            decoded = result
+            for _ in range(depth + 1):
+                decoded = json.loads(decoded)
+            assert isinstance(decoded, dict)
+            assert decoded["content"] == f"{field_name}: ***"
+            assert decoded["safe"] == "public"
+            assert redact_persisted_diagnostic(result, limit=None) == result
+            raw = json.dumps(raw, ensure_ascii=False)
+
+    def test_actual_physical_records_end_without_swallowing_the_next_sensitive_field(self):
+        text = (
+            "Cookie: sid=SYN_R6_PHYSICAL_COOKIE\n"
+            "Authorization: Bearer SYN_R6_PHYSICAL_AUTH\r\n"
+            "Set-Cookie: sid=SYN_R6_PHYSICAL_SET"
+        )
+        assert redact_persisted_diagnostic(text, limit=None) == (
+            "Cookie: ***\n"
+            "Authorization: Bearer ***\r\n"
+            "Set-Cookie: ***"
+        )
+
+    def test_json_whitespace_predicate_is_exactly_rfc_8259(self):
+        import agent.redact as redact_module
+
+        assert all(redact_module._is_json_whitespace(char) for char in " \t\n\r")
+        assert not any(
+            redact_module._is_json_whitespace(char)
+            for char in ("\x0b", "\x0c", "\u0085", "\u00a0", "\u2003", "\u2028")
+        )
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '{"Authorization"\x0b: "Bearer SYN_R6_KEY_VT", "safe": "SYN_R6_TAIL"}',
+            '{"Authorization":\x0c"Bearer SYN_R6_COLON_FF", "safe": "SYN_R6_TAIL"}',
+            '{"Authorization": "Bearer SYN_R6_QUOTED_NBSP"\u00a0, "safe": "SYN_R6_TAIL"}',
+            '{"X-Api-Key": true\u2003, "safe": "SYN_R6_BARE_EM"}',
+            '{"X-Api-Key": [1]\u2028, "safe": "SYN_R6_CONTAINER_LINE"}',
+        ],
+    )
+    def test_non_json_whitespace_at_structured_boundaries_fails_closed(self, text):
+        result = redact_persisted_diagnostic(text, limit=None)
+        assert result == "[redaction-unavailable]"
+        assert all(marker not in result for marker in (
+            "SYN_R6_KEY_VT", "SYN_R6_COLON_FF", "SYN_R6_QUOTED_NBSP",
+            "SYN_R6_TAIL", "SYN_R6_BARE_EM", "SYN_R6_CONTAINER_LINE",
+        ))
