@@ -2405,6 +2405,71 @@ def test_dump_api_request_debug_bounds_final_utf8_file_and_stdout_and_is_idempot
     assert redact_persisted_diagnostic(persisted, limit=None) == persisted
 
 
+def test_dump_api_request_debug_r7_redacts_escaped_keys_userinfo_file_and_stdout(
+    monkeypatch, tmp_path, capsys
+):
+    from agent.redact import redact_persisted_diagnostic
+
+    agent = _build_agent(monkeypatch)
+    agent.base_url = "https://alice:SYN_R7_DUMP_USERINFO@api.example.test/v1"
+    setattr(agent, "logs_dir", tmp_path)
+    nested = (
+        '{"Authoriz\\u0061tion": "Bearer SYN_R7_DUMP_AUTH", '
+        '"Coo\\u006bie": "sid=SYN_R7_DUMP_COOKIE", '
+        '"url": "https://api.example.test/x?token=SYN_R7_DUMP_QUERY&safe=ok", '
+        '"safe": "public"}'
+    )
+    request = _codex_request_kwargs()
+    request["input"] = [{"role": "user", "content": nested}]
+    monkeypatch.setenv("HERMES_DUMP_REQUEST_STDOUT", "1")
+
+    dump_file = agent._dump_api_request_debug(request, reason="r7-escaped-keys")
+
+    persisted = dump_file.read_text(encoding="utf-8")
+    stdout = capsys.readouterr().out
+    payload = json.loads(persisted)
+    content = payload["request"]["body"]["input"][0]["content"]
+    parsed_content = json.loads(content)
+    for marker in (
+        "SYN_R7_DUMP_USERINFO", "SYN_R7_DUMP_AUTH", "SYN_R7_DUMP_COOKIE",
+        "SYN_R7_DUMP_QUERY",
+    ):
+        assert marker not in persisted
+        assert marker not in stdout
+    assert payload["request"]["url"].startswith(
+        "https://alice:***@api.example.test/v1/responses"
+    )
+    assert parsed_content == {
+        "Authorization": "Bearer ***",
+        "Cookie": "***",
+        "url": "https://api.example.test/x?token=***&safe=ok",
+        "safe": "public",
+    }
+    assert stdout[stdout.find("{"):] == persisted
+    assert redact_persisted_diagnostic(persisted, limit=None) == persisted
+
+
+def test_dump_api_request_debug_r7_ambiguous_query_writes_only_safe_envelope(
+    monkeypatch, tmp_path, capsys
+):
+    agent = _build_agent(monkeypatch)
+    agent.base_url = "https://api.example.test/v1?token=\"SYN_R7_DUMP_QUOTED\""
+    setattr(agent, "logs_dir", tmp_path)
+    monkeypatch.setenv("HERMES_DUMP_REQUEST_STDOUT", "1")
+
+    dump_file = agent._dump_api_request_debug(
+        _codex_request_kwargs(), reason="r7-ambiguous-query"
+    )
+
+    persisted = dump_file.read_text(encoding="utf-8")
+    stdout = capsys.readouterr().out
+    payload = json.loads(persisted)
+    assert payload == {"diagnostic": "[redaction-unavailable]"}
+    assert "SYN_R7_DUMP_QUOTED" not in persisted
+    assert "SYN_R7_DUMP_QUOTED" not in stdout
+    assert json.loads(stdout[stdout.find("{"):]) == payload
+
+
 # --- Reasoning-only response tests (fix for empty content retry loop) ---
 
 

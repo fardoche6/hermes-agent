@@ -1765,3 +1765,92 @@ class TestPersistedHttpCredentialCorrection:
             "SYN_R6_KEY_VT", "SYN_R6_COLON_FF", "SYN_R6_QUOTED_NBSP",
             "SYN_R6_TAIL", "SYN_R6_BARE_EM", "SYN_R6_CONTAINER_LINE",
         ))
+
+    def test_r7_json_escape_key_names_are_canonicalized_at_nested_depths(self):
+        auth_marker = "SYN_R7_ESCAPED_AUTH"
+        cookie_marker = "SYN_R7_ESCAPED_COOKIE"
+        raw = (
+            '{"Authoriz\\u0061tion": "Bearer ' + auth_marker + '", '
+            '"Coo\\u006bie": "sid=' + cookie_marker + '", "safe": "public"}'
+        )
+
+        for depth in range(5):
+            result = redact_persisted_diagnostic(raw, limit=None)
+            assert auth_marker not in result
+            assert cookie_marker not in result
+            decoded = result
+            for _ in range(depth + 1):
+                decoded = json.loads(decoded)
+            assert isinstance(decoded, dict)
+            assert decoded["Authorization"] == "Bearer ***"
+            assert decoded["Cookie"] == "***"
+            assert decoded["safe"] == "public"
+            assert redact_persisted_diagnostic(result, limit=None) == result
+            raw = json.dumps(raw, ensure_ascii=False)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "https://api.example.test/x?token=&safe=ok",
+            'https://api.example.test/x?token="SYN_R7_QUOTED_QUERY"&safe=ok',
+            "https://api.example.test/x?client%2525255Fsecret=SYN_R7_QUERY_CAP&safe=ok",
+        ],
+    )
+    def test_r7_strict_query_ambiguity_fails_closed(self, text):
+        result = redact_persisted_diagnostic(text, limit=None)
+        assert result == "[redaction-unavailable]"
+        assert "SYN_R7_" not in result
+
+    def test_r7_strict_query_preserves_json_escape_framing(self):
+        marker = "SYN_R7_JSON_QUERY"
+        raw = json.dumps(
+            {
+                "url": "https://api.example.test/x?token=" + marker + "&safe=ok",
+                "safe": "public",
+            },
+            ensure_ascii=False,
+        )
+
+        result = redact_persisted_diagnostic(raw, limit=None)
+
+        parsed = json.loads(result)
+        assert parsed["url"] == "https://api.example.test/x?token=***&safe=ok"
+        assert parsed["safe"] == "public"
+        assert marker not in result
+        assert redact_persisted_diagnostic(result, limit=None) == result
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "https://alice:SYN_R7_TRUNCATED_USERINFO@",
+            "Authorization\x0b: Bearer SYN_R7_VT_HEADER",
+            "X-Api-Key\x0c: SYN_R7_FF_HEADER",
+            "Cookie\u00a0: sid=SYN_R7_NBSP_HEADER",
+        ],
+    )
+    def test_r7_truncated_userinfo_and_non_ows_headers_fail_closed(self, text):
+        result = redact_persisted_diagnostic(text, limit=None)
+        if text.startswith("https://"):
+            assert result == "https://alice:***@"
+        else:
+            assert result == "[redaction-unavailable]"
+        assert "SYN_R7_" not in result
+
+    def test_r7_utf8_bound_is_byte_bounded_and_idempotent(self):
+        text = "é" * 80 + " safe tail context"
+
+        result = redact_persisted_diagnostic(text, limit=64)
+
+        assert len(result.encode("utf-8")) <= 64
+        assert redact_persisted_diagnostic(result, limit=64) == result
+
+    def test_r7_formatter_fails_closed_for_ambiguous_strict_query(self):
+        marker = "SYN_R7_FORMATTER_QUERY"
+        text = "provider https://api.example.test/x?token=\"" + marker + "\""
+
+        result = RedactingFormatter("%(message)s").format(
+            logging.makeLogRecord({"msg": text})
+        )
+
+        assert result == "[redaction-unavailable]"
+        assert marker not in result

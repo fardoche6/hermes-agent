@@ -31,6 +31,11 @@ def _make_empty_body_error(response_text: str, status_code: int = 400) -> Except
     return err
 
 
+class _R7Error(Exception):
+    status_code: Any
+    body: Any
+
+
 def test_empty_body_falls_back_to_response_json_error_message():
     """A JSON payload with error.message is surfaced (not a bare HTTP 400)."""
     err = _make_empty_body_error(
@@ -426,3 +431,71 @@ def test_summary_and_auxiliary_warning_keep_serialized_literal_cookie_atomic(mon
     assert warnings == [f"⚠ Auxiliary summary failed: {summary}"]
     assert "SYN_R6_SUMMARY_" not in summary
     assert "SYN_R6_SUMMARY_" not in warnings[0]
+
+
+def test_r7_summary_and_auxiliary_warning_redact_truncated_userinfo(monkeypatch):
+    marker = "SYN_R7_SUMMARY_USERINFO"
+    error = _R7Error("synthetic provider failure")
+    error.status_code = 502
+    error.body = {
+        "error": {"message": "provider https://alice:" + marker + "@"},
+    }
+    summary = AIAgent._summarize_api_error(error)
+    warnings = []
+    agent = object.__new__(AIAgent)
+    monkeypatch.setattr(agent, "_emit_warning", warnings.append)
+
+    AIAgent._emit_auxiliary_failure(agent, "summary", error)
+
+    assert marker not in summary
+    assert "https://alice:***@" in summary
+    assert warnings == [f"⚠ Auxiliary summary failed: {summary}"]
+    assert marker not in warnings[0]
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        'provider https://api.example.test/x?token="SYN_R7_SUMMARY_QUOTED"&safe=ok',
+        "provider Authorization\x0b: Bearer SYN_R7_SUMMARY_VT",
+    ],
+)
+def test_r7_summary_and_auxiliary_warning_fail_closed_for_ambiguous_http_detail(
+    detail, monkeypatch
+):
+    error = _R7Error("synthetic provider failure")
+    error.status_code = 502
+    error.body = {"error": {"message": detail}}
+    summary = AIAgent._summarize_api_error(error)
+    warnings = []
+    agent = object.__new__(AIAgent)
+    monkeypatch.setattr(agent, "_emit_warning", warnings.append)
+
+    AIAgent._emit_auxiliary_failure(agent, "summary", error)
+
+    assert summary == "[redaction-unavailable]"
+    assert warnings == ["⚠ Auxiliary summary failed: [redaction-unavailable]"]
+    assert "SYN_R7_" not in summary
+    assert all("SYN_R7_" not in warning for warning in warnings)
+
+
+def test_r7_summary_redacts_utf8_bytes_on_the_same_auxiliary_path(monkeypatch):
+    marker = "SYN_R7_SUMMARY_BYTES"
+    error = _R7Error("synthetic provider failure")
+    error.status_code = 502
+    error.body = {
+        "error": {
+            "message": (
+                "provider https://api.example.test/x?token=" + marker
+            ).encode("utf-8")
+        }
+    }
+    summary = AIAgent._summarize_api_error(error)
+    warnings = []
+    agent = object.__new__(AIAgent)
+    monkeypatch.setattr(agent, "_emit_warning", warnings.append)
+
+    AIAgent._emit_auxiliary_failure(agent, "summary", error)
+
+    assert marker not in summary
+    assert warnings == [f"⚠ Auxiliary summary failed: {summary}"]

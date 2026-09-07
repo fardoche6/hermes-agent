@@ -133,6 +133,11 @@ class ApiErrorSummaryMixin:
             _nodes = [0]
         if _depth > _MAX_DETAIL_DEPTH or _nodes[0] >= _MAX_DETAIL_NODES:
             return "[structured error omitted]"
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            try:
+                return bytes(value).decode("utf-8", errors="strict")
+            except (TypeError, UnicodeError):
+                return "[redaction-unavailable]"
         if isinstance(value, str):
             return value
         if isinstance(value, dict):

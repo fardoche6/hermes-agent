@@ -4,12 +4,13 @@ Short tokens (< 18 chars) are fully masked; longer ones keep the first 6 and
 last 4 characters for debuggability.
 """
 
+import json
 import logging
 import os
 import re
 import shlex
 import threading
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import unquote_plus
 
 # Shared with agent/file_safety's read-block list so the two defenses can't
@@ -334,13 +335,13 @@ _URL_USERINFO_RE = re.compile(r"(https?|wss?|ftp)://([^/\s:@]+):([^/\s@]+)@")
 # Strict provider-egress URL redaction: delimiters stay in capture groups so the
 # query/fragment layout is preserved byte-for-byte; the key is decoded
 # separately for classification. Values stop at ``&``/``;`` (both valid).
-_STRICT_URL_PARAM_RE = re.compile(r"([?#&;])([A-Za-z0-9_.~+%\-]+)=([^#&;\s\"'<>]*)")
+_STRICT_URL_PARAM_START_RE = re.compile(r"([?#&;])([A-Za-z0-9_.~+%\-]+)=")
 
 # Userinfo in absolute and network-path (``//user:pass@host``) references; the
 # authority stops at path/query/fragment delimiters. Anchored on the mandatory
 # ``//`` — an optional-scheme prefix backtracked O(n²) on long alphanumeric runs
 # (~55s per sub() on a 320KB compaction payload).
-_STRICT_URL_USERINFO_RE = re.compile(r"(//)([^/\s?#]*@)([^/\s?#]+)")
+_STRICT_URL_USERINFO_RE = re.compile(r"(//)([^/\s?#]*@)([^/\s?#]*)")
 
 # Header names handled by the persisted-diagnostic policy. Ordinary tool-flow
 # redaction deliberately does not use this list: structured credential policy
@@ -443,6 +444,8 @@ def _canonical_url_param_name(name: str) -> str:
     """Decode a URL parameter name (up to 3 unquote rounds) for case-insensitive matching."""
     decoded = name
     for _ in range(3):
+        if "%" not in decoded:
+            break
         next_value = unquote_plus(decoded)
         if next_value == decoded:
             break
@@ -450,12 +453,80 @@ def _canonical_url_param_name(name: str) -> str:
     return decoded.casefold().replace("-", "_")
 
 
+def _canonical_url_param_name_with_cap(name: str) -> tuple[str, bool]:
+    """Return a canonical query name and whether another decode round remains."""
+    decoded = name
+    exhausted = False
+    for round_index in range(3):
+        if "%" not in decoded:
+            break
+        next_value = unquote_plus(decoded)
+        if next_value == decoded:
+            break
+        decoded = next_value
+        if round_index == 2 and "%" in decoded:
+            exhausted = True
+    return decoded.casefold().replace("-", "_"), exhausted
+
+
+def _strict_url_value_end(
+    text: str,
+    start: int,
+    *,
+    serialization_layers: Optional[list[Optional[int]]] = None,
+) -> int:
+    """Find a query value's proven boundary without consuming its enclosing quotes."""
+    if start >= len(text) or text[start] in "\"'":
+        raise ValueError("ambiguous empty or quoted URL query value")
+    layer = serialization_layers[start] if serialization_layers is not None else None
+    position = start
+    while position < len(text):
+        char = text[position]
+        if char in "?#&; \t\r\n<>":
+            return position
+        if char in "\"'":
+            if layer is None:
+                raise ValueError("ambiguous quoted URL query value")
+            run_start = position
+            while run_start > start and text[run_start - 1] == "\\":
+                run_start -= 1
+            run_length = position - run_start
+            if run_length == layer and _quote_closes_at_layer(run_length, layer):
+                return run_start
+            raise ValueError("ambiguous URL query quote boundary")
+        position += 1
+    return position
+
+
 def _redact_strict_url_credentials(text: str) -> str:
     """Strict egress-boundary redaction of URL credentials (absolute, relative and
     network references); preserves keys, separators, public params, hosts, paths."""
-    text = _STRICT_URL_PARAM_RE.sub(
-        lambda m: f"{m.group(1)}{m.group(2)}=***"
-        if _canonical_url_param_name(m.group(2)) in _SENSITIVE_QUERY_PARAMS else m.group(0), text)
+    serialization_layers = _serialization_layer_map(text)
+    replacements = []
+    for match in _STRICT_URL_PARAM_START_RE.finditer(text):
+        canonical, exhausted = _canonical_url_param_name_with_cap(match.group(2))
+        if exhausted and _looks_like_sensitive_fragment(match.group(2)):
+            raise ValueError("URL query-name decode cap exhausted")
+        if canonical not in _SENSITIVE_QUERY_PARAMS:
+            continue
+        value_start = match.end()
+        value_end = _strict_url_value_end(
+            text, value_start, serialization_layers=serialization_layers
+        )
+        if value_end == value_start:
+            raise ValueError("ambiguous empty URL query value")
+        replacements.append((value_start, value_end, "***"))
+    if replacements:
+        output = []
+        cursor = 0
+        for start, end, replacement in replacements:
+            if start < cursor:
+                continue
+            output.append(text[cursor:start])
+            output.append(replacement)
+            cursor = end
+        output.append(text[cursor:])
+        text = "".join(output)
 
     def _redact_userinfo(match: re.Match) -> str:
         userinfo = match.group(2)[:-1]
@@ -659,6 +730,564 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
 _PERSISTED_DIAGNOSTIC_DEFAULT_LIMIT = 8192
 _PERSISTED_DIAGNOSTIC_FAILURE = "[redaction-unavailable]"
 _PERSISTED_DIAGNOSTIC_TRUNCATION = "…[truncated]…"
+
+# The persistence boundary deliberately has a different policy from the ordinary
+# log redactor above.  A diagnostic is either a bounded, parsed JSON value or an
+# opaque string.  Opaque strings are never rebuilt around a guessed credential
+# span: one uncertain marker poisons the complete diagnostic.
+_PERSISTED_JSON_MAX_CHARS = 262_144
+_PERSISTED_JSON_MAX_STRING_CHARS = 32_768
+_PERSISTED_JSON_MAX_DEPTH = 8
+_PERSISTED_JSON_MAX_NODES = 512
+_PERSISTED_PERCENT_DECODE_ROUNDS = 3
+_PERSISTED_ESCAPE_DECODE_ROUNDS = 3
+_PERSISTED_QUERY_NAMES = frozenset(_SENSITIVE_QUERY_PARAMS)
+_PERSISTED_AUTH_NAMES = frozenset(_PERSISTED_AUTH_HEADER_NAMES)
+_PERSISTED_QUERY_CANONICAL_NAMES = frozenset(
+    name.replace("-", "_") for name in _PERSISTED_QUERY_NAMES
+)
+_PERSISTED_AUTH_CANONICAL_NAMES = frozenset(
+    name.replace("-", "_") for name in _PERSISTED_AUTH_NAMES
+)
+_PERSISTED_STRUCTURED_NAMES = frozenset({
+    "authorization", "proxy-authorization", "x-api-key", "x-goog-api-key",
+    "api-key", "apikey", "x-api-token", "x-auth-token", "x-access-token",
+    "cookie", "set-cookie", "password", "passwd", "secret", "token",
+    "access_token", "refresh_token", "auth_token", "client_secret", "bearer",
+    "key_material", "raw_secret", "secret_value", "secret_input",
+})
+
+
+class _PersistedDiagnosticAmbiguous(ValueError):
+    """Internal signal that the persistence boundary cannot prove its framing."""
+
+
+def _decode_persisted_input(value: object) -> str:
+    """Decode only explicit text/UTF-8 byte inputs; never stringify bytes."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        try:
+            return bytes(value).decode("utf-8", errors="strict")
+        except (TypeError, UnicodeError) as exc:
+            raise _PersistedDiagnosticAmbiguous("invalid UTF-8 diagnostic") from exc
+    raise _PersistedDiagnosticAmbiguous("unsupported diagnostic input")
+
+
+def _json_object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Reject duplicate keys so canonicalization cannot discard an unsafe value."""
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise _PersistedDiagnosticAmbiguous("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    """Reject NaN/Infinity extensions; persisted output is RFC 8259 JSON."""
+    raise _PersistedDiagnosticAmbiguous(f"non-JSON constant: {value}")
+
+
+def _loads_persisted_json(text: str) -> object:
+    """Parse one bounded JSON document with decoded, unique object keys."""
+    if len(text) > _PERSISTED_JSON_MAX_CHARS:
+        raise _PersistedDiagnosticAmbiguous("JSON size cap exhausted")
+    try:
+        return json.loads(
+            text,
+            object_pairs_hook=_json_object_pairs,
+            parse_constant=_reject_json_constant,
+        )
+    except (TypeError, ValueError, RecursionError, UnicodeError) as exc:
+        if isinstance(exc, _PersistedDiagnosticAmbiguous):
+            raise
+        raise _PersistedDiagnosticAmbiguous("invalid JSON") from exc
+
+
+def _dump_persisted_json(value: object) -> str:
+    """Serialize a sanitized value with stable, valid JSON framing."""
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+        raise _PersistedDiagnosticAmbiguous("JSON serialization failed") from exc
+
+
+def _decode_marker_escape_layer(text: str) -> str:
+    """Decode one bounded JSON/Python-style escape layer for detection only."""
+    replacements = {
+        '"': '"', "'": "'", "\\": "\\", "/": "/", "b": "\b",
+        "f": "\f", "n": "\n", "r": "\r", "t": "\t",
+    }
+    output: list[str] = []
+    position = 0
+    while position < len(text):
+        char = text[position]
+        if char != "\\" or position + 1 >= len(text):
+            output.append(char)
+            position += 1
+            continue
+        escaped = text[position + 1]
+        if escaped == "u" and position + 5 < len(text):
+            digits = text[position + 2:position + 6]
+            if all(digit in "0123456789abcdefABCDEF" for digit in digits):
+                output.append(chr(int(digits, 16)))
+                position += 6
+                continue
+        if escaped == "x" and position + 3 < len(text):
+            digits = text[position + 2:position + 4]
+            if all(digit in "0123456789abcdefABCDEF" for digit in digits):
+                output.append(chr(int(digits, 16)))
+                position += 4
+                continue
+        output.append(replacements.get(escaped, escaped))
+        position += 2
+    return "".join(output)
+
+
+def _marker_variants(text: str) -> tuple[list[str], bool]:
+    """Return a small set of decoded views and whether a decode cap was hit."""
+    if len(text) > _PERSISTED_JSON_MAX_CHARS:
+        return [text], True
+    variants: list[str] = []
+    seen: set[str] = set()
+    escape_cap = False
+    current = text
+    for _ in range(_PERSISTED_ESCAPE_DECODE_ROUNDS + 1):
+        if current not in seen:
+            variants.append(current)
+            seen.add(current)
+        decoded = _decode_marker_escape_layer(current)
+        if decoded == current:
+            break
+        current = decoded
+    else:
+        escape_cap = True
+
+    percent_sources = tuple(variants)
+    for source in percent_sources:
+        current = source
+        for round_index in range(_PERSISTED_PERCENT_DECODE_ROUNDS + 1):
+            if current not in seen:
+                variants.append(current)
+                seen.add(current)
+            if "%" not in current:
+                break
+            decoded = unquote_plus(current)
+            if decoded == current:
+                break
+            current = decoded
+            if round_index == _PERSISTED_PERCENT_DECODE_ROUNDS - 1 and "%" in current:
+                escape_cap = True
+    return variants, escape_cap
+
+
+def _decoded_marker_name(name: str) -> tuple[str, bool]:
+    """Canonicalize a query/key name with an explicit percent-decode cap."""
+    current = name
+    exhausted = False
+    for round_index in range(_PERSISTED_PERCENT_DECODE_ROUNDS):
+        if "%" not in current:
+            break
+        decoded = unquote_plus(current)
+        if decoded == current:
+            break
+        current = decoded
+        if round_index == _PERSISTED_PERCENT_DECODE_ROUNDS - 1 and "%" in current:
+            exhausted = True
+    return _ascii_lower(current).replace("-", "_"), exhausted
+
+
+def _looks_like_sensitive_fragment(value: str) -> bool:
+    lower = _ascii_lower(value)
+    return (
+        "authorization" in lower or "proxy_authorization" in lower
+        or "cookie" in lower or "password" in lower or "passwd" in lower
+        or "secret" in lower or "token" in lower or "auth" in lower
+        or ("api" in lower and "key" in lower)
+    )
+
+
+def _safe_marker_value(value: str) -> bool:
+    """Whether a previously redacted scalar can safely pass a second scan."""
+    stripped = value.strip().strip("\"'").strip()
+    if not stripped:
+        return False
+    if stripped in {"***", _PERSISTED_DIAGNOSTIC_FAILURE}:
+        return True
+    if stripped.startswith("***") and stripped.replace("***", "").strip(" ;,") == "":
+        return True
+    if stripped.startswith(("Bearer ", "Basic ", "Digest ", "Token ")):
+        return stripped.rsplit(None, 1)[-1] == "***"
+    return False
+
+
+def _structured_candidate_is_marker(text: str, start: int, end: int) -> Optional[bool]:
+    """Classify a quoted structured field, including escaped JSON layers."""
+    key_info = _quoted_field_key_info(text, start, end)
+    if key_info is None:
+        return None
+    separator, escape_depth, valid_key = key_info
+    if not valid_key:
+        return True
+    value_start = _skip_json_whitespace(text, separator + 1)
+    if value_start >= len(text):
+        return True
+    quoted = _escaped_quote_at(text, value_start)
+    if quoted is not None:
+        _, quote_index, quote_depth = quoted
+        if quote_depth != escape_depth:
+            return True
+        closing = _matching_escaped_quote(text, quote_index, text[quote_index], escape_depth)
+        if closing is None:
+            return True
+        after_quote = _skip_json_whitespace(text, closing + 1)
+        if after_quote < len(text) and text[after_quote] not in ",]}":
+            return True
+        return not _safe_marker_value(text[quote_index + 1:closing - escape_depth])
+    if text[value_start] in "[{":
+        value_end, complete = _find_balanced_container_end(
+            text, value_start, escape_depth=escape_depth
+        )
+        if not complete:
+            return True
+        after_container = _skip_json_whitespace(text, value_end)
+        if after_container < len(text) and text[after_container] not in ",]}":
+            return True
+        return not _is_masked_container_value(text[value_start:value_end], escape_depth)
+    # A safe persisted structured scalar is always emitted as a quoted marker.
+    return True
+
+
+def _header_candidate_is_marker(
+    text: str,
+    start: int,
+    end: int,
+    name: str,
+    *,
+    serialization_layers: Optional[list[Optional[int]]] = None,
+) -> bool:
+    """Check a known header/key delimiter without accepting non-OWS whitespace."""
+    structured_marker = _structured_candidate_is_marker(text, start, end)
+    if structured_marker is not None:
+        return structured_marker
+    position = end
+    if position < len(text) and text[position] in "\"'":
+        position += 1
+    delimiter = position
+    while delimiter < len(text) and text[delimiter] in " \t":
+        delimiter += 1
+    if delimiter >= len(text) or text[delimiter] not in ":=":
+        # A recognized name followed by VT/FF/NBSP (or another non-OWS byte)
+        # and then a delimiter is malformed framing, not ordinary prose.
+        for probe in range(position, min(len(text), position + 5)):
+            if text[probe] in ":=":
+                return True
+        return False
+    value_start = delimiter + 1
+    while value_start < len(text) and text[value_start] in " \t":
+        value_start += 1
+    if serialization_layers is None and any(char in text for char in "\\\"'"):
+        serialization_layers = _serialization_layer_map(text)
+    if serialization_layers is None:
+        serialization_layer = None
+    else:
+        serialization_layer = serialization_layers[value_start]
+    if serialization_layer is not None:
+        value_end = _plain_field_value_end(
+            text,
+            value_start,
+            serialization_layer=serialization_layer,
+        )
+        if value_end is None:
+            return True
+        value = text[value_start:value_end].strip()
+        return not _safe_marker_value(value)
+    if value_start < len(text) and text[value_start] in "\"'":
+        quoted = _escaped_quote_at(text, value_start)
+        if quoted is None or quoted[1] != value_start:
+            return True
+        closing = _matching_escaped_quote(text, value_start, text[value_start], 0)
+        if closing is None:
+            return True
+        after_quote = _skip_json_whitespace(text, closing + 1)
+        if after_quote < len(text) and text[after_quote] not in ",]}":
+            return True
+        return not _safe_marker_value(text[value_start + 1:closing])
+    line_end = value_start
+    while line_end < len(text) and text[line_end] not in "\r\n":
+        line_end += 1
+    value = text[value_start:line_end].strip()
+    if not value:
+        return True
+    if _safe_marker_value(value):
+        return False
+    # A quoted plain header is deliberately ambiguous.  The JSON parser owns
+    # quoted JSON values; this path owns only opaque, non-JSON diagnostics.
+    if value[:1] in "\"'" or value[-1:] in "\"'":
+        return True
+    if name in {"cookie", "set-cookie"}:
+        return True
+    return True
+
+
+def _contains_header_marker(text: str) -> bool:
+    lower = _ascii_lower(text)
+    names = tuple(sorted(_PERSISTED_AUTH_NAMES | {"cookie", "set-cookie"}, key=len, reverse=True))
+    serialization_layers = (
+        _serialization_layer_map(text)
+        if any(char in text for char in "\\\"'")
+        else None
+    )
+    for name in names:
+        position = 0
+        while True:
+            found = lower.find(name, position)
+            if found < 0:
+                break
+            end = found + len(name)
+            before = lower[found - 1] if found else ""
+            after = lower[end] if end < len(lower) else ""
+            if ((not before or not (before.isalnum() or before in "_-")
+                 or before in "\\\"'")
+                    and (not after or not (after.isalnum() or after in "_-"))
+                    and _header_candidate_is_marker(
+                        text,
+                        found,
+                        end,
+                        name,
+                        serialization_layers=serialization_layers,
+                    )):
+                return True
+            position = max(end, found + 1)
+    return False
+
+
+def _query_value_is_safe(value: str) -> bool:
+    return _safe_marker_value(value) or value.strip() == "***"
+
+
+def _contains_query_marker(text: str) -> bool:
+    """Detect complete, quoted, incomplete, or over-encoded query pairs."""
+    delimiters = "?#&;"
+    position = 0
+    length = len(text)
+    while position < length:
+        if text[position] in delimiters:
+            start = position + 1
+        elif position == 0:
+            start = 0
+        else:
+            position += 1
+            continue
+        while start < length and text[start] in " \t\r\n\"'":
+            start += 1
+        end = start
+        while end < length and text[end] not in "=?&#; \t\r\n\"'":
+            end += 1
+        if end < length and text[end] == "=" and end > start:
+            canonical, exhausted = _decoded_marker_name(text[start:end])
+            sensitive = canonical in _PERSISTED_QUERY_CANONICAL_NAMES
+            if exhausted and _looks_like_sensitive_fragment(text[start:end]):
+                sensitive = True
+            value_end = end + 1
+            if sensitive:
+                value_start = end + 1
+                value_end = value_start
+                while value_end < length and text[value_end] not in "?#&; \t\r\n\"'":
+                    value_end += 1
+                value = text[value_start:value_end]
+                if not value or text[value_start:value_start + 1] in "\"'":
+                    return True
+                if not _query_value_is_safe(value):
+                    return True
+            position = value_end if value_end < length else length
+        else:
+            position = end if end < length and text[end] in delimiters else max(end + 1, start + 1)
+    return False
+
+
+def _contains_userinfo_marker(text: str) -> bool:
+    position = 0
+    while True:
+        slash = text.find("//", position)
+        if slash < 0:
+            return False
+        authority_start = slash + 2
+        authority_end = authority_start
+        while authority_end < len(text) and text[authority_end] not in "/?#\r\n \t":
+            authority_end += 1
+        authority = text[authority_start:authority_end]
+        at = authority.rfind("@")
+        if at >= 0:
+            credentials = authority[:at]
+            host = authority[at + 1:]
+            if ":" in credentials:
+                password = credentials.rsplit(":", 1)[1]
+                if not host and password == "***":
+                    pass
+                elif password != "***":
+                    return True
+            elif credentials and len(credentials) >= 8 and credentials != "***":
+                return True
+        position = max(authority_end, slash + 2)
+
+
+def _contains_structured_key_marker(text: str) -> bool:
+    lower = _ascii_lower(text)
+    for name in _PERSISTED_STRUCTURED_NAMES:
+        position = 0
+        while True:
+            found = lower.find(name, position)
+            if found < 0:
+                break
+            end = found + len(name)
+            before = lower[found - 1] if found else ""
+            after = lower[end] if end < len(lower) else ""
+            if ((not before or not (before.isalnum() or before in "_-")
+                 or before in "\\\"'")
+                    and (not after or not (after.isalnum() or after in "_-"))):
+                structured_marker = _structured_candidate_is_marker(text, found, end)
+                if structured_marker is not None:
+                    if structured_marker:
+                        return True
+                    position = max(end, found + 1)
+                    continue
+                if before in "?#&;":
+                    position = max(end, found + 1)
+                    continue
+                probe = end
+                while probe < len(text) and text[probe] in " \t\"'":
+                    probe += 1
+                if probe < len(text) and text[probe] in ":=":
+                    value_start = probe + 1
+                    while value_start < len(text) and text[value_start] in " \t":
+                        value_start += 1
+                    value_end = value_start
+                    while value_end < len(text) and text[value_end] not in "\r\n,}]":
+                        value_end += 1
+                    if not _safe_marker_value(text[value_start:value_end]):
+                        return True
+            position = max(end, found + 1)
+    return False
+
+
+def _contains_prefix_marker(text: str) -> bool:
+    return bool(
+        _PREFIX_RE.search(text)
+        or _JWT_RE.search(text)
+        or _TELEGRAM_RE.search(text)
+        or _PRIVATE_KEY_RE.search(text)
+    )
+
+
+def _contains_persisted_sensitive_marker(text: str) -> bool:
+    """Detection-only policy for opaque diagnostics; never returns spans."""
+    if not isinstance(text, str) or len(text) > _PERSISTED_JSON_MAX_CHARS:
+        return True
+    variants, decode_cap = _marker_variants(text)
+    for variant in variants:
+        if (_contains_header_marker(variant)
+                or _contains_query_marker(variant)
+                or _contains_userinfo_marker(variant)
+                or _contains_structured_key_marker(variant)
+                or _contains_prefix_marker(variant)):
+            return True
+    return decode_cap and _looks_like_sensitive_fragment(text)
+
+
+def _json_key_kind(key: str) -> Optional[str]:
+    canonical, exhausted = _decoded_marker_name(key)
+    if canonical in _PERSISTED_AUTH_CANONICAL_NAMES:
+        return "authorization" if canonical in {"authorization", "proxy_authorization"} else "secret"
+    if canonical in {"cookie", "set_cookie"}:
+        return "cookie"
+    if canonical in _PERSISTED_QUERY_CANONICAL_NAMES:
+        return "secret"
+    if exhausted and _looks_like_sensitive_fragment(key):
+        raise _PersistedDiagnosticAmbiguous("JSON key decode cap exhausted")
+    return None
+
+
+def _safe_json_authorization(value: object) -> str:
+    if not isinstance(value, str):
+        return "***"
+    candidate = value.strip()
+    scheme = re.match(r"([A-Za-z][A-Za-z0-9._+\-]*)([ \t]+)(\S.*)$", candidate)
+    if scheme and scheme.group(3).strip():
+        return f"{scheme.group(1)}{scheme.group(2)}***"
+    if candidate == "***" or not candidate:
+        return "***"
+    return "***"
+
+
+def _sanitize_persisted_json(value: object, *, depth: int, nodes: list[int]) -> object:
+    if depth > _PERSISTED_JSON_MAX_DEPTH:
+        raise _PersistedDiagnosticAmbiguous("JSON depth cap exhausted")
+    nodes[0] += 1
+    if nodes[0] > _PERSISTED_JSON_MAX_NODES:
+        raise _PersistedDiagnosticAmbiguous("JSON node cap exhausted")
+    if isinstance(value, dict):
+        result: dict[str, object] = {}
+        for key, nested in value.items():
+            if not isinstance(key, str):
+                raise _PersistedDiagnosticAmbiguous("non-text JSON key")
+            kind = _json_key_kind(key)
+            if kind == "authorization":
+                result[key] = _safe_json_authorization(nested)
+            elif kind == "cookie" or kind == "secret":
+                result[key] = "***"
+            else:
+                result[key] = _sanitize_persisted_json(nested, depth=depth + 1, nodes=nodes)
+        return result
+    if isinstance(value, list):
+        return [
+            _sanitize_persisted_json(item, depth=depth + 1, nodes=nodes)
+            for item in value
+        ]
+    if isinstance(value, str):
+        if value in {_PERSISTED_DIAGNOSTIC_FAILURE, "[structured error omitted]"}:
+            return value
+        if len(value) > _PERSISTED_JSON_MAX_STRING_CHARS:
+            if _contains_persisted_sensitive_marker(value):
+                raise _PersistedDiagnosticAmbiguous("JSON string cap exhausted")
+            return value
+        stripped = value.lstrip()
+        if stripped.startswith(("{", "[", '"')):
+            if depth >= _PERSISTED_JSON_MAX_DEPTH:
+                raise _PersistedDiagnosticAmbiguous("nested JSON depth cap exhausted")
+            try:
+                nested = _loads_persisted_json(value)
+            except _PersistedDiagnosticAmbiguous:
+                raise
+            sanitized = _sanitize_persisted_json(nested, depth=depth + 1, nodes=nodes)
+            return _dump_persisted_json(sanitized)
+        if _contains_persisted_sensitive_marker(value):
+            return _redact_persisted_opaque_text(value, serialization_layer=0)
+    return value
+
+
+def _bounded_plain_persisted(text: str, limit: int) -> str:
+    if limit <= 0:
+        return ""
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) <= limit:
+        return text
+    return encoded[:limit].decode("utf-8", errors="ignore")
+
+
+def _bounded_utf8_suffix(text: str, limit: int) -> str:
+    if limit <= 0:
+        return ""
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) <= limit:
+        return text
+    return encoded[-limit:].decode("utf-8", errors="ignore")
+
 
 
 def _valid_utf8_text(value: str) -> str:
@@ -966,6 +1595,7 @@ def _plain_field_value_end(
     serialization_layer: Optional[int] = None,
     inside_quote: bool = False,
     quote_context: Optional[list[Optional[int]]] = None,
+    allow_serialization_end: bool = False,
 ) -> Optional[int]:
     """Scan one plain record at its proven serialization layer.
 
@@ -987,6 +1617,8 @@ def _plain_field_value_end(
             run_end = _backslash_run_end(text, end)
             run_length = run_end - end
             if run_end < len(text) and text[run_end] in "nNrR":
+                if text[run_end] in "NR":
+                    return None
                 if serialization_layer is None:
                     return None
                 line_escape_width = serialization_layer + 1
@@ -1011,7 +1643,7 @@ def _plain_field_value_end(
                 return end
             return None
         end += 1
-    return end if serialization_layer is None else None
+    return end if serialization_layer is None or allow_serialization_end else None
 
 
 def _find_header_value_span(
@@ -1019,6 +1651,7 @@ def _find_header_value_span(
     quote_context: Optional[list[Optional[int]]] = None,
     serialization_layer: Optional[int] = None,
     escape_depth: int = 0, json_field: bool = False,
+    allow_serialization_end: bool = False,
 ) -> tuple[int, int, Optional[int], Optional[int], bool]:
     """Return a sensitive field value span, rejecting ambiguous boundaries."""
     if start >= len(text):
@@ -1071,6 +1704,7 @@ def _find_header_value_span(
         serialization_layer=serialization_layer,
         inside_quote=inside_quote,
         quote_context=quote_context,
+        allow_serialization_end=allow_serialization_end,
     )
     if plain_end is None:
         return start, _line_end(text, start), None, None, False
@@ -1130,7 +1764,12 @@ def _quoted_field_key_info(text: str, name_start: int, end_name: int):
     return separator, escape_depth, valid
 
 
-def _persisted_header_spans(text: str, names: tuple[str, ...]):
+def _persisted_header_spans(
+    text: str,
+    names: tuple[str, ...],
+    *,
+    default_serialization_layer: Optional[int] = None,
+):
     """Yield non-overlapping candidate field spans with checked value boundaries."""
     serialization_layers = _serialization_layer_map(text)
     position = 0
@@ -1171,17 +1810,56 @@ def _persisted_header_spans(text: str, names: tuple[str, ...]):
             else _skip_header_ows(text, separator + 1)
         )
         serialization_layer = serialization_layers[value_start]
+        if serialization_layer is None:
+            serialization_layer = default_serialization_layer
         if not json_field and _ascii_lower(name) in {"cookie", "set-cookie"}:
             value_end = _plain_field_value_end(
                 text,
                 value_start,
                 serialization_layer=serialization_layer,
+                allow_serialization_end=default_serialization_layer is not None,
             )
             if value_end is None:
                 failure_end = _line_end(text, value_start)
                 yield found, name, value_start, failure_end, None, None, False
                 position = max(failure_end, found + 1)
             else:
+                if default_serialization_layer is not None and value_end < len(text):
+                    run_end = _backslash_run_end(text, value_end)
+                    if (
+                        run_end < len(text)
+                        and text[run_end] in "nNrR"
+                        and run_end - value_end == default_serialization_layer + 1
+                        and text[run_end] in "nr"
+                    ):
+                        next_header = _next_persisted_header_name(
+                            text,
+                            run_end + 1,
+                            (
+                                "cookie",
+                                "set-cookie",
+                                *_PERSISTED_AUTH_HEADER_NAMES,
+                            ),
+                        )
+                        if next_header is None:
+                            value_end = len(text)
+                        else:
+                            separator_start = next_header[0]
+                            if separator_start and text[separator_start - 1] in "\r\n":
+                                separator_start -= 1
+                                if (
+                                    separator_start
+                                    and text[separator_start - 1] in "\r\n"
+                                ):
+                                    separator_start -= 1
+                            elif separator_start and text[separator_start - 1] in "nNrR":
+                                separator_start -= 1
+                                while (
+                                    separator_start > value_end
+                                    and text[separator_start - 1] == "\\"
+                                ):
+                                    separator_start -= 1
+                            value_end = separator_start
                 yield found, name, value_start, value_end, None, None, True
                 position = max(value_end, found + 1)
             continue
@@ -1191,6 +1869,7 @@ def _persisted_header_spans(text: str, names: tuple[str, ...]):
             serialization_layer=None if json_field else serialization_layer,
             escape_depth=field_escape_depth,
             json_field=json_field,
+            allow_serialization_end=default_serialization_layer is not None,
         )
         yield found, name, value_start, value_end, content_start, content_end, structured_ok
         position = max(value_end, found + 1)
@@ -1215,6 +1894,20 @@ def _persisted_field_escape_depth(text: str, name_start: int) -> int:
     while start and text[start - 1] == "\\":
         start -= 1
     return quote_index - start
+
+
+def _serialized_closing_quote_suffix(text: str, value_end: int) -> str:
+    """Preserve a proven closing quote and its enclosing escape run."""
+    if value_end >= len(text):
+        return ""
+    if text[value_end] in "\"'":
+        return text[value_end]
+    if text[value_end] != "\\":
+        return ""
+    run_end = _backslash_run_end(text, value_end)
+    if run_end < len(text) and text[run_end] in "\"'":
+        return text[value_end:run_end + 1]
+    return ""
 
 
 def _assemble_span_replacements(text: str, replacements) -> str:
@@ -1271,6 +1964,12 @@ def _sanitized_persisted_field(text: str, record, transform) -> tuple[int, int, 
     key_info = _quoted_field_key_info(text, name_start, name_start + len(field_name))
     json_field = key_info is not None
     escape_depth = _persisted_field_escape_depth(text, name_start) if json_field else 0
+    enclosing_quote = _escaped_quote_at(text, field_start)
+    serialized_value = (
+        enclosing_quote is not None
+        and enclosing_quote[1] < value_start
+    )
+    suffix = _serialized_closing_quote_suffix(text, value_end) if serialized_value else ""
     kind = _ascii_lower(field_name)
     if original[:1] in "[{":
         if _is_masked_container_value(original, escape_depth):
@@ -1288,11 +1987,17 @@ def _sanitized_persisted_field(text: str, record, transform) -> tuple[int, int, 
     if json_field and _json_bare_scalar_end(text, value_start) == value_end:
         return field_start, value_end, prefix + _masked_json_scalar_value(escape_depth)
     if kind in {"cookie", "set-cookie"}:
-        return field_start, value_end, prefix + "***"
-    return field_start, value_end, prefix + (transform(original, field_name) or "***")
+        return field_start, value_end + len(suffix), prefix + "***" + suffix
+    return (
+        field_start,
+        value_end + len(suffix),
+        prefix + (transform(original, field_name) or "***") + suffix,
+    )
 
 
-def _persisted_structured_replacements(text: str):
+def _persisted_structured_replacements(
+    text: str, *, default_serialization_layer: Optional[int] = None
+):
     """Collect checked fields once and assemble only non-overlapping replacements.
 
     Cookie values are whole-field replacements.  Their ranges are established
@@ -1308,7 +2013,9 @@ def _persisted_structured_replacements(text: str):
     for policy_order, (names, transform) in enumerate(policies[:2]):
         cookie_records.extend(
             (policy_order, record, transform)
-            for record in _persisted_header_spans(text, names)
+            for record in _persisted_header_spans(
+                text, names, default_serialization_layer=default_serialization_layer
+            )
         )
     cookie_records.sort(
         key=lambda item: (
@@ -1344,7 +2051,11 @@ def _persisted_structured_replacements(text: str):
         candidates.append((field_start, end, policy_order, replacement))
 
     cookie_range_index = 0
-    for record in _persisted_header_spans(text, policies[2][0]):
+    for record in _persisted_header_spans(
+        text,
+        policies[2][0],
+        default_serialization_layer=default_serialization_layer,
+    ):
         start = _persisted_field_start(text, record[0])
         while (
             cookie_range_index < len(cookie_ranges)
@@ -1375,6 +2086,31 @@ def _persisted_structured_replacements(text: str):
     return selected
 
 
+def _redact_persisted_opaque_text(
+    text: str, *, serialization_layer: Optional[int] = None
+) -> str:
+    """Redact one non-JSON diagnostic while preserving only proven field framing."""
+    replacements = _persisted_structured_replacements(
+        text, default_serialization_layer=serialization_layer
+    )
+    if (
+        len(replacements) == 1
+        and replacements[0][0] == 0
+        and replacements[0][1] == len(text)
+        and replacements[0][2] == _PERSISTED_DIAGNOSTIC_FAILURE
+    ):
+        raise _PersistedDiagnosticAmbiguous("ambiguous opaque diagnostic")
+    protected = _assemble_span_replacements(text, replacements)
+    redacted = redact_sensitive_text(
+        protected,
+        force=True,
+        redact_url_credentials=True,
+    )
+    if not isinstance(redacted, str) or _contains_persisted_sensitive_marker(redacted):
+        raise _PersistedDiagnosticAmbiguous("sensitive diagnostic boundary unresolved")
+    return redacted
+
+
 def _redact_persisted_auth_value(value: str, field_name: str) -> str:
     """Mask API-key fields fully; preserve Authorization's scheme only with credentials."""
     kind = _ascii_lower(field_name)
@@ -1395,41 +2131,41 @@ def _safe_truncation_fragment(fragment: str) -> str:
 
 
 def _contains_persisted_field_name(text: str) -> bool:
-    names = _PERSISTED_AUTH_HEADER_NAMES + ("cookie", "set-cookie")
-    return _next_persisted_header_name(text, 0, names) is not None
+    return _contains_persisted_sensitive_marker(text)
 
 
 def _truncate_persisted_diagnostic(text: str, limit: int) -> str:
     """Bound redacted text with a second-pass-stable, syntax-neutral context split."""
     if limit <= 0:
         return ""
-    if len(text) <= limit:
+    if len(text.encode("utf-8", errors="replace")) <= limit:
         return text
-    if limit <= len(_PERSISTED_DIAGNOSTIC_TRUNCATION):
-        return _PERSISTED_DIAGNOSTIC_TRUNCATION[:limit]
-    remaining = limit - len(_PERSISTED_DIAGNOSTIC_TRUNCATION)
-    head = (remaining + 1) // 2
-    tail = remaining - head
-    suffix = text[-tail:] if tail else ""
+    truncation_bytes = len(_PERSISTED_DIAGNOSTIC_TRUNCATION.encode("utf-8"))
+    if limit <= truncation_bytes:
+        return _bounded_plain_persisted(_PERSISTED_DIAGNOSTIC_TRUNCATION, limit)
+    remaining = limit - truncation_bytes
+    head_budget = (remaining + 1) // 2
+    tail_budget = remaining - head_budget
+    head = _bounded_plain_persisted(text, head_budget)
+    suffix = _bounded_utf8_suffix(text, tail_budget) if tail_budget else ""
     candidate = (
-        _safe_truncation_fragment(text[:head])
+        _safe_truncation_fragment(head)
         + _PERSISTED_DIAGNOSTIC_TRUNCATION
         + _safe_truncation_fragment(suffix)
     )
     if _contains_persisted_field_name(candidate):
-        return _PERSISTED_DIAGNOSTIC_FAILURE[:limit]
+        return _bounded_plain_persisted(_PERSISTED_DIAGNOSTIC_FAILURE, limit)
     return candidate
 
 
 def redact_persisted_diagnostic(
-    text: str, *, limit: Optional[int] = _PERSISTED_DIAGNOSTIC_DEFAULT_LIMIT
+    text: object, *, limit: Optional[int] = _PERSISTED_DIAGNOSTIC_DEFAULT_LIMIT
 ) -> str:
     """Redact a diagnostic for durable storage or display, always failing closed.
 
-    This is intentionally stricter than :func:`redact_sensitive_text`: persistence and
-    provider-error display must treat URL query parameters and userinfo as credentials.
-    Structured fields are protected and restored through monotonic span passes, then
-    the deterministic output bound is applied.
+    Valid JSON is parsed with the stdlib, sanitized recursively, and serialized
+    again.  Everything else is opaque: detection may reject it, but never tries
+    to preserve arbitrary neighboring fragments around a guessed secret span.
     """
     if limit is None:
         bounded_limit = None
@@ -1439,15 +2175,30 @@ def redact_persisted_diagnostic(
         except Exception:
             bounded_limit = _PERSISTED_DIAGNOSTIC_DEFAULT_LIMIT
 
+    structured = False
     try:
-        text = _valid_utf8_text(text)
-        structured = _persisted_structured_replacements(text)
-        protected = _assemble_span_replacements(text, structured)
-        redacted = redact_sensitive_text(protected, force=True, redact_url_credentials=True)
-        redacted = _valid_utf8_text("" if redacted is None else redacted)
+        decoded = _valid_utf8_text(_decode_persisted_input(text))
+        if len(decoded) > _PERSISTED_JSON_MAX_CHARS:
+            raise _PersistedDiagnosticAmbiguous("diagnostic size cap exhausted")
+        try:
+            parsed = _loads_persisted_json(decoded)
+        except _PersistedDiagnosticAmbiguous:
+            redacted = _redact_persisted_opaque_text(decoded)
+        else:
+            structured = True
+            redacted = _dump_persisted_json(
+                _sanitize_persisted_json(parsed, depth=0, nodes=[0])
+            )
     except Exception:
         redacted = _PERSISTED_DIAGNOSTIC_FAILURE
-    return redacted if bounded_limit is None else _truncate_persisted_diagnostic(redacted, bounded_limit)
+
+    if bounded_limit is None:
+        return redacted
+    if redacted == _PERSISTED_DIAGNOSTIC_FAILURE:
+        return _bounded_plain_persisted(redacted, bounded_limit)
+    if structured:
+        return redacted if len(redacted.encode("utf-8", errors="replace")) <= bounded_limit else _bounded_plain_persisted(_PERSISTED_DIAGNOSTIC_FAILURE, bounded_limit)
+    return _truncate_persisted_diagnostic(redacted, bounded_limit)
 
 
 # Commands whose stdout is an env-var dump: terminal redaction runs the
