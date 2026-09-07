@@ -58,6 +58,30 @@ def _safe_api_error_summary(error: Exception) -> str:
     return f"{_http_prefix(error)}{_SAFE_API_ERROR_SUMMARY}"
 
 
+def _api_error_json_default(value: object) -> str:
+    """Decode byte details without falling back to a potentially leaky repr."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).decode("utf-8", errors="strict")
+    raise TypeError(f"unsupported structured detail: {type(value).__name__}")
+
+
+def _redact_structured_api_error_value(value: object) -> str:
+    """Sanitize structured details before any HTTP prefix or prose is added."""
+    try:
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            serialized = bytes(value).decode("utf-8", errors="strict")
+        else:
+            serialized = json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=_api_error_json_default,
+            )
+        return redact_persisted_diagnostic(serialized, limit=None)
+    except Exception:
+        return "[redaction-unavailable]"
+
+
 class ApiErrorSummaryMixin:
     """Provider error -> user/log-safe summary (see module docstring)."""
 
@@ -134,10 +158,7 @@ class ApiErrorSummaryMixin:
         if _depth > _MAX_DETAIL_DEPTH or _nodes[0] >= _MAX_DETAIL_NODES:
             return "[structured error omitted]"
         if isinstance(value, (bytes, bytearray, memoryview)):
-            try:
-                return bytes(value).decode("utf-8", errors="strict")
-            except (TypeError, UnicodeError):
-                return "[redaction-unavailable]"
+            return _redact_structured_api_error_value(value)
         if isinstance(value, str):
             return value
         if isinstance(value, dict):
@@ -147,6 +168,15 @@ class ApiErrorSummaryMixin:
             _seen.add(value_id)
             _nodes[0] += 1
             try:
+                serialized = json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=_api_error_json_default,
+                )
+                safe_value = _redact_structured_api_error_value(value)
+                if safe_value != serialized:
+                    return safe_value
                 for key in _ERROR_DETAIL_KEYS:
                     nested = value.get(key)
                     if isinstance(nested, str) and nested.strip():
@@ -159,7 +189,7 @@ class ApiErrorSummaryMixin:
                         if nested_detail:
                             return nested_detail
                 try:
-                    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+                    return _redact_structured_api_error_value(value)
                 except Exception:
                     return "[structured error omitted]"
             except Exception:

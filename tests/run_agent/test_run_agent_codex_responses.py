@@ -272,6 +272,12 @@ def _codex_request_kwargs():
     }
 
 
+def _r8_percent_encode_once(value):
+    if "%" not in value:
+        return "".join(f"%{byte:02X}" for byte in value.encode("utf-8"))
+    return value.replace("%", "%25")
+
+
 def test_api_mode_uses_explicit_provider_when_codex(monkeypatch):
     _patch_agent_bootstrap(monkeypatch)
     agent = run_agent.AIAgent(
@@ -2200,6 +2206,58 @@ def test_dump_api_request_debug_redacts_persisted_json_and_stdout(monkeypatch, t
     assert "Cookie: ***" in persisted
     assert "Set-Cookie: ***" in persisted
     assert "Path=/" not in persisted
+
+
+def test_dump_api_request_debug_redacts_mixed_percent_and_rfc8259_query_name(
+    monkeypatch, tmp_path
+):
+    agent = _build_agent(monkeypatch)
+    agent.base_url = "https://api.example.test/v1"
+    agent.logs_dir = tmp_path
+    marker = "SYN_R8_DUMP_MIXED"
+    request = _codex_request_kwargs()
+    request["input"] = [{
+        "role": "user",
+        "content": (
+            "GET https://api.example.test/x?%5Cu0074oken="
+            + marker
+            + "&safe=ok"
+        ),
+    }]
+
+    dump_file = agent._dump_api_request_debug(request, reason="mixed-query-preflight")
+
+    persisted = dump_file.read_text()
+    assert marker not in persisted
+    assert "api.example.test" in persisted
+
+
+@pytest.mark.parametrize("depth", range(1, 11))
+def test_dump_api_request_debug_redacts_fully_percent_encoded_query_name_at_each_depth(
+    monkeypatch, tmp_path, depth
+):
+    agent = _build_agent(monkeypatch)
+    agent.base_url = "https://api.example.test/v1"
+    agent.logs_dir = tmp_path
+    name = "token"
+    for _ in range(depth):
+        name = _r8_percent_encode_once(name)
+    marker = f"SYN_R8_DUMP_DEPTH_{depth}"
+    request = _codex_request_kwargs()
+    request["input"] = [{
+        "role": "user",
+        "content": (
+            "GET https://api.example.test/x?"
+            + name
+            + "="
+            + marker
+            + "&safe=ok"
+        ),
+    }]
+
+    dump_file = agent._dump_api_request_debug(request, reason="encoded-depth-preflight")
+
+    assert marker not in dump_file.read_text()
 
 
 def test_dump_api_request_debug_redacts_structured_headers_in_file_and_stdout(monkeypatch, tmp_path, capsys):
