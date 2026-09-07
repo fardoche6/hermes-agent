@@ -669,6 +669,24 @@ def _final_is_candidate(candidate: ProtectedLexicalCandidate) -> bool:
         return False
 
 
+def _remove_bound_quarantine(
+    candidate: ProtectedLexicalCandidate,
+    quarantine: str,
+) -> str:
+    """Preserve a bound entry when the platform cannot unlink by inode.
+
+    Linux provides descriptor-relative rename operations but no unlink-by-file-
+    descriptor operation.  A path-based unlink after validation would therefore
+    be able to remove a replacement installed at ``quarantine``.  Keeping the
+    name is the only safe terminal action, and callers must report uncertainty.
+    """
+    return (
+        "UNCERTAIN STATE: protected temporary object was bound and verified, "
+        "but this platform cannot atomically remove the bound inode; "
+        "leaving it in quarantine"
+    )
+
+
 def _cleanup_temp(
     candidate: ProtectedLexicalCandidate,
     name: str | None,
@@ -677,25 +695,26 @@ def _cleanup_temp(
     expected_sha256: str | None = None,
     expected_link_text: str | None = None,
 ) -> str | None:
-    """Remove only an entry atomically bound to the expected object.
+    """Bind and verify a temporary entry without destructive path cleanup.
 
     The generated name is first moved with RENAME_NOREPLACE into a fresh
     quarantine name.  A raced replacement is therefore moved out of the
-    original name and remains available for inspection; it is never passed to
-    unlink.  Identity uncertainty leaves the quarantined object in place.
+    original name and remains available for inspection.  Because this platform
+    has no atomic remove-by-inode operation, the validated quarantine is kept
+    and the caller reports explicit uncertainty instead of unlinking a path.
     """
     if not name:
         return None
     expected = expected_identity or candidate.staged_identity
     if expected is None:
-        return "protected temporary identity is not bound; leaving it in place"
+        return "UNCERTAIN STATE: protected temporary identity is not bound; leaving it in place"
     quarantine = _random_name(candidate.parent_fd)
     try:
         _rename_noreplace(name, quarantine, candidate.parent_fd)
     except FileNotFoundError:
-        return "protected temporary object could not be atomically bound; leaving it in place"
+        return "UNCERTAIN STATE: protected temporary object could not be atomically bound; leaving it in place"
     except Exception as exc:
-        return f"protected temporary object could not be atomically bound: {exc}"
+        return f"UNCERTAIN STATE: protected temporary object could not be atomically bound: {exc}"
     try:
         if not _entry_matches(
             candidate,
@@ -704,14 +723,10 @@ def _cleanup_temp(
             expected_sha256=expected_sha256,
             expected_link_text=expected_link_text,
         ):
-            return "protected temporary object changed; leaving it in quarantine"
+            return "UNCERTAIN STATE: protected temporary object changed; leaving it in quarantine"
     except Exception as exc:
-        return f"protected temporary object could not be verified: {exc}"
-    try:
-        os.unlink(quarantine, dir_fd=candidate.parent_fd)
-    except Exception as exc:
-        return str(exc)
-    return None
+        return f"UNCERTAIN STATE: protected temporary object could not be verified: {exc}"
+    return _remove_bound_quarantine(candidate, quarantine)
 
 
 def _protected_failure(
@@ -780,10 +795,15 @@ def _rollback_exchange(candidate: ProtectedLexicalCandidate, temp_name: str) -> 
         )
     cleanup_error = _cleanup_temp(candidate, temp_name)
     if cleanup_error:
+        restoration_detail = (
+            "the approved lexical entry could not be proven restored; "
+            if not restored
+            else "rollback restored the approved lexical entry; "
+        )
         return _protected_failure(
             candidate,
             "UNCERTAIN STATE: protected preimage drifted and rollback completed, but "
-            f"the staged object could not be cleaned up: {cleanup_error}",
+            f"{restoration_detail}the staged object could not be cleaned up: {cleanup_error}",
             outcome="uncertain",
             possibly_modified=True,
         )
@@ -905,23 +925,6 @@ def commit_candidate(candidate: ProtectedLexicalCandidate) -> WriteResult:
         if candidate.initial_kind != "absent":
             if not _approved_preimage_matches(candidate, temp_name):
                 return _rollback_exchange(candidate, temp_name)
-            cleanup_error = _cleanup_temp(
-                candidate,
-                temp_name,
-                expected_identity=candidate.final_identity,
-                expected_sha256=candidate.original_sha256 if candidate.initial_kind == "regular" else None,
-                expected_link_text=candidate.link_text,
-            )
-            if cleanup_error:
-                return _protected_failure(
-                    candidate,
-                    "UNCERTAIN STATE (possibly modified): protected atomic replacement "
-                    "installed the candidate, but the approved displaced object could "
-                    f"not be cleaned up: {cleanup_error}",
-                    outcome="uncertain",
-                    possibly_modified=True,
-                )
-        temp_name = None
 
         try:
             _capture_committed_state(candidate)
@@ -986,6 +989,25 @@ def commit_candidate(candidate: ProtectedLexicalCandidate) -> WriteResult:
                 outcome="uncertain",
                 possibly_modified=True,
             )
+
+        if candidate.initial_kind != "absent":
+            cleanup_error = _cleanup_temp(
+                candidate,
+                temp_name,
+                expected_identity=candidate.final_identity,
+                expected_sha256=candidate.original_sha256 if candidate.initial_kind == "regular" else None,
+                expected_link_text=candidate.link_text,
+            )
+            if cleanup_error:
+                return _protected_failure(
+                    candidate,
+                    "UNCERTAIN STATE (possibly modified): protected atomic replacement "
+                    "installed the candidate, but the approved displaced object could "
+                    f"not be cleaned up: {cleanup_error}",
+                    outcome="uncertain",
+                    possibly_modified=True,
+                )
+        temp_name = None
         return WriteResult(bytes_written=len(candidate.candidate_bytes), verified=True)
     except Exception as exc:
         if commit_attempted:

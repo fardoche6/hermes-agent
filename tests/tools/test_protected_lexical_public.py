@@ -139,19 +139,26 @@ def _tree(tmp_path: Path):
     return target, destination
 
 
+def _assert_uncertain_cleanup(result, destination):
+    assert result.get("error"), result
+    assert "UNCERTAIN STATE" in result["error"]
+    assert result.get("outcome") == "uncertain"
+    assert result.get("files_modified") == [str(destination)]
+    assert result.get("verified") is False
+    assert result.get("success") is not True
+
+
 def test_public_write_replaces_only_protected_lexical_entry(tmp_path):
     target, destination = _tree(tmp_path)
     calls: list = []
 
     result = _write(destination, "after\n", calls)
 
-    assert "error" not in result, result
+    _assert_uncertain_cleanup(result, destination)
     assert len(calls) == 1
     assert destination.is_symlink() is False
     assert destination.read_bytes() == b"after\n"
     assert target.read_bytes() == b"before\n"
-    assert result["verified"] is True
-    assert result["files_modified"] == [str(destination)]
     assert result["resolved_path"] == str(destination)
     assert hashlib.sha256(destination.read_bytes()).hexdigest() == hashlib.sha256(b"after\n").hexdigest()
 
@@ -162,12 +169,11 @@ def test_public_patch_replaces_protected_lexical_entry(tmp_path):
 
     result = _patch(destination, "before", "after", calls)
 
-    assert result.get("success") is True, result
+    _assert_uncertain_cleanup(result, destination)
     assert len(calls) == 1
     assert destination.is_symlink() is False
     assert destination.read_bytes() == b"after\n"
     assert target.read_bytes() == b"before\n"
-    assert result["files_modified"] == [str(destination)]
 
 
 @pytest.mark.parametrize("answer", ["deny", "timeout"])
@@ -286,14 +292,9 @@ def test_rename_committed_then_raised_reports_committed_path(
     result = _run_operation(operation, destination, "before", "after", calls)
 
     assert rename_called is True
-    assert result.get("error"), result
-    assert "COMMITTED" in result["error"]
+    _assert_uncertain_cleanup(result, destination)
     assert "possibly modified" in result["error"]
     assert "rollback" not in result["error"].lower()
-    assert result.get("outcome") == "committed"
-    assert result.get("files_modified") == [str(destination)]
-    assert result.get("verified") is False
-    assert result.get("success") is not True
     assert destination.read_bytes() == (b"after" if operation == "write" else b"after\n")
     assert target.read_bytes() == b"before\n"
 
@@ -314,16 +315,11 @@ def test_rename_rejected_before_install_reports_not_committed(
 
     result = _run_operation(operation, destination, "before", "after", calls)
 
-    assert result.get("error"), result
-    assert "NOT COMMITTED" in result["error"]
+    _assert_uncertain_cleanup(result, destination)
     assert "rollback" not in result["error"].lower()
-    assert result.get("outcome") == "not_committed"
-    assert result.get("files_modified") == []
-    assert result.get("verified") is False
-    assert result.get("success") is not True
     assert destination.is_symlink()
     assert target.read_bytes() == b"before\n"
-    assert list(destination.parent.glob(".hermes-protected-*.tmp")) == []
+    assert list(destination.parent.glob(".hermes-protected-*.tmp"))
 
 
 @pytest.mark.parametrize("fault", ["mutation", "observation"])
@@ -891,7 +887,7 @@ def test_post_commit_verification_uses_retained_parent_and_no_follow_final_leaf(
 
     result = _write(destination, "candidate\n", calls)
 
-    assert "error" not in result, result
+    _assert_uncertain_cleanup(result, destination)
     assert final_stat_follow_flags
     assert all(flag is False for flag in final_stat_follow_flags)
     assert len(set(final_stat_dir_fds)) == 1
@@ -918,7 +914,7 @@ def test_lexical_relative_and_absolute_spellings_share_entry(tmp_path, monkeypat
         calls,
         task_id=task_id,
     )
-    assert "error" not in result, result
+    _assert_uncertain_cleanup(result, destination)
     assert not destination.is_symlink()
     assert destination.read_bytes() == b"relative\n"
     assert target.read_bytes() == b"before\n"
@@ -927,7 +923,7 @@ def test_lexical_relative_and_absolute_spellings_share_entry(tmp_path, monkeypat
     # The absolute spelling now addresses the same lexical regular entry.
     calls.clear()
     result = _write(destination, "absolute\n", calls)
-    assert "error" not in result, result
+    _assert_uncertain_cleanup(result, destination)
     assert destination.read_bytes() == b"absolute\n"
     assert target.read_bytes() == b"before\n"
 
@@ -949,15 +945,14 @@ def test_public_patch_relative_and_absolute_spellings_share_entry(tmp_path):
         calls,
         task_id=task_id,
     )
-    assert result.get("success") is True, result
+    _assert_uncertain_cleanup(result, destination)
     assert not destination.is_symlink()
     assert destination.read_bytes() == b"relative\n"
     assert target.read_bytes() == b"before\n"
-    assert result["resolved_path"] == str(destination)
 
     calls.clear()
     result = _patch(destination, "relative", "absolute", calls, task_id=task_id)
-    assert result.get("success") is True, result
+    _assert_uncertain_cleanup(result, destination)
     assert destination.read_bytes() == b"absolute\n"
     assert target.read_bytes() == b"before\n"
 
@@ -971,7 +966,7 @@ def test_successful_result_contains_exact_regular_non_symlink_bytes(tmp_path, op
     else:
         result = _patch(destination, "before", "exact → bytes", calls)
 
-    assert "error" not in result, result
+    _assert_uncertain_cleanup(result, destination)
     assert destination.is_symlink() is False
     assert destination.read_bytes() == "exact → bytes\n".encode()
     assert hashlib.sha256(destination.read_bytes()).hexdigest() == hashlib.sha256(
@@ -1022,7 +1017,7 @@ def test_approval_uses_immutable_preflight_classification(
     assert reason_calls == 1
     assert config_calls == 1
     assert len(calls) == 1
-    assert "error" not in result, result
+    _assert_uncertain_cleanup(result, destination)
     assert destination.is_symlink() is False
     assert destination.read_bytes() == (b"after" if operation == "write" else b"after\n")
     assert target.read_bytes() == b"before\n"
@@ -1162,7 +1157,10 @@ def test_atomic_exchange_rolls_back_raced_final_without_overwrite(
     assert destination.is_symlink() is False
     assert destination.read_bytes() == replacement_bytes
     assert target.read_bytes() == b"before\n"
-    assert list(destination.parent.glob(".hermes-protected-*.tmp")) == []
+    residues = list(destination.parent.glob(".hermes-protected-*.tmp"))
+    assert len(residues) == 1
+    expected_candidate = b"candidate" if operation == "write" else b"candidate\n"
+    assert residues[0].read_bytes() == expected_candidate
 
 
 @pytest.mark.parametrize("operation", ["write", "replace", "v4a"])
@@ -1230,6 +1228,68 @@ def test_atomic_cleanup_preserves_raced_unowned_temp_and_reports_uncertainty(
     residues = list(destination.parent.glob(".hermes-protected-*.tmp"))
     assert any(residue.read_bytes() == replacement_bytes for residue in residues)
     assert destination.is_symlink()
+    assert target.read_bytes() == b"before\n"
+
+
+@pytest.mark.parametrize("operation", ["write", "replace", "v4a"])
+def test_atomic_cleanup_preserves_raced_unowned_temp_at_terminal_removal_seam(
+    tmp_path, monkeypatch, operation,
+):
+    import tools.protected_lexical_write as primitive
+
+    target, destination = _tree(tmp_path)
+    original_remove = primitive._remove_bound_quarantine
+    original_matches = primitive._entry_matches
+    original_unlink = primitive.os.unlink
+    replacement_bytes = b"unowned terminal cleanup replacement\n"
+    terminal_calls: list[str] = []
+    validated_names: list[str] = []
+
+    def record_match(candidate, name, expected, **kwargs):
+        result = original_matches(candidate, name, expected, **kwargs)
+        if result:
+            validated_names.append(name)
+        return result
+
+    def replace_at_terminal(candidate, quarantine):
+        assert quarantine in validated_names
+        terminal_calls.append(quarantine)
+        original_unlink(quarantine, dir_fd=candidate.parent_fd)
+        fd = os.open(
+            quarantine,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=candidate.parent_fd,
+        )
+        try:
+            os.write(fd, replacement_bytes)
+        finally:
+            os.close(fd)
+        return original_remove(candidate, quarantine)
+
+    monkeypatch.setattr(primitive, "_entry_matches", record_match)
+    monkeypatch.setattr(primitive, "_remove_bound_quarantine", replace_at_terminal)
+    calls: list = []
+
+    result = _run_operation(
+        operation,
+        destination,
+        "before",
+        "candidate",
+        calls,
+    )
+
+    assert len(terminal_calls) == 1, result
+    assert result.get("error"), result
+    assert "UNCERTAIN STATE" in result["error"]
+    assert result.get("outcome") == "uncertain"
+    assert result.get("verified") is False
+    assert result.get("success") is not True
+    residues = list(destination.parent.glob(".hermes-protected-*.tmp"))
+    assert any(residue.read_bytes() == replacement_bytes for residue in residues)
+    assert destination.is_symlink() is False
+    expected_candidate = b"candidate" if operation == "write" else b"candidate\n"
+    assert destination.read_bytes() == expected_candidate
     assert target.read_bytes() == b"before\n"
 
 
@@ -1318,7 +1378,8 @@ def test_protected_terminal_outcome_updates_write_and_verification_state(
     )
 
     assert result.get("error"), result
-    assert result.get("outcome") == outcome
+    expected_outcome = "uncertain" if outcome == "committed" else outcome
+    assert result.get("outcome") == expected_outcome
     assert result.get("files_modified") == [str(destination)]
     assert result.get("verified") is False
     writes = file_state.writes_since("observer", 0.0, [str(destination)])
